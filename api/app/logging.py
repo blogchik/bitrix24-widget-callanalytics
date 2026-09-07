@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from collections.abc import Mapping
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -170,6 +171,47 @@ def setup_logging() -> None:
         uvicorn_logger = logging.getLogger(name)
         uvicorn_logger.handlers.clear()
         uvicorn_logger.propagate = True
+
+
+class _SafeExtraLogger(logging.Logger):
+    """Logger that cannot be killed by a colliding `extra` key.
+
+    `logging.Logger.makeRecord` raises `KeyError` when `extra` carries a name the
+    stdlib already owns on a LogRecord (`created`, `module`, `filename`, `process`,
+    `args`, ...). The failure is invisible in development because it only fires once
+    the logger is actually enabled for that level, so a diagnostic line added at INFO
+    turns into a 500 the first time it runs in production with LOG_LEVEL=INFO.
+
+    A log line must never be able to fail the request it is describing, so a colliding
+    key is renamed to `ctx_<key>` instead of raising.
+    """
+
+    def makeRecord(  # noqa: PLR0913 - signature fixed by the stdlib
+        self,
+        name: str,
+        level: int,
+        fn: str,
+        lno: int,
+        msg: object,
+        args: object,
+        exc_info: object,
+        func: str | None = None,
+        extra: Mapping[str, object] | None = None,
+        sinfo: str | None = None,
+    ) -> logging.LogRecord:
+        if extra:
+            probe = logging.LogRecord(name, level, fn, lno, "", (), None)
+            safe: dict[str, object] = {}
+            for key, value in extra.items():
+                collides = key in ("message", "asctime") or key in probe.__dict__
+                safe[f"ctx_{key}" if collides else key] = value
+            extra = safe
+        return super().makeRecord(  # type: ignore[no-any-return,arg-type]
+            name, level, fn, lno, msg, args, exc_info, func, extra, sinfo
+        )
+
+
+logging.setLoggerClass(_SafeExtraLogger)
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -22,18 +22,21 @@ the response itself.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Final
+from urllib.parse import parse_qsl
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from markupsafe import Markup
 
-from app.i18n import resolve_locale, t
+from app.i18n import has_message, resolve_locale, t
 from app.logging import get_logger, get_request_id
 
-__all__ = ["render_error", "render_install", "render_state"]
+__all__ = ["render_error", "render_handoff", "render_install", "render_state"]
 
 _log = get_logger(__name__)
 
@@ -243,5 +246,152 @@ def render_error(
     return HTMLResponse(
         content=_render("error.html", context),
         status_code=status_code,
+        headers=_headers(domain, protocol_https),
+    )
+
+
+#: An SPA route this handler may hand the browser to. Root-relative, no scheme, no
+#: host, no dot segments: `render_handoff` writes it into `location.replace()`, and a
+#: value that could start with `//` or `http:` would be an open redirect out of the
+#: Bitrix24 frame. Every caller passes a constant, and this is the check that keeps it
+#: that way.
+_TARGET_PATH_RE: Final[re.Pattern[str]] = re.compile(r"^/[A-Za-z0-9._~/-]{0,255}$")
+
+#: RFC 3986 query characters. `bitrix/forms.py` already applied the same allowlist to
+#: `raw_query` (§4.2); it is repeated because this value is interpolated into a page.
+_RAW_QUERY_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]*$")
+
+#: A compact JWS: three base64url segments. Anything else never reaches the page.
+_TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+
+
+def _lang_of(query: str) -> str | None:
+    """Bitrix24's `LANG` out of the forwarded query string (§4.4 step 8).
+
+    `parse_qsl` never raises on a malformed pair, and the value is handed to
+    `resolve_locale`, which maps anything unknown onto a supported locale - so a
+    crafted `LANG` can only change which translation a spinner is rendered in.
+    """
+    for key, value in parse_qsl(query, keep_blank_values=False):
+        if key.lower() == "lang" and value:
+            return value
+    return None
+
+
+def _js_string(value: str) -> Markup:
+    """One JS string literal, safe in a `<script>` block inside an HTML document.
+
+    Two escaping layers are involved and both have to be right:
+
+    * JSON gives a valid JS literal, with `ensure_ascii=True` so the output is pure
+      ASCII whatever the page's charset ends up being;
+    * `<`, `>` and `&` are then escaped to `\\uXXXX`, because an HTML parser looks for
+      `</script` inside a script element no matter what JavaScript thinks the quoting
+      is - that sequence, not a quote, is how a string in an inline script breaks out.
+
+    The result is returned as `Markup` so Jinja's autoescape (which would turn the
+    literal's own quotes into `&quot;` and break the script) leaves it alone. That is
+    safe precisely because nothing outside this ASCII, HTML-inert set survives above.
+    """
+    encoded = json.dumps(value, ensure_ascii=True)
+    for raw, escaped in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026")):
+        encoded = encoded.replace(raw, escaped)
+    # S704 is suppressed below because this is the one place the escaping is DONE
+    # rather than assumed:
+    # `encoded` is pure ASCII JSON with `<`, `>` and `&` already replaced above, so
+    # nothing in it can close the script element or break the literal.
+    return Markup(encoded)  # noqa: S704
+
+
+def render_handoff(
+    request: Request,
+    *,
+    target_path: str,
+    raw_query: str,
+    token: str,
+    domain: str | None,
+    protocol_https: bool = True,
+) -> HTMLResponse:
+    """Hand the browser to the SPA, with the session token in the URL fragment (§4.4 step 8).
+
+    This is the decision of §4.6 / decision 6 made concrete. The alternative - a 303
+    whose `Location` carries the token - would write a live session credential into the
+    reverse proxy's access log on every open of every tenant, and into the browser's
+    history and any intermediary that logs URLs. So the response is an ordinary HTML
+    page whose inline script runs::
+
+        location.replace("<target_path>?<Bitrix24's original query string>#s=<jwt>")
+
+    Three properties of that string are load-bearing:
+
+    * **the query string is forwarded verbatim**, not rebuilt from parsed fields:
+      `APP_SID` (plus `DOMAIN`, `PROTOCOL`, `LANG`) must reach the SPA or `BX24.init`
+      never fires and `fitWindow` / `openPath` / `getAuth` are inert (§11 assumption 11);
+    * **the token is in the fragment**, which browsers never send to a server - so it
+      cannot appear in an access log, a `Referer` or a `rest_log` row (§4.6);
+    * **`target_path` is root-relative and allowlisted**, so this page can never be
+      turned into an open redirect that carries a fresh session token off-origin.
+
+    `token=""` is a first-class case: `/state/denied` and `/state/crm_no_access` are
+    reached through exactly this page **with no fragment at all** (§4.4 step 8 table),
+    because they must be shown inside the same SPA shell but must not carry a session.
+
+    Every input is re-validated here rather than trusted from the caller, in the same
+    spirit as the `frame-ancestors` domain check above: this function is the last code
+    that touches these values before they become a page.
+    """
+    if not _TARGET_PATH_RE.match(target_path):
+        # A programming error, never a portal-supplied value: fail loudly into the
+        # generic error page rather than emit a redirect we cannot vouch for.
+        _log.error("render_handoff: refusing an unsafe target path")
+        return render_error(
+            request, lang=None, domain=domain, protocol_https=protocol_https
+        )
+
+    query = raw_query[1:] if raw_query.startswith("?") else raw_query
+    if not _RAW_QUERY_RE.match(query):
+        # The SPA loses BX24 (§11 assumption 11) but the page still renders; a
+        # malformed query string is not worth a dead frame.
+        _log.warning("render_handoff: dropping a malformed query string")
+        query = ""
+
+    if token and not _TOKEN_RE.match(token):
+        # Cannot happen with `security/session_token.issue_session`; if it ever did,
+        # sending the SPA on without a session is far better than emitting garbage.
+        _log.error("render_handoff: refusing a token that is not a compact JWS")
+        token = ""
+
+    target = target_path
+    if query:
+        target = f"{target}?{query}"
+    if token:
+        # §4.6: `#s=` is the only channel the token ever travels in.
+        target = f"{target}#s={token}"
+
+    # The signature carries no `lang`: Bitrix24 repeats `LANG` in the very query
+    # string this page forwards, so the page's own locale is read back out of it
+    # rather than passed twice and risk disagreeing with what the SPA will use.
+    locale = resolve_locale(_lang_of(query))
+    context = _base_context(locale)
+    context.update(
+        {
+            "title": context["app_name"],
+            # §8 keeps every string in the shared catalogue. These two are optional
+            # there: the page is visible for a few milliseconds, so a missing key
+            # renders nothing rather than a dotted key on a moderator's screen.
+            "progress": t(locale, "handoff.progress") if has_message("handoff.progress") else None,
+            "noscript": (
+                t(locale, "handoff.noscript")
+                if has_message("handoff.noscript")
+                else t(locale, "common.openFromBitrix24")
+            ),
+            "target": _js_string(target),
+        }
+    )
+    return HTMLResponse(
+        content=_render("handoff.html", context),
+        status_code=200,
+        # `Cache-Control: no-store` (§4.10) is what keeps a page carrying a live
+        # session token out of every shared cache and out of the browser's own.
         headers=_headers(domain, protocol_https),
     )

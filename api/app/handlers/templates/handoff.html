@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+{# The session token rides in the fragment this page writes. A fragment is never
+   sent to a server, but a Referer would carry the URL that produced it, so the
+   referrer is suppressed as well (§4.6: the JWT is never logged anywhere). #}
+<meta name="referrer" content="no-referrer">
+<title>{{ title }}</title>
+{# §4.4 step 8: this page exists ONLY to run `location.replace(target)`. A 303 with
+   the token in a `Location` header would be written to the reverse proxy's access
+   log on every open of every tenant (§4.6, decision 6), so the handoff happens in
+   the browser and the token travels in the fragment, which never leaves it.
+
+   Self-contained by design - no script src, no webfont, no stylesheet: the only
+   network this frame is guaranteed to reach is the response itself, and a blocked
+   external resource here would be a blank frame (§4.11). #}
+<style>
+  :root { color-scheme: light dark; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; padding: 24px;
+    display: flex; align-items: center; justify-content: center;
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #1f2733; background: #f4f6f8;
+  }
+  .card { max-width: 520px; text-align: center; }
+  p { margin: 0 0 10px; }
+  .spinner {
+    width: 20px; height: 20px; margin: 0 auto 14px; border-radius: 50%;
+    border: 2px solid #c9d2dd; border-top-color: #2f7de1; animation: spin 900ms linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+  .muted { color: #67707d; font-size: 12px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e6e9ee; background: #171a1f; }
+    .spinner { border-color: #39414c; border-top-color: #6aa6f0; }
+    .muted { color: #98a1af; }
+  }
+</style>
+</head>
+<body data-state="handoff">
+<main class="card" role="main">
+  <div class="spinner" aria-hidden="true"></div>
+  {% if progress %}<p>{{ progress }}</p>{% endif %}
+  <noscript><p>{{ noscript }}</p></noscript>
+  {% if request_id %}
+  <p class="muted">{{ request_id_label }}: <code>{{ request_id }}</code></p>
+  {% endif %}
+</main>
+
+<script>
+  (function () {
+    "use strict";
+    // Built server-side as a JS string literal: the SPA path, Bitrix24's ORIGINAL
+    // query string byte for byte (APP_SID must survive or BX24.init never fires and
+    // fitWindow/openPath/getAuth stay inert - §4.4 step 8, §11 assumption 11), and
+    // the session token in the fragment.
+    var target = {{ target }};
+    try {
+      // replace(), not assign(): the handoff must not become a history entry, or the
+      // browser's Back inside the Bitrix24 slider would re-run it with a spent token.
+      window.location.replace(target);
+    } catch (e) {
+      window.location.href = target;
+    }
+  })();
+</script>
+</body>
+</html>

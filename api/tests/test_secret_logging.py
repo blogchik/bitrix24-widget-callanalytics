@@ -368,3 +368,36 @@ def test_the_sentinels_would_actually_be_found_if_they_leaked(
         assert_clean(
             logs=" ".join(secret for _, secret in SECRETS), rows=[], where="the negative control"
         )
+
+
+def test_a_colliding_extra_key_cannot_fail_the_request_it_describes() -> None:
+    """A log line must never raise, even when `extra` names a LogRecord attribute.
+
+    `logging.Logger.makeRecord` raises KeyError for reserved names, and only once the
+    logger is enabled for that level - so an INFO diagnostic that is silent in tests
+    becomes a 500 in production where LOG_LEVEL=INFO. app.logging renames instead.
+    """
+    import logging as _logging
+
+    from app.logging import get_logger
+
+    log = get_logger("tests.collision")
+    log.setLevel(_logging.INFO)
+    records: list[_logging.LogRecord] = []
+
+    class _Capture(_logging.Handler):
+        def emit(self, record: _logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture()
+    log.addHandler(handler)
+    try:
+        for reserved in ("created", "module", "filename", "process", "args", "message"):
+            log.info("collision", extra={reserved: "value", "portal_id": 7})
+    finally:
+        log.removeHandler(handler)
+
+    assert len(records) == 6
+    for record in records:
+        assert record.portal_id == 7  # type: ignore[attr-defined]
+        assert record.getMessage() == "collision"

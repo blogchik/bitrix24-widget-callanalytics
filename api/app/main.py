@@ -147,18 +147,18 @@ def create_app() -> FastAPI:
             return JSONResponse({"status": "error"}, status_code=503)
         return JSONResponse({"status": "ok"})
 
-    # TODO(milestone 3/5/6): mount the remaining routers. Uncomment as each lands — the
+    # TODO(milestone 5/6): mount the remaining routers. Uncomment as each lands — the
     # import paths and mount order are fixed by §2 and §4, so nothing here is a guess.
+    from app.api.router import router as api_router
     from app.handlers.install import router as install_router
+    from app.handlers.open import router as open_router
 
-    # from app.api.router import router as api_router
     # from app.handlers.events import router as events_router
-    # from app.handlers.open import router as open_router
     #
     app.include_router(install_router)  # POST /install/
-    # app.include_router(open_router)      # POST /app/ and POST /settings/
+    app.include_router(open_router)  # POST /app/ and POST /settings/
     # app.include_router(events_router)    # POST /events/
-    # app.include_router(api_router)       # /api/v1/*, all behind get_principal
+    app.include_router(api_router)  # /api/v1/*, all behind get_principal
 
     return app
 

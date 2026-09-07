@@ -1,0 +1,179 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * The app renders inside a Bitrix24 slider (§4.10), so it owns no chrome of its own:
+ * no header bar, no dark backdrop, no second scrollbar, no webfont. It is meant to
+ * read as a page of Bitrix24, which means the native system font stack, hairline
+ * borders, a lot of white space and exactly one accent colour.
+ *
+ * The palette lives in custom properties rather than in `tailwind.config.ts` because
+ * that config is shared with other milestones; the semantic classes below then keep
+ * light/dark in one place instead of doubling every element's class list. The values
+ * match `api/app/handlers/templates/state.html`, so the server-rendered states and the
+ * client-rendered ones are the same page to a moderator walking §4.11.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --ca-page: #ffffff;
+  --ca-surface: #ffffff;
+  --ca-surface-soft: #f4f6f8;
+  --ca-text: #1f2733;
+  --ca-muted: #67707d;
+  --ca-border: #e3e7ec;
+  --ca-border-soft: #eceff3;
+  --ca-accent: #2067b0;
+  --ca-accent-contrast: #ffffff;
+  --ca-accent-soft: #eaf2fa;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ca-page: #171a1f;
+    --ca-surface: #20242b;
+    --ca-surface-soft: #1c2026;
+    --ca-text: #e6e9ee;
+    --ca-muted: #98a1af;
+    --ca-border: #2f353e;
+    --ca-border-soft: #2a2f37;
+    --ca-accent: #63a8e6;
+    --ca-accent-contrast: #10141a;
+    --ca-accent-soft: #1d2733;
+  }
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  /*
+   * No `height: 100%` anywhere: the document height is what `BX24.fitWindow()`
+   * measures, and a full-viewport body would pin the slider open at maximum size.
+   */
+  body {
+    margin: 0;
+    background: var(--ca-page);
+    color: var(--ca-text);
+    font-family:
+      -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial,
+      'Helvetica Neue', sans-serif;
+    font-size: 14px;
+    line-height: 1.55;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ca-accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+}
+
+@layer components {
+  .ca-page {
+    background: var(--ca-page);
+    color: var(--ca-text);
+  }
+
+  .ca-card {
+    background: var(--ca-surface);
+    border: 1px solid var(--ca-border);
+    border-radius: 12px;
+  }
+
+  .ca-panel {
+    background: var(--ca-surface-soft);
+    border: 1px solid var(--ca-border-soft);
+    border-radius: 10px;
+  }
+
+  .ca-muted {
+    color: var(--ca-muted);
+  }
+
+  .ca-accent {
+    color: var(--ca-accent);
+  }
+
+  .ca-divider {
+    border-top: 1px solid var(--ca-border-soft);
+  }
+
+  /* One accent colour, one button shape. */
+  .ca-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--ca-accent);
+    background: var(--ca-accent);
+    color: var(--ca-accent-contrast);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .ca-button:hover {
+    filter: brightness(1.06);
+  }
+
+  .ca-button-quiet {
+    background: transparent;
+    color: var(--ca-accent);
+    border-color: var(--ca-border);
+  }
+
+  .ca-button-quiet:hover {
+    background: var(--ca-accent-soft);
+    filter: none;
+  }
+
+  /* A small, low-contrast label: placement, entity type, access level. */
+  .ca-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 9px;
+    border-radius: 999px;
+    background: var(--ca-accent-soft);
+    color: var(--ca-accent);
+    font-size: 12px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  /* Full-width notice above the content: the "own calls only" and import banners. */
+  .ca-banner {
+    background: var(--ca-accent-soft);
+    border: 1px solid var(--ca-border);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 13px;
+  }
+
+  .ca-skeleton {
+    background: var(--ca-border-soft);
+    border-radius: 6px;
+    animation: ca-pulse 1.4s ease-in-out infinite;
+  }
+}
+
+@keyframes ca-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ca-skeleton {
+    animation: none;
+  }
+}

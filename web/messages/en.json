@@ -58,5 +58,93 @@
       "title": "Something went wrong",
       "body": "An unexpected error occurred. Close this window and open the app again. If it keeps happening, quote the request code to support."
     }
+  },
+  "errors": {
+    "invalid_session": "The app session has expired. Close this window and open the app from Bitrix24 again.",
+    "network": "Could not reach the app server. Check your connection and try again.",
+    "timeout": "The app server did not answer in time. Please try again.",
+    "server": "The app server returned an error. Try again in a minute.",
+    "context_missing": "The data for this CRM item is out of date. Open the tab again."
+  },
+  "app": {
+    "loading": "Loading…",
+    "retry": "Try again",
+    "signedInAs": "Bitrix24 user #{id}",
+    "ownScopeBanner": "You see your own calls only.",
+    "preview": {
+      "body": "Charts and the call table will appear here. For now this page shows the current session only."
+    },
+    "dashboard": {
+      "title": "Overview"
+    },
+    "crm": {
+      "title": "Calls for this CRM item",
+      "noEntity": "No CRM item in this session"
+    },
+    "settings": {
+      "title": "Settings",
+      "tokenSection": "Authorisation",
+      "tokenStatus": "Token status",
+      "actionsLater": "The 'Re-authorise' and 'Re-bind placements' buttons arrive together with the actions behind them."
+    },
+    "session": {
+      "title": "Session",
+      "user": "User",
+      "access": "Access level",
+      "placement": "Placement",
+      "entity": "CRM item",
+      "timezone": "Time zone",
+      "language": "Language"
+    },
+    "access": {
+      "all": "All calls",
+      "own": "Own calls only",
+      "denied": "No access"
+    },
+    "sync": {
+      "title": "Synchronisation",
+      "status": "Status",
+      "progress": "Imported",
+      "importing": "Importing history: {done} of {total}",
+      "pending": "The history import has not started yet",
+      "done": "The call history is fully imported",
+      "lastRun": "Last successful sync",
+      "lastErrorCode": "Last error code"
+    }
+  },
+  "call": {
+    "direction": {
+      "1": "Outgoing",
+      "2": "Incoming",
+      "3": "Incoming with redirection",
+      "4": "Callback",
+      "5": "Informational",
+      "unknown": "Unknown"
+    },
+    "result": {
+      "200": "Answered",
+      "304": "Missed",
+      "402": "Insufficient funds",
+      "403": "Forbidden",
+      "404": "Invalid number",
+      "423": "Blocked",
+      "480": "Temporarily unavailable",
+      "484": "Unavailable",
+      "486": "Busy",
+      "503": "Unavailable",
+      "603": "Declined",
+      "603-S": "Cancelled",
+      "OTHER": "Undefined",
+      "unknown": "Undefined"
+    }
+  },
+  "crm": {
+    "entity": {
+      "LEAD": "Lead",
+      "DEAL": "Deal",
+      "CONTACT": "Contact",
+      "COMPANY": "Company",
+      "unknown": "CRM item"
+    }
   }
 }

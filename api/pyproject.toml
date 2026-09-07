@@ -1,0 +1,76 @@
+[project]
+name = "callanalytics-api"
+version = "0.1.0"
+description = "Call Analytics for Bitrix24 - FastAPI backend and sync worker"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+
+# Upper bounds are deliberate: this app is pinned to one Bitrix24 contract and a
+# surprise major of SQLAlchemy, pydantic or httpx must be an explicit decision.
+dependencies = [
+    "fastapi>=0.115,<0.120",
+    "uvicorn[standard]>=0.32,<0.40",
+    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "asyncpg>=0.30,<0.31",
+    # Alembic runs synchronously as ca_owner (§3), so the sync driver ships too.
+    "psycopg[binary]>=3.2,<3.3",
+    "alembic>=1.14,<1.20",
+    "httpx>=0.28,<0.29",
+    "pydantic-settings>=2.6,<3",
+    "cryptography>=44,<48",
+    "pyjwt>=2.10,<3",
+    "apscheduler>=3.11,<4",
+    # Bitrix24 opens the app with an application/x-www-form-urlencoded POST (§4.2).
+    "python-multipart>=0.0.20,<0.1",
+    # Server-rendered install.html / handoff.html / state.html (§4.4).
+    "jinja2>=3.1,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.24,<2",
+    "ruff>=0.8,<1",
+    "mypy>=1.13,<2",
+]
+
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# The image installs dependencies from this file BEFORE the sources are copied, so
+# the wheel itself must be allowed to contain no modules.  The app is run from
+# /app (WORKDIR) rather than from site-packages, which is also what makes the dev
+# bind mount hot-reload.
+bypass-selection = true
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "ASYNC", "S", "RUF"]
+ignore = [
+    "S101",  # pytest uses assert
+    "B008",  # FastAPI Depends() in defaults is the framework's idiom
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]  # fixture tokens are fake by construction
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# The project is not installed into site-packages (see bypass-selection above),
+# so /app must be on sys.path for `import app`.
+pythonpath = ["."]
+addopts = "-ra"
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["app"]
+strict = true
+warn_unreachable = true
+plugins = []

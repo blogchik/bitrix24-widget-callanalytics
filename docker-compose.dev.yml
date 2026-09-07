@@ -1,0 +1,52 @@
+# Development overrides: layered on top of docker-compose.yml.
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# (that is what the Makefile does).  Sources are bind-mounted so both servers
+# hot-reload; images still come from the same Dockerfiles as production.
+
+services:
+  postgres:
+    # Loopback only, so psql/DBeaver on the host can connect while nothing is exposed.
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  api:
+    volumes:
+      - ./api:/app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/app"]
+    environment:
+      LOG_LEVEL: DEBUG
+
+  worker:
+    volumes:
+      - ./api:/app
+    environment:
+      LOG_LEVEL: DEBUG
+
+  web:
+    # `next dev` needs the full dependency tree, which the production runner stage
+    # strips out, so development stops at the `build` stage of web/Dockerfile.
+    build:
+      context: ./web
+      target: build
+    image: callanalytics-web:dev
+    volumes:
+      - ./web:/app
+      # Keep the image's installed dependencies and build output; the bind mount
+      # above would otherwise hide them behind the (empty) host directories.
+      - /app/node_modules
+      - /app/.next
+    command: ["npm", "run", "dev"]
+
+  # `docker compose --profile test run --rm test` (see `make test`).
+  # Same image, same postgres; conftest.py owns schema setup and the two roles.
+  test:
+    profiles: ["test"]
+    build: ./api
+    image: callanalytics-api:local
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./api:/app
+    command: ["pytest", "-q"]

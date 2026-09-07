@@ -1,0 +1,102 @@
+# =============================================================================
+# docker/Caddyfile.snippet  --  host Caddy site block for b24.texnobus.uz
+# docs/architecture.md §2 (routing) and §4.10 (frame embedding, TLS, headers)
+#
+# This file is NOT read by anything automatically.  Caddy runs on the host,
+# outside compose; paste this block into /etc/caddy/Caddyfile (or drop it in
+# /etc/caddy/conf.d/ if your Caddyfile has an `import conf.d/*`) and run
+# `caddy validate --config /etc/caddy/Caddyfile` then `systemctl reload caddy`.
+#
+# UPSTREAM NAMES: `api:8000` / `web:3000` resolve only when Caddy is attached to
+# the compose network.  A plain host install must instead use the loopback ports
+# that docker-compose.yml publishes:  127.0.0.1:8000  and  127.0.0.1:3000.
+# Change both reverse_proxy lines together; nothing else differs.
+# =============================================================================
+
+b24.texnobus.uz {
+
+	# ---------------------------------------------------------------- TLS
+	# Automatic HTTPS: Caddy obtains and renews a Let's Encrypt DV certificate for
+	# this name and installs the HTTP->HTTPS redirect on :80 by itself.  Nothing to
+	# configure; set an ACME contact address once, globally, in the top-level
+	# options block:   { email ops@texnobus.uz }
+	# On-premise / staging with a private name: uncomment `tls internal`.
+	# tls internal
+
+	encode zstd gzip
+
+	# ---------------------------------------------------------------- headers
+	header {
+		# HSTS.  Add `preload` only once you are certain every subdomain is HTTPS.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+		# §4.10: the app is rendered INSIDE a Bitrix24 iframe.  X-Frame-Options has
+		# no origin granularity and would break every portal, so it is stripped here
+		# no matter what an upstream sets.  Framing is controlled exclusively by the
+		# per-request `Content-Security-Policy: frame-ancestors` that web/middleware.ts
+		# and the server-rendered install/handoff/state pages emit from the validated
+		# DOMAIN.  Never add X-Frame-Options back.
+		-X-Frame-Options
+
+		# Do not advertise the stack.
+		-Server
+		-X-Powered-By
+
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+
+	# ---------------------------------------------------------------- routing
+	# Bitrix24-facing form POSTs, the SPA's JSON API and the health probe are the
+	# FastAPI app; everything else is the Next.js frontend (§2).
+	@api path /app /app/* /install /install/* /settings /settings/* /events /events/* /api/* /healthz
+
+	handle @api {
+		reverse_proxy api:8000 {
+			# The app builds absolute URLs from APP_BASE_URL, but uvicorn still needs
+			# the real scheme/host for logging and proxy-header handling.
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+		}
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+
+	# ---------------------------------------------------------------- access log
+	# §4.10: a session JWT travels in a URL fragment and, at handoff time, inside the
+	# Location header; Bitrix24's own POST-back query string carries AUTH_ID/APP_SID.
+	# None of it may ever be persisted to disk, so the encoder DELETES the Location
+	# response header and REWRITES the logged URI to drop the query string entirely.
+	# Keep this filter in sync with any new field you add - the default json encoder
+	# logs everything it is given.
+	log {
+		output file /var/log/caddy/b24.texnobus.uz.access.log {
+			roll_size 20MiB
+			roll_keep 7
+			roll_keep_for 168h
+		}
+		format filter {
+			wrap json
+
+			fields {
+				# Drop the whole query string: `/app/?AUTH_ID=...&APP_SID=...` -> `/app/`.
+				# Everything after the first `?` goes, so a parameter added later by
+				# Bitrix24 cannot leak by being unknown to a per-parameter filter.
+				request>uri regexp "\?.*$" ""
+
+				# The handoff response's Location contains the target plus `#s=<jwt>`.
+				# Some proxies log fragments; delete the header rather than trust that.
+				resp_headers>Location delete
+
+				# Nothing below is needed to debug a portal and all of it is either
+				# a credential or personal data.
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>Referer delete
+				resp_headers>Set-Cookie delete
+			}
+		}
+	}
+}

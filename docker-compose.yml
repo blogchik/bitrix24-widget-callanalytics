@@ -1,0 +1,62 @@
+# Base stack: postgres, api, worker (same image as api) and web.
+# Every published port is bound to 127.0.0.1 - the host Caddy (docker/Caddyfile.snippet)
+# is the only thing reachable from the internet.  No secrets inline: everything
+# comes from .env, which is gitignored.
+name: callanalytics
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # POSTGRES_DB is deliberately left at its default so the entrypoint does not
+      # create `callanalytics` owned by the superuser; init.sql creates it OWNER ca_owner (§3).
+      POSTGRES_USER: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # First-boot only: creates roles ca_owner / ca_app and the database (§3).
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  api:
+    build: ./api
+    image: callanalytics-api:local
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  worker:
+    # Same image as api (built once); only the command differs (§2).
+    build: ./api
+    image: callanalytics-api:local
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "app.worker"]
+
+  web:
+    build: ./web
+    image: callanalytics-web:local
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - api
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  pgdata:

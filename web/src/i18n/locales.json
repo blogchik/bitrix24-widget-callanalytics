@@ -1,0 +1,8 @@
+{
+  "locales": ["ru", "en"],
+  "default": "ru",
+  "fallback": {
+    "kz": "ru",
+    "uz": "ru"
+  }
+}

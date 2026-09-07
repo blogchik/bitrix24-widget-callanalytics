@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{{ title }} — {{ app_name }}</title>
+{# §4.11: every state is a rendered, translated page. No script, no webfont, no
+   image, no stylesheet - it must render identically inside a Bitrix24 iframe on a
+   network that can reach nothing but this response. #}
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; padding: 24px;
+    display: flex; align-items: center; justify-content: center;
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #1f2733; background: #f4f6f8;
+  }
+  .card {
+    width: 100%; max-width: 520px; padding: 28px 28px 20px;
+    background: #fff; border: 1px solid #e3e7ec; border-radius: 12px;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, .06);
+  }
+  h1 { margin: 0 0 12px; font-size: 19px; line-height: 1.35; font-weight: 600; }
+  p { margin: 0 0 14px; }
+  .muted { margin: 18px 0 0; padding-top: 14px; border-top: 1px solid #eceff3; color: #67707d; font-size: 12px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e6e9ee; background: #171a1f; }
+    .card { background: #20242b; border-color: #2f353e; box-shadow: none; }
+    .muted { border-top-color: #2f353e; color: #98a1af; }
+  }
+</style>
+</head>
+{# `data-state` names the §4.11 kind in the markup: it is what a moderation walk-through
+   and the handler tests identify a state by, and it costs the reader nothing. #}
+<body data-state="{{ kind }}">
+<main class="card" role="main">
+  <h1>{{ title }}</h1>
+  <p>{{ body }}</p>
+  {% if hint %}<p>{{ hint }}</p>{% endif %}
+  {% if request_id %}
+  {# The id a user can quote to support; it is also the rest_log.correlation_id
+     of every exchange this request made (§6). #}
+  <p class="muted">{{ request_id_label }}: <code>{{ request_id }}</code></p>
+  {% endif %}
+</main>
+</body>
+</html>

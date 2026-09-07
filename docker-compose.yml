@@ -26,7 +26,11 @@ services:
       start_period: 10s
 
   api:
-    build: ./api
+    # Context is the repo root, not ./api: the image must also carry the shared
+    # i18n bundle from web/ (§8). Dockerfile paths are therefore repo-relative.
+    build:
+      context: .
+      dockerfile: api/Dockerfile
     image: callanalytics-api:local
     restart: unless-stopped
     env_file: .env
@@ -39,7 +43,9 @@ services:
 
   worker:
     # Same image as api (built once); only the command differs (§2).
-    build: ./api
+    build:
+      context: .
+      dockerfile: api/Dockerfile
     image: callanalytics-api:local
     restart: unless-stopped
     env_file: .env

@@ -20,11 +20,19 @@ WORKDIR /app
 # uvloop/httptools), so no compiler is installed in the image.
 # The [dev] extra is included because `make test` and `make lint` run pytest, ruff
 # and mypy inside this same image.
-COPY pyproject.toml ./
+COPY api/pyproject.toml ./
 RUN pip install --no-cache-dir ".[dev]"
 
+# ---- shared i18n bundle -----------------------------------------------------
+# docs/architecture.md §8: web/messages/*.json and web/src/i18n/locales.json are the
+# SINGLE source of locales and strings, shared by the Next.js app and the API's
+# server-rendered install/state/error pages. The build context is the repo root so
+# this one bundle can be copied into both images; app/i18n.py reads /app/i18n/.
+COPY --chown=app:app web/messages/ ./i18n/messages/
+COPY --chown=app:app web/src/i18n/locales.json ./i18n/locales.json
+
 # ---- source layer -----------------------------------------------------------
-COPY --chown=app:app . .
+COPY --chown=app:app api/ .
 
 USER app
 

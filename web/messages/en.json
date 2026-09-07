@@ -1,0 +1,62 @@
+{
+  "common": {
+    "appName": "Call Analytics",
+    "requestId": "Request code",
+    "openFromBitrix24": "Open this app from Bitrix24."
+  },
+  "placement": {
+    "crm_tab_title": "Calls"
+  },
+  "install": {
+    "title": "Installing the app",
+    "progress": "Installing…",
+    "hint": "Please keep this window open — the installation finishes automatically.",
+    "fallback": "Could not reach Bitrix24. Close this window and start the installation again."
+  },
+  "state": {
+    "bad_request": {
+      "title": "Invalid request",
+      "body": "The app was opened with invalid parameters. Close this window and open the app from Bitrix24 again."
+    },
+    "not_installed": {
+      "title": "The app is not installed yet",
+      "body": "Ask a Bitrix24 administrator to open the app once — the installation then completes automatically."
+    },
+    "admin_only": {
+      "title": "Administrators only",
+      "body": "Only a Bitrix24 administrator can install and configure this app. Ask your administrator to open it."
+    },
+    "unsupported_portal": {
+      "title": "This Bitrix24 is not supported",
+      "body": "This Bitrix24 did not provide the data the app needs to authorise itself. Installing in this configuration is not supported yet — please contact the app's support."
+    },
+    "method_missing": {
+      "title": "Call statistics are unavailable",
+      "body": "This Bitrix24 does not provide the call statistics method (voximplant.statistic.get). Enable Bitrix24 telephony or update the portal, then open the app again."
+    },
+    "retry": {
+      "title": "Please try again",
+      "body": "Bitrix24 is not responding right now, or the request limit was reached. Close this window and open the app again in a minute."
+    },
+    "scope": {
+      "title": "The app is missing permissions",
+      "body": "The app was not granted the access rights it needs. Reinstall it from the Bitrix24 Market and confirm the requested permissions."
+    },
+    "denied": {
+      "title": "No access to call statistics",
+      "body": "Your account does not have access to call statistics. Ask your Bitrix24 administrator to grant the 'Call statistics — view' permission."
+    },
+    "crm_no_access": {
+      "title": "No access to this CRM item",
+      "body": "You do not have permission to view this CRM item, so its calls are not shown. Please contact your Bitrix24 administrator."
+    },
+    "reauth": {
+      "title": "Re-authorisation required",
+      "body": "The app's authorisation has expired. Ask a Bitrix24 administrator to open the app — it re-authorises automatically."
+    },
+    "error": {
+      "title": "Something went wrong",
+      "body": "An unexpected error occurred. Close this window and open the app again. If it keeps happening, quote the request code to support."
+    }
+  }
+}

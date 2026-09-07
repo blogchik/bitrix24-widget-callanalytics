@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="{{ locale }}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{{ title }} — {{ app_name }}</title>
+{# §4.3 step 6 / research "BX24.installFinish": everything that makes the app work -
+   the credential, the admin proof, placement.bind and event.bind - has already
+   happened server-side by the time this page is served. installFinish is the LAST
+   step; until it runs Bitrix24 considers the app uninstalled and shows no widgets. #}
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; padding: 24px;
+    display: flex; align-items: center; justify-content: center;
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #1f2733; background: #f4f6f8;
+  }
+  .card {
+    width: 100%; max-width: 520px; padding: 28px 28px 20px;
+    background: #fff; border: 1px solid #e3e7ec; border-radius: 12px;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, .06);
+  }
+  .row { display: flex; align-items: center; gap: 12px; }
+  h1 { margin: 0; font-size: 19px; line-height: 1.35; font-weight: 600; }
+  p { margin: 12px 0 0; }
+  .spinner {
+    flex: 0 0 auto; width: 18px; height: 18px; border-radius: 50%;
+    border: 2px solid #c9d2dd; border-top-color: #2f7de1; animation: spin 900ms linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+  .muted { margin: 18px 0 0; padding-top: 14px; border-top: 1px solid #eceff3; color: #67707d; font-size: 12px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+  #fallback { color: #9a3412; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e6e9ee; background: #171a1f; }
+    .card { background: #20242b; border-color: #2f353e; box-shadow: none; }
+    .muted { border-top-color: #2f353e; color: #98a1af; }
+    .spinner { border-color: #39414c; border-top-color: #6aa6f0; }
+    #fallback { color: #f0a675; }
+  }
+</style>
+</head>
+<body>
+<main class="card" role="main">
+  <div class="row">
+    <div class="spinner" aria-hidden="true"></div>
+    <h1>{{ progress }}</h1>
+  </div>
+  <p>{{ hint }}</p>
+  <p id="fallback" hidden>{{ fallback }}</p>
+  {% if request_id %}
+  <p class="muted">{{ request_id_label }}: <code>{{ request_id }}</code></p>
+  {% endif %}
+</main>
+
+{# Protocol-relative on purpose: on-premise portals are reachable over http
+   (PROTOCOL=0) and the SDK must load from the same scheme as the frame. #}
+<script src="//api.bitrix24.com/api/v1/"></script>
+<script>
+  (function () {
+    "use strict";
+    var done = false;
+
+    function fallback() {
+      if (done) { return; }
+      done = true;
+      var node = document.getElementById("fallback");
+      if (node) { node.hidden = false; }
+    }
+
+    function finish() {
+      // BX24.init fires only after Bitrix24 has handed the frame its account data;
+      // installFinish inside the callback is the documented order.
+      try {
+        BX24.init(function () {
+          try {
+            BX24.installFinish();
+            done = true;
+          } catch (e) {
+            fallback();
+          }
+        });
+      } catch (e) {
+        fallback();
+      }
+    }
+
+    if (window.BX24 && typeof window.BX24.init === "function") {
+      finish();
+    } else {
+      // The SDK script is the one external resource this page has; if it did not
+      // load, say so in the user's language instead of leaving a silent frame.
+      window.addEventListener("load", function () {
+        if (window.BX24 && typeof window.BX24.init === "function") { finish(); }
+        else { fallback(); }
+      });
+      window.setTimeout(function () {
+        if (!(window.BX24 && typeof window.BX24.init === "function")) { fallback(); }
+      }, 15000);
+    }
+  })();
+</script>
+</body>
+</html>

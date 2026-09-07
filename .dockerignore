@@ -1,0 +1,19 @@
+# The api image builds from the repo root (it needs web/messages and
+# web/src/i18n/locales.json, the shared i18n bundle of docs/architecture.md §8),
+# so everything the image does not need is excluded here to keep the context small
+# and to guarantee a local .env can never be baked into a layer.
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+.venv
+docs/
+web/node_modules
+web/.next
+web/out

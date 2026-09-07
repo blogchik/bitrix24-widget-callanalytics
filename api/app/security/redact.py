@@ -28,13 +28,21 @@ TRUNCATED: Final = "[truncated]"
 
 # §6: any key whose NAME suggests a credential, at any depth. `client_id` is included
 # because it identifies our vendor application in support-visible logs.
-_SENSITIVE_KEY_RE: Final = re.compile(r"(token|secret|auth|password|client_id)", re.IGNORECASE)
+# `refresh_id` is listed separately because Bitrix24 posts the refresh token under
+# that name, which contains none of the other words; missing it would write a live
+# 180-day credential into rest_log on every install and every app open. It is spelled
+# out rather than a bare `refresh` so diagnostic columns such as `token_refreshed_at`
+# stay readable. `app_sid` and `sessid` are portal session identifiers.
+_SENSITIVE_KEY_RE: Final = re.compile(
+    r"(token|secret|auth|password|client_id|refresh_id|app_sid|sessid)", re.IGNORECASE
+)
 
 # Query/form parameters carrying a credential inside a URL string. The OAuth refresh URL
 # is the reason this exists: httpx-style "GET https://.../oauth/token/?client_secret=..."
 # lines are the classic way a secret escapes into a log.
 _SENSITIVE_PARAM_RE: Final = re.compile(
-    r"(?i)\b(auth|token|access_token|refresh_token|client_secret|client_id|password|secret)"
+    r"(?i)\b(auth|token|access_token|refresh_token|refresh_id|auth_id|application_token"
+    r"|client_secret|client_id|password|secret)"
     r"=([^&\s\"'<>#]*)"
 )
 

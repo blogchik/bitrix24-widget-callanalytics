@@ -313,3 +313,17 @@ async def two_portals(app_engine: AsyncEngine) -> AsyncIterator[TwoPortals]:
     finally:
         await _drop_portal(portal_a.portal_id)
         await _drop_portal(portal_b.portal_id)
+
+
+@pytest.fixture(autouse=True)
+def _reset_oauth_rate_limit() -> None:
+    """Clear the §4.1 exchange limiter between tests.
+
+    The limiter counts refresh exchanges per member_id AND per source IP. Every test
+    driving the app through an ASGI transport shares one synthetic client IP, so without
+    this reset the sixth test in a module trips a limiter that protects production
+    against a very different threat.
+    """
+    from app.bitrix.oauth import reset_exchange_rate_limit
+
+    reset_exchange_rate_limit()

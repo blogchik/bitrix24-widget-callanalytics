@@ -17,6 +17,11 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from app.api.calls import router as calls_router
+from app.api.dashboard import router as dashboard_router
+from app.api.filters import router as filters_router
+from app.api.portal import router as portal_router
+from app.api.record import router as record_router
 from app.api.session import router as session_router
 from app.security.principal import PrincipalErrorRoute
 
@@ -28,16 +33,8 @@ __all__ = ["router"]
 router = APIRouter(prefix="/api/v1", route_class=PrincipalErrorRoute)
 
 router.include_router(session_router)  # GET /me, POST /session/exchange
-
-# TODO(milestone 5): uncomment as each router lands. Paths and modules are fixed by §2.
-# from app.api.calls import router as calls_router          # /calls, /calls/{id}/refresh, /play-url
-# from app.api.dashboard import router as dashboard_router  # /dashboard (one GROUPING SETS query)
-# from app.api.filters import router as filters_router      # /filters (employees + lines)
-# from app.api.portal import router as portal_router        # /portal/sync-status, /portal/reauthorize
-# from app.api.record import router as record_router        # /calls/{id}/record?t=<signed> (§9)
-#
-# router.include_router(dashboard_router)
-# router.include_router(calls_router)
-# router.include_router(filters_router)
-# router.include_router(record_router)
-# router.include_router(portal_router)
+router.include_router(dashboard_router)  # GET /dashboard (one GROUPING SETS query, §10 step 5)
+router.include_router(filters_router)  # GET /filters (employees + lines / sources)
+router.include_router(calls_router)  # GET /calls, POST /calls/{id}/refresh, /play-url
+router.include_router(record_router)  # GET /calls/{id}/record?t=<signed> (§9)
+router.include_router(portal_router)  # GET /portal/sync-status, POST /portal/reauthorize

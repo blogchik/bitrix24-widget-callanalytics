@@ -1,115 +1,201 @@
 {
-  "common": {
-    "appName": "Call Analytics",
-    "requestId": "Request code",
-    "openFromBitrix24": "Open this app from Bitrix24."
-  },
-  "placement": {
-    "crm_tab_title": "Calls"
-  },
-  "install": {
-    "title": "Installing the app",
-    "progress": "Installing…",
-    "hint": "Please keep this window open — the installation finishes automatically.",
-    "fallback": "Could not reach Bitrix24. Close this window and start the installation again."
-  },
-  "state": {
-    "bad_request": {
-      "title": "Invalid request",
-      "body": "The app was opened with invalid parameters. Close this window and open the app from Bitrix24 again."
-    },
-    "not_installed": {
-      "title": "The app is not installed yet",
-      "body": "Ask a Bitrix24 administrator to open the app once — the installation then completes automatically."
-    },
-    "admin_only": {
-      "title": "Administrators only",
-      "body": "Only a Bitrix24 administrator can install and configure this app. Ask your administrator to open it."
-    },
-    "unsupported_portal": {
-      "title": "This Bitrix24 is not supported",
-      "body": "This Bitrix24 did not provide the data the app needs to authorise itself. Installing in this configuration is not supported yet — please contact the app's support."
-    },
-    "method_missing": {
-      "title": "Call statistics are unavailable",
-      "body": "This Bitrix24 does not provide the call statistics method (voximplant.statistic.get). Enable Bitrix24 telephony or update the portal, then open the app again."
-    },
-    "retry": {
-      "title": "Please try again",
-      "body": "Bitrix24 is not responding right now, or the request limit was reached. Close this window and open the app again in a minute."
-    },
-    "scope": {
-      "title": "The app is missing permissions",
-      "body": "The app was not granted the access rights it needs. Reinstall it from the Bitrix24 Market and confirm the requested permissions."
-    },
-    "denied": {
-      "title": "No access to call statistics",
-      "body": "Your account does not have access to call statistics. Ask your Bitrix24 administrator to grant the 'Call statistics — view' permission."
-    },
-    "crm_no_access": {
-      "title": "No access to this CRM item",
-      "body": "You do not have permission to view this CRM item, so its calls are not shown. Please contact your Bitrix24 administrator."
-    },
-    "reauth": {
-      "title": "Re-authorisation required",
-      "body": "The app's authorisation has expired. Ask a Bitrix24 administrator to open the app — it re-authorises automatically."
-    },
-    "error": {
-      "title": "Something went wrong",
-      "body": "An unexpected error occurred. Close this window and open the app again. If it keeps happening, quote the request code to support."
-    }
-  },
-  "errors": {
-    "invalid_session": "The app session has expired. Close this window and open the app from Bitrix24 again.",
-    "network": "Could not reach the app server. Check your connection and try again.",
-    "timeout": "The app server did not answer in time. Please try again.",
-    "server": "The app server returned an error. Try again in a minute.",
-    "context_missing": "The data for this CRM item is out of date. Open the tab again."
-  },
   "app": {
+    "access": {
+      "all": "All calls",
+      "denied": "No access",
+      "own": "Own calls only"
+    },
+    "calls": {
+      "player": {
+        "failed": "The recording is still unavailable. Open the call in Bitrix24 to check whether it still exists.",
+        "loading": "Preparing the recording...",
+        "missing": "This call has no recording any more.",
+        "noViewerToken": "Bitrix24 did not confirm your session, so the recording cannot be played here. Open the call in Bitrix24 instead.",
+        "offBody": "This portal plays call recordings in Bitrix24 itself. Open the call there to listen to it.",
+        "offTitle": "Recordings are played in Bitrix24",
+        "open": "Open in Bitrix24",
+        "openFailed": "Bitrix24 did not open the page. Look for the call in Bitrix24 under Telephony.",
+        "retry": "Try again",
+        "stale": "The recording did not play. It may have been deleted in Bitrix24. A fresh link has been requested - try again in a moment.",
+        "unsupported": "This browser cannot play the recording."
+      },
+      "table": {
+        "allShown": "All calls in this period are shown.",
+        "caption": "One row per call, newest first",
+        "crm": "CRM",
+        "direction": "Direction",
+        "dismissed": "dismissed",
+        "duration": "Duration",
+        "employee": "Employee",
+        "employeeUnknown": "User #{id}",
+        "empty": "No calls in this period.",
+        "emptyImporting": "No calls in this period yet - the call history is still being imported.",
+        "hide": "Hide the player",
+        "loadMore": "Load more",
+        "loadingMore": "Loading...",
+        "noRecording": "No recording",
+        "number": "Number",
+        "play": "Play the recording",
+        "recording": "Recording",
+        "result": "Result",
+        "shown": "{shown} calls",
+        "time": "Time",
+        "timeOrder": "Newest first",
+        "title": "Calls"
+      }
+    },
+    "crm": {
+      "noEntity": "No CRM item in this session",
+      "title": "Calls for this CRM item"
+    },
+    "dashboard": {
+      "callsCount": "{count, plural, =0 {no calls} one {# call} other {# calls}}",
+      "employees": {
+        "other": "Other",
+        "otherHint": "“Other” groups every employee beyond the top {count}.",
+        "title": "By employee"
+      },
+      "empty": {
+        "body": "Change the period or the filters to see calls.",
+        "importing": "The call history is still being imported, so this period may still fill in.",
+        "title": "No calls in this period"
+      },
+      "filter": {
+        "all": "All",
+        "builtin": "Built-in telephony",
+        "direction": "Direction",
+        "dismissed": "dismissed",
+        "employee": "Employee",
+        "line": "Line",
+        "reset": "Reset filters",
+        "result": "Result",
+        "unknownEmployee": "User #{id}",
+        "unknownLine": "Integration #{id}"
+      },
+      "heatmap": {
+        "cell": "{weekday} {hour} — {calls}",
+        "legendHigh": "max {count}",
+        "legendLow": "0",
+        "title": "Load by hour and weekday"
+      },
+      "perDay": {
+        "title": "Calls per day",
+        "total": "Total"
+      },
+      "period": {
+        "custom": "Custom",
+        "d30": "30 days",
+        "d7": "7 days",
+        "from": "From",
+        "label": "Period",
+        "to": "To",
+        "today": "Today",
+        "tooLong": "A period can cover at most {days} days, so the other end was moved."
+      },
+      "series": {
+        "answered": "Answered",
+        "missed": "Missed",
+        "not_connected": "Not connected"
+      },
+      "summary": {
+        "answeredOf": "{answered} of {total} answered",
+        "answeredRate": "Answered rate",
+        "avgTalk": "Average talk time",
+        "down": "down",
+        "flat": "no change",
+        "missed": "Missed",
+        "noPrevious": "No data for the previous period",
+        "points": "{value} pts",
+        "talkTotal": "{duration} in total",
+        "total": "Calls",
+        "up": "up",
+        "vsPrevious": "vs previous period"
+      },
+      "title": "Overview"
+    },
     "loading": "Loading…",
-    "retry": "Try again",
-    "signedInAs": "Bitrix24 user #{id}",
     "ownScopeBanner": "You see your own calls only.",
+    "period": {
+      "12m": "12 months",
+      "30d": "30 days",
+      "90d": "90 days",
+      "label": "Period"
+    },
     "preview": {
       "body": "Charts and the call table will appear here. For now this page shows the current session only."
     },
-    "dashboard": {
-      "title": "Overview"
-    },
-    "crm": {
-      "title": "Calls for this CRM item",
-      "noEntity": "No CRM item in this session"
+    "retry": "Try again",
+    "session": {
+      "access": "Access level",
+      "entity": "CRM item",
+      "language": "Language",
+      "placement": "Placement",
+      "timezone": "Time zone",
+      "title": "Session",
+      "user": "User"
     },
     "settings": {
+      "actionsLater": "The 'Re-authorise' and 'Re-bind placements' buttons arrive together with the actions behind them.",
+      "appVersion": "App version",
+      "capabilitiesSection": "Portal capabilities",
+      "capabilityOff": "no",
+      "capabilityOn": "yes",
+      "domain": "Portal address",
+      "failures": "Consecutive failures",
+      "installedAt": "Installed",
+      "lastAdminOpen": "Last opened by an administrator",
+      "lastError": "Last error",
+      "lastErrorNone": "None",
+      "nextRun": "Next sync attempt",
+      "placementBound": "Bound",
+      "placementFailed": "Not bound",
+      "placementUnknown": "Not attempted",
+      "placementsSection": "CRM tab placements",
+      "portalSection": "Portal",
+      "qualitySection": "Sync health",
+      "quarantined": "Quarantined rows",
+      "quarantinedHint": "Rows Bitrix24 returned that could not be read. Sync is not blocked by them, but a non-zero count is worth reporting.",
+      "reauthorize": "Re-authorise",
+      "reauthorizeFailed": "Re-authorisation failed. Close this window, open the app from Bitrix24 again and retry.",
+      "reauthorizeHint": "Re-authorises the app with your own Bitrix24 session. Only an administrator can do this.",
+      "reauthorizeNoAuth": "Bitrix24 did not provide a session for this window. Close it and open the app again.",
+      "reauthorizeOk": "The app was re-authorised.",
+      "rebind": "Re-bind",
+      "rebindFailed": "The placements could not be re-bound. Try again in a minute.",
+      "rebindHint": "Re-binds the CRM tab in every language the app ships with. Safe to repeat.",
+      "rebindOk": "The placements were re-bound.",
+      "statusUnavailable": "The detailed status service did not answer, so this page shows the summary from your session only.",
+      "throttle": "Rate-limit hits",
       "title": "Settings",
+      "tokenAdminVerified": "Administrator rights last proven",
+      "tokenAge": "Authorisation age",
+      "tokenAgeDays": "{days} days",
+      "tokenExpiring": "This authorisation expires about {days} days from now. Use \"Re-authorise\" to renew it.",
+      "tokenOwner": "Authorised by",
+      "tokenRefreshed": "Last renewed",
       "tokenSection": "Authorisation",
       "tokenStatus": "Token status",
-      "actionsLater": "The 'Re-authorise' and 'Re-bind placements' buttons arrive together with the actions behind them."
+      "working": "Working..."
     },
-    "session": {
-      "title": "Session",
-      "user": "User",
-      "access": "Access level",
-      "placement": "Placement",
-      "entity": "CRM item",
-      "timezone": "Time zone",
-      "language": "Language"
-    },
-    "access": {
-      "all": "All calls",
-      "own": "Own calls only",
-      "denied": "No access"
-    },
+    "signedInAs": "Bitrix24 user #{id}",
     "sync": {
-      "title": "Synchronisation",
-      "status": "Status",
-      "progress": "Imported",
-      "importing": "Importing history: {done} of {total}",
-      "pending": "The history import has not started yet",
       "done": "The call history is fully imported",
+      "importing": "Importing history: {done} of {total}",
+      "importingShort": "Importing history {done} / {total}",
+      "lastErrorCode": "Last error code",
       "lastRun": "Last successful sync",
-      "lastErrorCode": "Last error code"
+      "openSettings": "Open settings",
+      "pending": "The history import has not started yet",
+      "progress": "Imported",
+      "progressLabel": "History import progress",
+      "status": "Status",
+      "title": "Synchronisation",
+      "tokenIssue": {
+        "filter_unsupported": "This Bitrix24 does not support the statistics filter the app needs, so the import has stopped.",
+        "method_missing": "This Bitrix24 no longer provides the call statistics method, so the import has stopped.",
+        "no_stats_permission": "The account the app synchronises with has lost access to call statistics, so new calls are not being imported.",
+        "reauth_required": "The app's authorisation has expired, so new calls are not being imported."
+      }
     }
   },
   "call": {
@@ -138,13 +224,80 @@
       "unknown": "Undefined"
     }
   },
+  "common": {
+    "appName": "Call Analytics",
+    "openFromBitrix24": "Open this app from Bitrix24.",
+    "requestId": "Request code"
+  },
   "crm": {
     "entity": {
-      "LEAD": "Lead",
-      "DEAL": "Deal",
-      "CONTACT": "Contact",
       "COMPANY": "Company",
+      "CONTACT": "Contact",
+      "DEAL": "Deal",
+      "LEAD": "Lead",
       "unknown": "CRM item"
+    }
+  },
+  "errors": {
+    "context_missing": "The data for this CRM item is out of date. Open the tab again.",
+    "invalid_session": "The app session has expired. Close this window and open the app from Bitrix24 again.",
+    "network": "Could not reach the app server. Check your connection and try again.",
+    "server": "The app server returned an error. Try again in a minute.",
+    "timeout": "The app server did not answer in time. Please try again."
+  },
+  "install": {
+    "fallback": "Could not reach Bitrix24. Close this window and start the installation again.",
+    "hint": "Please keep this window open — the installation finishes automatically.",
+    "progress": "Installing…",
+    "title": "Installing the app"
+  },
+  "placement": {
+    "crm_tab_title": "Calls"
+  },
+  "state": {
+    "admin_only": {
+      "body": "Only a Bitrix24 administrator can install and configure this app. Ask your administrator to open it.",
+      "title": "Administrators only"
+    },
+    "bad_request": {
+      "body": "The app was opened with invalid parameters. Close this window and open the app from Bitrix24 again.",
+      "title": "Invalid request"
+    },
+    "crm_no_access": {
+      "body": "You do not have permission to view this CRM item, so its calls are not shown. Please contact your Bitrix24 administrator.",
+      "title": "No access to this CRM item"
+    },
+    "denied": {
+      "body": "Your account does not have access to call statistics. Ask your Bitrix24 administrator to grant the 'Call statistics — view' permission.",
+      "title": "No access to call statistics"
+    },
+    "error": {
+      "body": "An unexpected error occurred. Close this window and open the app again. If it keeps happening, quote the request code to support.",
+      "title": "Something went wrong"
+    },
+    "method_missing": {
+      "body": "This Bitrix24 does not provide the call statistics method (voximplant.statistic.get). Enable Bitrix24 telephony or update the portal, then open the app again.",
+      "title": "Call statistics are unavailable"
+    },
+    "not_installed": {
+      "body": "Ask a Bitrix24 administrator to open the app once — the installation then completes automatically.",
+      "title": "The app is not installed yet"
+    },
+    "reauth": {
+      "body": "The app's authorisation has expired. Ask a Bitrix24 administrator to open the app — it re-authorises automatically.",
+      "title": "Re-authorisation required"
+    },
+    "retry": {
+      "body": "Bitrix24 is not responding right now, or the request limit was reached. Close this window and open the app again in a minute.",
+      "title": "Please try again"
+    },
+    "scope": {
+      "body": "The app was not granted the access rights it needs. Reinstall it from the Bitrix24 Market and confirm the requested permissions.",
+      "title": "The app is missing permissions"
+    },
+    "unsupported_portal": {
+      "body": "This Bitrix24 did not provide the data the app needs to authorise itself. Installing in this configuration is not supported yet — please contact the app's support.",
+      "title": "This Bitrix24 is not supported"
     }
   }
 }

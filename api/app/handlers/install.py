@@ -16,7 +16,6 @@ catches everything and falls back to `error.html` with the request id.
 
 from __future__ import annotations
 
-import importlib
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -536,43 +535,22 @@ async def _install(request: Request, hints: _Hints) -> Response:
 async def _dispatch_event(
     request: Request, form: Mapping[str, str], *, correlation_id: uuid.UUID
 ) -> Response:
-    """Hand an `event=` body to the events handler (§4.2).
+    """Hand an `event=` body to the events handler (§4.2, §4.9).
 
     Some cabinets deliver lifecycle events to the installation URL, so the check runs
     before the placement allowlist - an `ONAPPUNINSTALL` posted here must not be
     answered with "bad request".
 
-    TODO(milestone 6): `handlers/events.py` lands with §4.9's verification ladder; the
-    import is lazy so this endpoint works before it exists, and a missing handler is
-    answered with a logged 200 because a 500 makes Bitrix24 retry an event we would
-    reject anyway.
+    The import is function-local because `handlers/events.py` imports this module's
+    helpers (one definition of the inbound-log shape, the correlation id and the
+    `member_id`-of-a-rejected-body rule): at module scope the two would be a cycle.
+    `handlers/events.py` owns its own `rest_log` row, so nothing is logged twice, and it
+    catches its own failures - a server-to-server endpoint must never be answered with
+    the HTML error page of §4.11.
     """
-    try:
-        module = importlib.import_module("app.handlers.events")
-        handler = getattr(module, "handle_event_form", None) or getattr(
-            module, "handle_event", None
-        )
-    except Exception:
-        _log.warning("install: events handler could not be imported", exc_info=True)
-        handler = None
-    if handler is None:
-        await _log_inbound(
-            request,
-            form,
-            member_id=_raw_member_id(form),
-            correlation_id=correlation_id,
-            kind="event",
-            error_code="events_handler_unavailable",
-            http_status=200,
-        )
-        _log.warning("install: event body received before the events handler exists")
-        return Response(status_code=200)
-    # The events handler owns its own `rest_log` row (§6), so nothing is logged twice.
-    result = await handler(request, form)
-    if isinstance(result, Response):
-        return result
-    _log.error("install: events handler returned no response")
-    return Response(status_code=200)
+    from app.handlers.events import handle_event_form
+
+    return await handle_event_form(request, form, correlation_id=correlation_id)
 
 
 async def _bind_widgets(

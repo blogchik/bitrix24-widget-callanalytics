@@ -1,128 +1,365 @@
 'use client';
 
-import { useLocale, useTranslations } from 'next-intl';
+/**
+ * The left-menu view: the dashboard (`PLACEMENT` `DEFAULT` / `LEFT_MENU`, §4.4, §4.11).
+ *
+ * One `GET /api/v1/dashboard` call serves the whole page - summary tiles, calls per day,
+ * hour x weekday, per employee - because all four are one `GROUPING SETS` aggregation
+ * over one filtered set (§2 `services/stats.py`), and four round trips would let four
+ * panels disagree with each other while a filter is being changed.
+ *
+ * The behaviours that make it read as a Bitrix24 section rather than a third-party page:
+ *
+ *  * **A filter change refetches with the previous data left visible and dimmed.** A
+ *    full-page spinner inside a slider collapses the frame, `fitWindow()` shrinks it,
+ *    and the next paint jumps it back open. Keeping the marks on screen keeps the
+ *    height stable and the change legible.
+ *  * **`BX24.fitWindow()` after the data lands, debounced** (§4.10). `AppFrame` already
+ *    watches the document; this adds the one beat after the numbers arrive, when the
+ *    page height actually changes.
+ *  * **Every terminal condition is a rendered, translated state** (§4.11): `denied` gets
+ *    the mandated sentence, an empty period says "No calls in this period" in words, and
+ *    a failed fetch with stale data on screen explains itself without discarding it.
+ *  * **`acc='own'` hides the employee filter and shows the mandated banner** (§4.7); the
+ *    scope itself is pinned server-side by `scope_filter`, never here.
+ */
 
-import {
-  ErrorState,
-  Field,
-  FieldList,
-  LoadingBlock,
-  PageShell,
-  Section,
-} from '@/components/AppFrame';
+import { useLocale, useTranslations } from 'next-intl';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+import { ErrorState, LoadingBlock, PageShell, Section } from '@/components/AppFrame';
+import CallsPerDayChart, { type DayBucket } from '@/components/CallsPerDayChart';
+import CallsTable from '@/components/CallsTable';
+import EmployeeBars, { type EmployeeBucket } from '@/components/EmployeeBars';
+import Filters, {
+  defaultFilters,
+  toQuery,
+  type DashboardFilters,
+  type FilterOptions,
+  EMPTY_FILTER_OPTIONS,
+} from '@/components/Filters';
+import HourWeekdayHeatmap, { type HourCell } from '@/components/HourWeekdayHeatmap';
 import StateCard from '@/components/StateCard';
-import { deniedBodyKey, useMe, type Me } from '@/lib/api';
-import { formatCount, formatDateTime } from '@/lib/format';
+import SummaryCards, { type DashboardSummary } from '@/components/SummaryCards';
+import SyncBanner from '@/components/SyncBanner';
+import { ApiError, CODE_SERVER, apiFetch, deniedBodyKey, presentError, useMe } from '@/lib/api';
+import { fitWindow } from '@/lib/bx24';
+import { VIZ_CSS } from '@/lib/viz';
+
+/** The period the server actually aggregated, after its own capping (§10 step 5). */
+export interface DashboardRange {
+  from: string;
+  to: string;
+  /** Inclusive length in days; the previous-period comparison uses the same length. */
+  days: number;
+}
 
 /**
- * The left-menu view (`PLACEMENT` `DEFAULT` / `LEFT_MENU`, §4.4).
+ * `GET /api/v1/dashboard` (`api/app/api/dashboard.py`).
  *
- * **Placeholder for milestone 3.** Milestone 5 replaces the body with the summary
- * cards, the per-day chart, the hour x weekday heatmap, the per-employee bars and the
- * calls table. What is real here is the plumbing those views sit on, and it is exactly
- * the part that is easy to get wrong later:
- *
- *  * the session token comes from the URL fragment and never appears anywhere else
- *    (§4.6, `lib/session.ts`),
- *  * `GET /api/v1/me` goes through the bearer wrapper that retries once through the
- *    session exchange (§4.6, §4.8),
- *  * loading, error and `acc='denied'` are rendered states, not blank frames (§4.11),
- *  * `acc='own'` shows the mandated "your own calls only" banner (§4.7),
- *  * the "importing history" banner of §4.11 is driven by the sync summary `GET /me`
- *    already returns, so the real dashboard needs no extra round trip for it.
+ * One response, four shapes, all aggregated in the viewer's timezone and all already
+ * scoped by `scope_filter` (§4.7) - the browser never narrows call data itself.
  */
+export interface DashboardResponse {
+  range: DashboardRange;
+  summary: DashboardSummary;
+  /** One entry per day that had calls; missing days are drawn as zero, not skipped. */
+  per_day: DayBucket[];
+  /** `weekday` is ISO (1 = Monday), `hour` is 0-23, both in the viewer's timezone. */
+  hour_weekday: HourCell[];
+  /** Top employees plus, when there are more, one aggregated `other` row. */
+  per_employee: EmployeeBucket[];
+}
+
+/** How long to wait after a change before asking Bitrix24 to resize the slider. */
+const FIT_DEBOUNCE_MS = 140;
+
 export default function DashboardPage() {
   const t = useTranslations();
   const locale = useLocale();
-  const { data, error, loading, reload } = useMe();
+  const me = useMe();
 
-  if (loading) {
+  const [filters, setFilters] = useState<DashboardFilters | null>(null);
+  const [options, setOptions] = useState<FilterOptions>(EMPTY_FILTER_OPTIONS);
+
+  const timezone = me.data?.timezone ?? null;
+  const access = me.data?.access ?? null;
+  const canRead = access === 'all' || access === 'own';
+
+  // The default period is "the last 30 days" *in the viewer's zone*, so it cannot be
+  // computed before `GET /me` has answered with that zone.
+  useEffect(() => {
+    if (canRead) {
+      setFilters((current) => current ?? defaultFilters(timezone));
+    }
+  }, [canRead, timezone]);
+
+  // The filter vocabulary is a separate, cacheable read and its failure must not take
+  // the page down: without it the selects simply offer "All" (§4.11 - never a blank).
+  useEffect(() => {
+    if (!canRead) {
+      return;
+    }
+    const controller = new AbortController();
+    apiFetch<FilterOptions>('/filters', { signal: controller.signal })
+      .then((value) => {
+        setOptions({
+          employees: Array.isArray(value?.employees) ? value.employees : [],
+          lines: Array.isArray(value?.lines) ? value.lines : [],
+        });
+      })
+      .catch(() => setOptions(EMPTY_FILTER_OPTIONS));
+    return () => controller.abort();
+  }, [canRead]);
+
+  const dashboard = useDashboard(canRead ? filters : null);
+
+  // §4.10: after the numbers land the page height changes, so the slider is re-measured.
+  const fitTimer = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    window.clearTimeout(fitTimer.current);
+    fitTimer.current = window.setTimeout(() => void fitWindow(), FIT_DEBOUNCE_MS);
+    return () => window.clearTimeout(fitTimer.current);
+  }, [dashboard.data, dashboard.pending, filters?.preset, me.data]);
+
+  if (me.loading) {
     return <LoadingBlock label={t('app.loading')} />;
   }
-  if (error || !data) {
-    return <ErrorState error={error} onRetry={reload} />;
+  if (me.error || !me.data) {
+    return <ErrorState error={me.error} onRetry={me.reload} />;
   }
 
-  // §4.7: `denied` is not an error - it is a state with mandated copy, and `GET /me`
-  // is the one endpoint that still answers for such a user.
-  if (data.access === 'denied') {
+  // §4.7: `denied` is a state with mandated copy, not an error.
+  if (me.data.access === 'denied') {
     return (
-      <StateCard kind="denied" title={t('state.denied.title')} body={t(deniedBodyKey(data))} />
+      <StateCard kind="denied" title={t('state.denied.title')} body={t(deniedBodyKey(me.data))} />
     );
   }
 
-  const importing = importText(data, locale, t);
+  const data = dashboard.data;
 
   return (
-    <PageShell
-      title={t('app.dashboard.title')}
-      subtitle={t('app.signedInAs', { id: String(data.user_id) })}
-      chips={
-        <>
-          <span className="ca-chip">{t(`app.access.${data.access}`)}</span>
-          {data.placement ? <span className="ca-chip">{data.placement}</span> : null}
-        </>
-      }
-      banner={
-        importing ? (
-          <span>{importing}</span>
-        ) : data.access === 'own' ? (
-          <span>{t('app.ownScopeBanner')}</span>
-        ) : undefined
-      }
-    >
-      <Section title={t('app.session.title')}>
-        <FieldList>
-          <Field label={t('app.session.user')} value={`#${data.user_id}`} />
-          <Field label={t('app.session.access')} value={t(`app.access.${data.access}`)} />
-          <Field label={t('app.session.placement')} value={data.placement ?? '—'} />
-          <Field label={t('app.session.timezone')} value={data.timezone ?? '—'} />
-          <Field label={t('app.session.language')} value={data.locale ?? locale} />
-        </FieldList>
-      </Section>
+    <>
+      <style dangerouslySetInnerHTML={{ __html: VIZ_CSS }} />
+      <PageShell
+        title={t('app.dashboard.title')}
+        subtitle={data ? rangeLabel(data.range, locale) : undefined}
+        banner={me.data.access === 'own' ? <span>{t('app.ownScopeBanner')}</span> : undefined}
+      >
+        <SyncBanner sync={me.data.sync} isAdmin={me.data.is_admin} locale={locale} />
 
-      <Section title={t('app.sync.title')}>
-        <FieldList>
-          <Field label={t('app.sync.status')} value={syncStatusText(data, locale, t)} />
-          <Field
-            label={t('app.sync.lastRun')}
-            value={formatDateTime(data.sync?.last_incremental_at, locale, data.timezone)}
+        {filters ? (
+          <Filters
+            value={filters}
+            onChange={setFilters}
+            options={options}
+            showEmployee={me.data.access === 'all'}
+            timeZone={timezone}
+            busy={dashboard.pending && data !== null}
           />
-        </FieldList>
-      </Section>
+        ) : null}
 
-      <p className="ca-muted text-[13px]">{t('app.preview.body')}</p>
-    </PageShell>
+        {dashboard.error && data ? (
+          <StaleNotice error={dashboard.error} onRetry={dashboard.reload} />
+        ) : null}
+
+        {!data ? (
+          dashboard.error ? (
+            <ErrorState error={dashboard.error} onRetry={dashboard.reload} />
+          ) : (
+            <LoadingBlock label={t('app.loading')} />
+          )
+        ) : (
+          <div
+            className={dashboard.pending ? 'ca-viz-dim' : undefined}
+            aria-busy={dashboard.pending}
+          >
+            {data.summary.total === 0 ? (
+              <EmptyPeriod importing={Boolean(me.data.sync?.importing)} />
+            ) : (
+              <div className="flex flex-col gap-5">
+                <SummaryCards summary={data.summary} locale={locale} />
+
+                <Section title={t('app.dashboard.perDay.title')}>
+                  <CallsPerDayChart
+                    days={data.per_day}
+                    from={data.range.from}
+                    to={data.range.to}
+                    locale={locale}
+                  />
+                </Section>
+
+                <div
+                  className="grid gap-5"
+                  style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))' }}
+                >
+                  <Section title={t('app.dashboard.heatmap.title')}>
+                    <HourWeekdayHeatmap cells={data.hour_weekday} locale={locale} />
+                  </Section>
+
+                  <Section title={t('app.dashboard.employees.title')}>
+                    <EmployeeBars employees={data.per_employee} locale={locale} />
+                  </Section>
+                </div>
+
+                {/*
+                  The call table is part of the v1 scope, and it is also the table view the
+                  chart palette depends on: one of the series colours sits below 3:1 against
+                  a white surface, and the relief for that is a readable table of the same
+                  numbers. It is therefore never behind a toggle that defaults to off.
+                */}
+                <CallsTable
+                  query={{ ...filters, period: 'custom' }}
+                  timezone={me.data.timezone}
+                  showEmployee={me.data.access === 'all'}
+                  importing={Boolean(me.data.sync?.importing)}
+                />
+              </div>
+            )}
+          </div>
+        )}
+      </PageShell>
+    </>
   );
 }
 
-type Translate = ReturnType<typeof useTranslations>;
+// --- data ------------------------------------------------------------------------------
 
-/**
- * §4.11: "Importing history 12 300 / 250 000" while the backfill is still running.
- *
- * `null` once the history is complete, which is what makes an empty period mean "no
- * calls in this period" rather than "not imported yet".
- */
-function importText(me: Me, locale: string, t: Translate): string | null {
-  const sync = me.sync;
-  if (!sync?.importing) {
-    return null;
-  }
-  const total = sync.backfill_total ?? null;
-  if (total === null) {
-    return t('app.sync.pending');
-  }
-  return t('app.sync.importing', {
-    done: formatCount(sync.backfill_done ?? 0, locale),
-    total: formatCount(total, locale),
-  });
+interface DashboardResource {
+  data: DashboardResponse | null;
+  error: unknown;
+  /** A request is in flight. The previous `data` stays on screen while it is. */
+  pending: boolean;
+  reload: () => void;
 }
 
-function syncStatusText(me: Me, locale: string, t: Translate): string {
-  const importing = importText(me, locale, t);
-  if (importing) {
-    return importing;
+/**
+ * `GET /dashboard` for a filter set, stale-while-refetching.
+ *
+ * The previous response is deliberately *not* cleared when the filters change: §4.11
+ * asks for a page that never goes blank, and inside a slider a disappearing panel also
+ * costs a resize round trip. `pending` drives the dimming; only a first load or a hard
+ * failure has nothing to show.
+ */
+function useDashboard(filters: DashboardFilters | null): DashboardResource {
+  const [data, setData] = useState<DashboardResponse | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const [pending, setPending] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+
+  const query = filters ? toQuery(filters) : null;
+
+  useEffect(() => {
+    if (query === null) {
+      return;
+    }
+    const controller = new AbortController();
+    setPending(true);
+    setError(null);
+    apiFetch<DashboardResponse>(`/dashboard?${query}`, { signal: controller.signal })
+      .then((value) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        // A body that does not carry the four shapes is a contract failure, not data:
+        // rendering half of it would put a blank panel on screen, which §4.11 forbids.
+        if (!isDashboardResponse(value)) {
+          setError(new ApiError(CODE_SERVER, 200));
+          return;
+        }
+        setData(value);
+      })
+      .catch((cause: unknown) => {
+        if (!controller.signal.aborted) {
+          setError(cause);
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setPending(false);
+        }
+      });
+    return () => controller.abort();
+  }, [query, attempt]);
+
+  const reload = useCallback(() => setAttempt((value) => value + 1), []);
+
+  return { data, error, pending, reload };
+}
+
+/** Does this body carry all four shapes the page renders? */
+function isDashboardResponse(value: unknown): value is DashboardResponse {
+  if (!value || typeof value !== 'object') {
+    return false;
   }
-  return me.sync?.backfill_status === 'done' ? t('app.sync.done') : t('app.sync.pending');
+  const body = value as Record<string, unknown>;
+  const range = body.range as Record<string, unknown> | undefined;
+  const summary = body.summary as Record<string, unknown> | undefined;
+  return (
+    typeof range?.from === 'string' &&
+    typeof range?.to === 'string' &&
+    typeof summary?.total === 'number' &&
+    Array.isArray(body.per_day) &&
+    Array.isArray(body.hour_weekday) &&
+    Array.isArray(body.per_employee)
+  );
+}
+
+// --- small states ----------------------------------------------------------------------
+
+/**
+ * §4.11: an empty period says so, in words.
+ *
+ * While the backfill is still running the sentence changes, because "no calls" and "not
+ * imported yet" are different facts and a moderator opening a fresh install must not be
+ * told the first one.
+ */
+function EmptyPeriod({ importing }: { importing: boolean }) {
+  const t = useTranslations();
+  return (
+    <div className="ca-panel px-6 py-10 text-center">
+      <p className="text-[15px] font-medium">{t('app.dashboard.empty.title')}</p>
+      <p className="ca-muted mx-auto mt-2 max-w-md text-[13px]">
+        {importing ? t('app.dashboard.empty.importing') : t('app.dashboard.empty.body')}
+      </p>
+    </div>
+  );
+}
+
+/** A failed refetch while usable numbers are still on screen: explain, offer, keep. */
+function StaleNotice({ error, onRetry }: { error: unknown; onRetry: () => void }) {
+  const t = useTranslations();
+  const { bodyKey } = presentError(error);
+  return (
+    <div className="ca-banner flex flex-wrap items-center gap-x-4 gap-y-2" role="status">
+      <span className="flex-1">{t(bodyKey)}</span>
+      <button type="button" className="ca-button ca-button-quiet" onClick={onRetry}>
+        {t('app.retry')}
+      </button>
+    </div>
+  );
+}
+
+/** "1 Aug - 7 Sep 2026": the period the server actually aggregated, under the title. */
+function rangeLabel(range: DashboardRange, locale: string): string {
+  const options: Intl.DateTimeFormatOptions = {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    timeZone: 'UTC',
+  };
+  const format = (iso: string): string => {
+    const parsed = Date.parse(`${iso}T00:00:00Z`);
+    if (Number.isNaN(parsed)) {
+      return iso;
+    }
+    try {
+      return new Intl.DateTimeFormat(locale, options).format(new Date(parsed));
+    } catch {
+      return iso;
+    }
+  };
+  return range.from === range.to
+    ? format(range.from)
+    : `${format(range.from)} — ${format(range.to)}`;
 }

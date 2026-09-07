@@ -65,7 +65,16 @@ _ENVELOPE_KEYS: Final[frozenset[str]] = frozenset(
 )
 
 # §6: their INFO lines contain the full OAuth URL.
-_MUTED_LOGGERS: Final[tuple[str, ...]] = ("httpx", "httpcore", "hpack", "asyncio")
+# `apscheduler.*` logs two INFO lines per job fire. The tick runs every 15 s, so at INFO
+# it would write ~11 500 lines a day per worker that say only "the scheduler is alive",
+# burying the sync events an operator actually reads (§6).
+_MUTED_LOGGERS: Final[tuple[str, ...]] = (
+    "httpx",
+    "httpcore",
+    "hpack",
+    "asyncio",
+    "apscheduler",
+)
 
 
 def set_request_id(request_id: str | None) -> None:

@@ -1,28 +1,40 @@
-"""Worker entrypoint: `python -m app.worker` (§2 — same image as the api, different CMD).
+"""Worker entrypoint: `python -m app.worker` (§2 - same image as the api, different CMD).
 
-WHY it blocks on an `asyncio.Event` instead of exiting when there is nothing to do:
-the container must stay up and healthy from milestone 1 so compose, restart policies
-and log plumbing are proven before any job exists. §5.9's backend schedules `tick`
-(every 15 s) and the daily purges on its own timer; this process only owns the
-lifetime — build the backend, keep the loop alive, shut the pool down cleanly.
+This process owns a lifetime and nothing else. §5.9 puts the schedule in `app.jobs`
+(`tick` every 15 s plus the daily maintenance) and the work in `app.jobs.definitions`;
+what is left here is: bring logging up, build and start the backend, block until the
+container is asked to stop, then shut the scheduler and the connection pool down.
 
-WHY the job layer is imported by name rather than at the top of the file: `app.jobs`
-lands in milestone 4. Probing for it keeps today's container startable and means the
-only change then is uncommenting the schedule calls below — the shape does not move.
+WHY it blocks on an `asyncio.Event` rather than on the scheduler: APScheduler's
+`AsyncIOScheduler` runs on the loop it was started in and never blocks, so something
+has to hold the loop open. An `Event` set from a signal handler is the smallest thing
+that also gives SIGTERM - how Docker asks for a stop - a clean path: without it the
+runtime is SIGKILLed after the grace period, and every pooled connection shows up in
+the Postgres log as a reset.
+
+WHY nothing is awaited before `stop.wait()`: an interrupted sync visit loses nothing.
+Every batch commits its rows and its cursor together (§5.3) and the lease expires on
+its own, so the correct shutdown is a fast one - the next tick, in this container or
+its replacement, resumes from committed state (§5.9 durability).
+
+WHY `SCHEDULER_INLINE` makes this process idle instead of exiting: §11 assumption 13
+allows the deployment to collapse the worker into the api container. In that mode the
+api's lifespan owns the schedule (`app.jobs.job_layer`), and a worker container that
+also scheduled `tick` would double every timer. Exiting would fight the restart policy,
+so it stays up, healthy and deliberately empty, and says so in the log.
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib
-import importlib.util
-import inspect
 import signal
-from typing import Any
 
 from app.config import settings
 from app.db.engine import dispose_engine
+from app.jobs import DEFAULT_SCHEDULE, job_layer
+from app.jobs.protocol import JobBackend
 from app.logging import get_logger, setup_logging
+from app.sync.lease import WORKER_ID
 
 _log = get_logger("app.worker")
 
@@ -39,45 +51,63 @@ def _install_signal_handlers(stop: asyncio.Event) -> None:
             signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
 
 
-async def _build_backend() -> Any | None:
-    """Return the §5.9 `JobBackend`, or None while `app/jobs/` does not exist yet."""
-    try:
-        if importlib.util.find_spec("app.jobs") is None:
-            return None
-    except ModuleNotFoundError:
-        return None
-    module = importlib.import_module("app.jobs")
-    get_backend = getattr(module, "get_backend", None)
-    if get_backend is None:
-        return None
-    backend = get_backend()
-    if inspect.isawaitable(backend):
-        backend = await backend
-    return backend
-
-
 async def run() -> None:
+    """Start the job layer (unless the api owns it) and block until asked to stop."""
     setup_logging()
     stop = asyncio.Event()
     _install_signal_handlers(stop)
 
-    backend = await _build_backend()
-    if backend is None:
-        _log.info("job layer not built yet")
-    else:
-        _log.info("job backend ready", extra={"job_backend": settings.job_backend})
-        # TODO(milestone 4): the only lines that change here. §5.9 schedules `tick`
-        # every 15 s and the daily retention purges; nothing else is periodic.
-        # backend.schedule_periodic("tick", 15)
-        # backend.schedule_periodic("purge_rest_log", 86400)
-        # backend.schedule_periodic("purge_crm_contexts", 86400)
+    # `WORKER_ID` (host:pid) is what `portal_sync.lease_owner` records, so it is the
+    # first thing to log: it is how a support engineer maps a stuck lease to a container.
+    _log.info(
+        "worker starting",
+        extra={
+            "worker_id": WORKER_ID,
+            "job_backend": settings.job_backend,
+            "scheduler_inline": settings.scheduler_inline,
+            "portal_concurrency": settings.global_portal_concurrency,
+        },
+    )
 
-    _log.info("worker started")
+    if settings.scheduler_inline:
+        _log.warning(
+            "SCHEDULER_INLINE is set: the api process owns the schedule, so this "
+            "worker stays idle (running it too would double every timer)",
+            extra={"worker_id": WORKER_ID},
+        )
+        try:
+            await stop.wait()
+        finally:
+            await dispose_engine()
+        return
+
     try:
-        await stop.wait()
+        async with job_layer() as backend:
+            _log.info(
+                "worker started",
+                extra={
+                    "worker_id": WORKER_ID,
+                    "schedule": [name for name, _ in DEFAULT_SCHEDULE],
+                },
+            )
+            await stop.wait()
+            _log.info("worker stopping", extra={"worker_id": WORKER_ID})
+            _ = backend  # the context manager stops it on the way out
     finally:
-        _log.info("worker stopping")
         await dispose_engine()
+        _log.info("worker stopped", extra={"worker_id": WORKER_ID})
+
+
+async def scheduler_backend() -> JobBackend:
+    """The inline hook for `SCHEDULER_INLINE=1` (§11 assumption 13).
+
+    Exposed so the api's lifespan can adopt the same schedule with one `async with
+    job_layer():` instead of re-deriving it; there is exactly one definition of what
+    runs periodically, in `app.jobs.DEFAULT_SCHEDULE`.
+    """
+    from app.jobs import start_backend
+
+    return await start_backend()
 
 
 def main() -> None:

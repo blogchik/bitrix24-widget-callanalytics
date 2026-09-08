@@ -16,11 +16,15 @@ model CRM rights, we borrow the answer. §4.4 step 5 turns any error on these co
 the `crm_no_access` state with **no** entity JWT, and §4.8 refuses to serve a cached
 context that a *different*, possibly more privileged, user resolved.
 
-Everything here is a **pure function that returns `(key, method, params)` triples**. No
-HTTP happens in this file, because the caller owns the batch: §4.4 budgets one batch for
-the whole open (`user.current`, `user.admin`, `app.info`, the access probe and these), and
-a client of our own here would turn one round trip into two and spend the portal's shared
-operating-time budget twice (§5.6).
+Everything in the open-time path is a **pure function that returns
+`(key, method, params)` triples**. No HTTP happens there, because the caller owns the
+batch: §4.4 budgets one batch for the whole open (`user.current`, `user.admin`, `app.info`,
+the access probe and these), and a client of our own there would turn one round trip into
+two and spend the portal's shared operating-time budget twice (§5.6).
+
+`resolve_recording_url` is the one exception, and it belongs to a different path: §4.6's
+playback endpoint has no batch to join and one thing to ask. It is documented at its own
+definition.
 
 Paging: `crm.activity.list` answers 50 rows per page, and §3 caps the stored set at
 `CRM_ACTIVITY_CAP` (250 = 5 pages x 50, "the handler's page budget"). `deal_context_commands`
@@ -34,13 +38,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
-from app.bitrix.client import BatchResult
+from app.bitrix.client import BatchResult, BitrixClient
 from app.config import settings
+from app.logging import get_logger
 
 __all__ = [
     "ACTIVITY_KEY",
     "ACTIVITY_PAGE_SIZE",
     "ACTIVITY_TYPE_CALL",
+    "CRM_ACTIVITY_GET",
     "CRM_ACTIVITY_LIST",
     "CRM_DEAL_CONTACT_ITEMS_GET",
     "CRM_DEAL_GET",
@@ -59,11 +65,15 @@ __all__ = [
     "parse_activity_ids",
     "parse_deal_entity_keys",
     "present_activity_keys",
+    "resolve_recording_url",
 ]
 
 CRM_DEAL_GET: Final[str] = "crm.deal.get"
 CRM_DEAL_CONTACT_ITEMS_GET: Final[str] = "crm.deal.contact.items.get"
 CRM_ACTIVITY_LIST: Final[str] = "crm.activity.list"
+CRM_ACTIVITY_GET: Final[str] = "crm.activity.get"
+
+_log = get_logger(__name__)
 
 #: `crm.activity.list` `filter.OWNER_TYPE_ID`. These are Bitrix24's CRM owner-type ids,
 #: not our `entity_type` strings; the mapping is the whole reason a deal tab and a lead
@@ -383,3 +393,120 @@ def parse_deal_entity_keys(
         add("COMPANY", _field(deal, "COMPANY_ID", "company_id"))
 
     return keys
+
+
+# --- the recording a call activity carries (§4.6, §9) --------------------------------
+
+
+def _file_entries(files: Any) -> Sequence[Any]:
+    """A `FILES` value as a sequence of entries, in whichever shape it arrived.
+
+    `crm.activity.get` types `FILES` as `diskfile` (`crm.activity.fields`), and on the live
+    portal it comes back as a JSON list. Three other shapes are handled anyway, because
+    Bitrix24's PHP serialiser is what decides and it is not consistent across builds or
+    across empty/non-empty results: the field may be **absent** or **null** (no attachment),
+    a **list**, or a **dict keyed by index** (`{"0": {...}}` - how PHP renders an array
+    whose keys are not a clean 0..n range). A bare single entry is accepted too. Anything
+    else yields no entries at all, which the caller turns into `None`; a shape we do not
+    recognise must degrade to "no Bitrix-hosted URL, use the stored one", never to a 500 on
+    a playback request.
+    """
+    if isinstance(files, Mapping) and _field(files, "url", "URL") is not None:
+        return (files,)
+    return _rows(files)
+
+
+async def resolve_recording_url(
+    client: BitrixClient, *, activity_id: int, record_file_id: int | None
+) -> str | None:
+    """The Bitrix24-hosted URL of one call's recording, or None if it cannot be named.
+
+    WHY this exists at all (§9, docs/spike-recording-playback.md): `calls.call_record_url`
+    points at the telephony provider, and on the live portal our server cannot pull from it
+    - every request shape a real player makes returns headers and then no body, while the
+    same request from an ordinary client network succeeds. Bitrix24 keeps its own copy,
+    because a Marketplace telephony integration is required to call
+    `telephony.externalCall.attachRecord` (which is why `RECORD_FILE_ID` is populated), and
+    `crm.activity.get` hands that copy over as a `FILES` entry:
+
+        FILES: [ {id: <file id>, url: ".../bitrix/tools/crm_show_file.php?fileId=...
+                                        &ownerTypeId=6&ownerId=<activity id>&auth=<token>"} ]
+
+    Measured twice from the container that cannot reach the provider: `Range: bytes=0-`
+    returns 206 and the whole 3,962,880-byte body in 1.15 s, a mid-file range returns 206
+    with a correct `Content-Range` in 0.26 s, and no request stalls. The endpoint needs no
+    cookie and no portal session - the `auth` parameter is the whole gate. `crm.activity.get`
+    is scope `crm`, which the app already holds, so this costs no new scope and no new
+    install prompt.
+
+    What is measured is not the same as what is promised: `FILES` is a documented activity
+    field, but neither "a telephony recording lands there" nor "that endpoint serves
+    audio/mpeg with byte ranges" is documented anywhere. The caller therefore keeps the
+    stored-URL path wired as a fallback, and this function returns `None` rather than
+    raising whenever it cannot name a file with confidence.
+
+    Matching rules:
+
+    * With a `record_file_id` (all 3,209 recorded calls on the first portal have one), the
+      entry whose id equals it is the recording. Ids are compared **numerically**: Bitrix24
+      serialises numbers as strings in some responses and as integers in others
+      (docs/bitrix24-api-research.md), and `"42" != 42` would silently return None forever.
+    * Without one, a **single** file in `FILES` is taken as the recording, and several files
+      yield `None`. An activity can carry ordinary attachments; guessing which of them is
+      the recording would eventually play a customer some other document.
+
+    Raises `BitrixError` (the client's typed failure) rather than swallowing it, so the
+    caller can tell "this portal does not attach recordings" from "the REST call failed"
+    and log them differently. It never raises for a payload shape.
+
+    The returned URL is NEVER logged: the embedded `auth` is a live access token (§6, §3
+    decision 21). The file id and the activity id are logged instead - they name the same
+    thing to a support engineer and carry no credential.
+    """
+    number = _as_int(activity_id)
+    if number is None or number <= 0:
+        # A row whose `crm_activity_id` is not a usable id: nothing to ask about, and a
+        # raise here would turn one bad row into a 500 on a playback request.
+        return None
+
+    result = await client.call(CRM_ACTIVITY_GET, {"id": number})
+    if not isinstance(result, Mapping):
+        return None
+
+    wanted = _as_int(record_file_id) if record_file_id is not None else None
+    candidates: list[tuple[int | None, str]] = []
+    for entry in _file_entries(_field(result, "FILES", "files")):
+        if not isinstance(entry, Mapping):
+            continue
+        raw_url = _field(entry, "url", "URL")
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            continue
+        candidates.append((_as_int(_field(entry, "id", "ID")), raw_url.strip()))
+
+    if wanted is not None:
+        for file_id, url in candidates:
+            if file_id == wanted:
+                _log.info(
+                    "crm: recording resolved from activity",
+                    extra={"activity_id": number, "file_id": wanted},
+                )
+                return url
+        _log.info(
+            "crm: recording file not attached to activity",
+            extra={"activity_id": number, "file_id": wanted, "files": len(candidates)},
+        )
+        return None
+
+    if len(candidates) == 1:
+        file_id, url = candidates[0]
+        _log.info(
+            "crm: recording resolved from the activity's only file",
+            extra={"activity_id": number, "file_id": file_id},
+        )
+        return url
+
+    _log.info(
+        "crm: activity carries no unambiguous recording",
+        extra={"activity_id": number, "files": len(candidates)},
+    )
+    return None

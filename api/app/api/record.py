@@ -35,14 +35,28 @@ What the endpoint does, in order:
   the portal's access token. The guard is at import time, below, because a mode that
   leaks a credential must stop the container, not the request.
 
-The stored `call_record_url` is never in a response body, never in a log line and never
-in a header (§3 decision 21); it is read into a local, used to open one upstream
-request, and dropped.
+**Which URL is streamed** changed after the §9 spike (docs/spike-recording-playback.md).
+On the first real portal `call_record_url` points at the telephony provider, and this
+server cannot pull from it: every request shape a player makes returns headers and then
+no body. Bitrix24 keeps its own copy of the recording - Marketplace telephony
+integrations must call `telephony.externalCall.attachRecord`, which is why
+`RECORD_FILE_ID` is populated - and `crm.activity.get` hands it over as a `FILES` entry
+on the call's activity, served with byte ranges from the portal's own host. So when the
+row names an activity, one `crm.activity.get` resolves the upstream URL
+(`bitrix/crm.py::resolve_recording_url`) and the stored URL becomes the fallback for a
+portal whose recordings are not attached to an activity.
+
+Neither the stored URL nor the resolved one is ever in a response body, a log line or a
+header (§3 decision 21); each is read into a local, used to open one upstream request,
+and dropped. The resolved one carries a live access token in its own query string,
+which is the second reason it is never logged.
 """
 
 from __future__ import annotations
 
+import contextlib
 import time
+import uuid
 from collections.abc import AsyncIterator
 from typing import Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -52,12 +66,14 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
 
+from app.bitrix.client import BitrixClient
+from app.bitrix.crm import resolve_recording_url
 from app.bitrix.errors import BitrixError
 from app.bitrix.oauth import CredentialUnavailable, MemberIdMismatch, with_portal_token
 from app.config import settings
 from app.db.models import Call, Portal
 from app.db.session import control_txn, tenant_txn
-from app.logging import get_logger
+from app.logging import get_logger, get_request_id
 from app.security.crypto import DecryptionError
 from app.security.principal import Principal, PrincipalErrorRoute
 from app.security.session_token import PlayClaims, TokenError, verify_play_token
@@ -302,6 +318,72 @@ async def _access_token_for(claims: PlayClaims, portal: Portal) -> str | None:
     return await with_portal_token(portal.id, _use)
 
 
+async def _bitrix_hosted_url(
+    claims: PlayClaims,
+    portal: Portal,
+    *,
+    access_token: str,
+    activity_id: int,
+    record_file_id: int | None,
+) -> str | None:
+    """Ask the portal for its own copy of this recording, or None if it cannot say (§9).
+
+    WHY a REST call on the playback path: the stored `call_record_url` points at the
+    telephony provider and this server cannot pull from it (docs/spike-recording-playback.md
+    - headers, then no body, on every request shape a player makes). The portal's own copy
+    answers a `Range: bytes=0-` with the whole 3,962,880-byte body in 1.15 s from the same
+    container, so this is the difference between playback and no playback.
+
+    It spends **one extra round trip** against §5.6's shared operating-time budget, and
+    spends it per playback request rather than per recording - an `<audio>` element issues
+    several Range requests against the same URL. The result is deliberately **not cached**:
+    the URL embeds an access token with a lifetime of its own, so a cached entry would keep
+    being served after that token expired and the browser would receive a login page as
+    audio - a failure that looks exactly like a deleted recording and would be debugged as
+    one. A cheap wrong answer here is worse than a round trip.
+
+    The call is made with the token `_access_token_for` already chose: the portal token for
+    an administrator, the viewer's own token for anyone else. That is not incidental - the
+    `auth` Bitrix24 embeds in the URL it returns is that same token, so a non-admin gets a
+    link Bitrix24 will evaluate as them (§4.7, §9 step 3).
+
+    Any REST failure is answered with None rather than an error: the caller then streams the
+    stored URL exactly as before, so this path can only add playbacks, never remove one.
+    """
+    try:
+        correlation_id = uuid.UUID(get_request_id() or uuid.uuid4().hex)
+    except ValueError:  # a request id that is not a UUID: log the call under a fresh one
+        correlation_id = uuid.uuid4()
+    admin = claims.acc == _ACCESS_ALL
+    try:
+        async with BitrixClient(
+            endpoint=portal.client_endpoint,
+            access_token=access_token,
+            portal_id=portal.id,
+            member_id=portal.member_id,
+            # Whose token is in play, for §6's `rest_log`: the portal's technical user for
+            # an administrator, the listener themself otherwise.
+            token_user_id=portal.token_user_id if admin else claims.sub,
+            correlation_id=correlation_id,
+        ) as client:
+            return await resolve_recording_url(
+                client, activity_id=activity_id, record_file_id=record_file_id
+            )
+    except BitrixError as exc:
+        # The code only, never `str(exc)`: a Bitrix24 error description can quote the
+        # request back at us, and that request carries the access token (§6).
+        _log.info(
+            "record: activity lookup failed, falling back to the stored link",
+            extra={
+                "portal_id": portal.id,
+                "call_id": claims.cid,
+                "activity_id": activity_id,
+                "error_code": exc.code,
+            },
+        )
+        return None
+
+
 async def _stream(
     request: Request, url: str, *, portal_id: int, call_id: int
 ) -> StreamingResponse | JSONResponse:
@@ -396,10 +478,8 @@ async def _stream(
             # group in the log. Closing is best-effort by definition: the request is over
             # either way, and there is nobody left to tell.
             for closer in (upstream.aclose, client.aclose):
-                try:
+                with contextlib.suppress(Exception):
                     await closer()
-                except Exception:  # noqa: BLE001 - teardown must not fail the response
-                    pass
 
     headers = {
         key: value
@@ -460,7 +540,14 @@ async def record(call_id: int, request: Request) -> Response:
     statement = (
         base_select(principal)
         .where(Call.id == call_id)
-        .with_only_columns(Call.call_record_url, Call.has_record)
+        # `crm_activity_id` and `record_file_id` are what name the portal's own copy of
+        # the recording (§9); `call_record_url` stays selected as the fallback.
+        .with_only_columns(
+            Call.call_record_url,
+            Call.has_record,
+            Call.crm_activity_id,
+            Call.record_file_id,
+        )
     )
     async with tenant_txn(portal.id) as session:
         row = (await session.execute(statement)).first()
@@ -474,11 +561,14 @@ async def record(call_id: int, request: Request) -> Response:
         # as "open the call in Bitrix24".
         return _error("recording_disabled", 409)
 
-    url = (row.call_record_url or "").strip()
-    if not url:
-        # `has_record` is true for a row with only `RECORD_FILE_ID` (§3): the recording
-        # exists in Bitrix24 but there is no URL to stream, and `disk.file.get` needs a
-        # scope this app does not request (§9 option 3). The SPA falls back to the link.
+    stored_url = (row.call_record_url or "").strip()
+    activity_id = row.crm_activity_id
+    if not stored_url and activity_id is None:
+        # Nothing to stream and nothing to ask about. `has_record` is true for a row that
+        # carries only `RECORD_FILE_ID` (§3), and with no activity there is no way to reach
+        # the file: `disk.file.get` needs a scope this app does not request (§9 option 3).
+        # The SPA falls back to the link. Rows that DO name an activity are answered after
+        # the lookup below, because that is what turns a file id into something streamable.
         return _error("record_missing", 404)
 
     try:
@@ -497,8 +587,33 @@ async def record(call_id: int, request: Request) -> Response:
             return _error("viewer_token_required", 409)
         return _error("record_unavailable", 502)
 
+    # §9: prefer the portal's OWN copy of the recording, reached through the call's CRM
+    # activity, because the provider URL in `call_record_url` does not answer this server
+    # (docs/spike-recording-playback.md). A portal that does not attach its recordings to
+    # an activity resolves nothing here and is served exactly as it was before.
+    url = ""
+    if activity_id is not None:
+        url = (
+            await _bitrix_hosted_url(
+                claims,
+                portal,
+                access_token=access_token,
+                activity_id=int(activity_id),
+                record_file_id=row.record_file_id,
+            )
+            or ""
+        )
+    if not url:
+        url = stored_url
+    if not url:
+        return _error("record_missing", 404)
+
     # The credential is attached ONLY for the portal's own hosts (§4.1: a URL that came
-    # back inside a REST response is still portal-controlled data).
+    # back inside a REST response is still portal-controlled data). This is where the
+    # resolved URL differs from the stored one for the first time: it lives on the portal's
+    # own host, so `_same_host` matches and `_with_auth` replaces the `auth` Bitrix24
+    # embedded with the token chosen for THIS viewer. Both halves are already right for
+    # that case and are deliberately left alone.
     upstream_url = (
         _with_auth(url, access_token)
         if _same_host(url, portal.client_endpoint, portal.domain)

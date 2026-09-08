@@ -401,3 +401,36 @@ def test_a_colliding_extra_key_cannot_fail_the_request_it_describes() -> None:
     for record in records:
         assert record.portal_id == 7  # type: ignore[attr-defined]
         assert record.getMessage() == "collision"
+
+
+def test_uvicorn_never_writes_the_request_line_with_its_query_string() -> None:
+    """§4.10: the query string carries AUTH_ID and APP_SID on every portal open.
+
+    Caddy strips it from the edge log, but `uvicorn.access` formats the raw request
+    line and would write it straight to container stdout, re-creating the leak one
+    layer in. Our own middleware already logs the path, so this logger is disabled.
+    """
+    import logging as _logging
+
+    from app.logging import setup_logging
+
+    setup_logging()
+    access = _logging.getLogger("uvicorn.access")
+    assert access.disabled, (
+        "uvicorn.access is enabled; it logs `GET /app/?AUTH_ID=... HTTP/1.1` verbatim"
+    )
+
+    records: list[_logging.LogRecord] = []
+
+    class _Capture(_logging.Handler):
+        def emit(self, record: _logging.LogRecord) -> None:  # pragma: no cover - guard
+            records.append(record)
+
+    handler = _Capture()
+    _logging.getLogger().addHandler(handler)
+    try:
+        access.info('%s - "%s %s HTTP/%s" %d', "1.2.3.4", "GET", "/app/?AUTH_ID=leak", "1.1", 200)
+    finally:
+        _logging.getLogger().removeHandler(handler)
+
+    assert not records, "a disabled logger still emitted a record"

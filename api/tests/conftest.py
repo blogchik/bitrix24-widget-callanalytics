@@ -71,7 +71,7 @@ def _probe(url: str) -> str | None:
 
     try:
         asyncio.run(_connect())
-    except Exception as exc:  # noqa: BLE001 - any failure means "cannot test here"
+    except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
     return None
 

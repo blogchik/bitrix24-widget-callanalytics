@@ -37,6 +37,8 @@ curl http://127.0.0.1:8000/healthz
 
 `make test` runs the suite; `make migrate` applies migrations; `make logs` tails everything.
 `tools/README.md` explains how to seed a demo portal and screenshot the dashboard.
+To put it on a server, follow [docs/deployment.md](docs/deployment.md) — it covers the
+first deploy, upgrades, rollback, backups and what to look at when a portal complains.
 
 The app itself is only reachable through Bitrix24, which POSTs to `/install/`, `/app/` and
 `/settings/`. Opening `http://127.0.0.1:3000/` directly renders "open this app from Bitrix24",
@@ -77,6 +79,7 @@ Three properties are worth knowing before reading the code:
 | [docs/design-review-findings.md](docs/design-review-findings.md) | The adversarial review that shaped the design: 38 issues with failure scenarios |
 | [docs/moderation-checklist.md](docs/moderation-checklist.md) | The manual test script to walk before submitting to Bitrix24 |
 | [docs/spike-recording-playback.md](docs/spike-recording-playback.md) | The playback protocol, ready to run on a real portal |
+| [docs/deployment.md](docs/deployment.md) | First deploy, upgrade, rollback, backups, and the operator's reference |
 
 ## Configuration
 

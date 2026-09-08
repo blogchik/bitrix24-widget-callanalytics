@@ -15,23 +15,25 @@ hence the case-insensitive compare - and that the published list is *not* closed
 """
 
 __all__ = [
-    "BitrixError",
-    "TransportError",
-    "ExpiredToken",
-    "NoAuthFound",
-    "InvalidCredentials",
     "AccessDenied",
-    "UserAccessError",
+    "BitrixError",
+    "ExpiredToken",
     "InsufficientScope",
-    "QueryLimitExceeded",
-    "OperationTimeLimit",
-    "MethodNotFound",
-    "PortalDeleted",
-    "PaymentRequired",
+    "InvalidCredentials",
     "InvalidGrant",
+    "MethodNotFound",
+    "NoAuthFound",
+    "OperationTimeLimit",
+    "PaymentRequired",
+    "PortalDeleted",
+    "QueryLimitExceeded",
+    "TransportError",
     "UnknownBitrixError",
+    "UserAccessError",
     "classify",
 ]
+
+from typing import Any
 
 
 class BitrixError(Exception):
@@ -50,7 +52,7 @@ class BitrixError(Exception):
     code: str
     description: str
     http_status: int | None
-    payload: dict
+    payload: dict[str, Any]
 
     def __init__(
         self,
@@ -58,7 +60,7 @@ class BitrixError(Exception):
         *,
         description: str = "",
         http_status: int | None = None,
-        payload: dict | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> None:
         self.code = code or self.default_code
         self.description = description
@@ -198,7 +200,7 @@ def classify(
     *,
     http_status: int | None = None,
     description: str = "",
-    payload: dict | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> BitrixError:
     """Build - never raise - the typed error for one Bitrix24 failure.
 
@@ -219,7 +221,7 @@ def classify(
         cls = UnknownBitrixError
 
     safe_description: str = description if isinstance(description, str) else str(description)
-    safe_payload: dict = payload if isinstance(payload, dict) else {}
+    safe_payload: dict[str, Any] = payload if isinstance(payload, dict) else {}
     return cls(
         raw.strip(),
         description=safe_description,

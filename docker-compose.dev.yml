@@ -12,6 +12,13 @@ services:
   api:
     volumes:
       - ./api:/app
+      # `./api:/app` hides everything the image put under /app, including the shared
+      # i18n bundle the Dockerfile copies to /app/i18n (§8). Without these two the
+      # server-rendered install/state/error pages fall back to message keys and every
+      # state looks like a generic error. Mounting the source of truth read-only keeps
+      # the dev container reading exactly what the image ships.
+      - ./web/messages:/app/i18n/messages:ro
+      - ./web/src/i18n/locales.json:/app/i18n/locales.json:ro
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/app"]
     environment:
       LOG_LEVEL: DEBUG
@@ -19,6 +26,13 @@ services:
   worker:
     volumes:
       - ./api:/app
+      # `./api:/app` hides everything the image put under /app, including the shared
+      # i18n bundle the Dockerfile copies to /app/i18n (§8). Without these two the
+      # server-rendered install/state/error pages fall back to message keys and every
+      # state looks like a generic error. Mounting the source of truth read-only keeps
+      # the dev container reading exactly what the image ships.
+      - ./web/messages:/app/i18n/messages:ro
+      - ./web/src/i18n/locales.json:/app/i18n/locales.json:ro
     environment:
       LOG_LEVEL: DEBUG
 
@@ -41,7 +55,11 @@ services:
   # Same image, same postgres; conftest.py owns schema setup and the two roles.
   test:
     profiles: ["test"]
-    build: ./api
+    # Repo-root context, like the api service: the image carries the i18n bundle and
+    # the ingress snippet, and `build: ./api` would resolve neither.
+    build:
+      context: .
+      dockerfile: api/Dockerfile
     image: callanalytics-api:local
     env_file: .env
     depends_on:
@@ -49,4 +67,14 @@ services:
         condition: service_healthy
     volumes:
       - ./api:/app
+      # `./api:/app` hides everything the image put under /app, including the shared
+      # i18n bundle the Dockerfile copies to /app/i18n (§8). Without these two the
+      # server-rendered install/state/error pages fall back to message keys and every
+      # state looks like a generic error. Mounting the source of truth read-only keeps
+      # the dev container reading exactly what the image ships.
+      - ./web/messages:/app/i18n/messages:ro
+      - ./web/src/i18n/locales.json:/app/i18n/locales.json:ro
+      # tests/test_routing.py parses the ingress snippet to assert which upstream each
+      # path resolves to - the regression guard for the /settings routing blocker.
+      - ./docker:/docker:ro
     command: ["pytest", "-q"]

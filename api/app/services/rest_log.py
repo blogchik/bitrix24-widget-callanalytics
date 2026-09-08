@@ -108,7 +108,7 @@ async def write_rest_log(
     http_status: int | None = None,
     error_code: str | None = None,
     response: Any = None,
-    time_block: dict | None = None,
+    time_block: dict[str, Any] | None = None,
     duration_ms: int | None = None,
 ) -> None:
     """Record exactly one exchange (§6). Opens its own transaction; never raises.

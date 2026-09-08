@@ -28,7 +28,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.db.session import control_txn, tenant_txn
-from tests.fixtures.bitrix import patch_httpx, seed_portal, delete_portal
+from tests.fixtures.bitrix import delete_portal, patch_httpx, seed_portal
 
 pytestmark = pytest.mark.asyncio
 
@@ -349,7 +349,7 @@ async def test_a_fresh_portal_imports_its_whole_history_and_lands_on_exact_curso
     portal_and_bitrix,  # type: ignore[no-untyped-def]
 ) -> None:
     """The headline promise of §5.2-§5.3: every call, no gaps, cursors at the extremes."""
-    seeded, fake = portal_and_bitrix
+    seeded, _fake = portal_and_bitrix
 
     # Enough visits for head fetch plus a backfill that yields after its per-visit budget.
     await _drive(seeded.portal_id, visits=8)

@@ -167,19 +167,22 @@ class Settings(BaseSettings):
                 )
             if key_id in ring:
                 raise ConfigError(f"TOKEN_ENC_KEYS contains duplicate key id {key_id}")
+            # A distinct name from the `material` used above for the string half of the
+            # "<id>:<base64>" split: reusing it made the decoded key a str to the checker.
+            key_bytes: bytes
             if isinstance(raw_material, (bytes, bytearray)):
-                material = bytes(raw_material)
+                key_bytes = bytes(raw_material)
             else:
                 try:
-                    material = base64.b64decode(str(raw_material), validate=True)
+                    key_bytes = base64.b64decode(str(raw_material), validate=True)
                 except (binascii.Error, ValueError):
                     raise ConfigError(f"TOKEN_ENC_KEYS key {key_id} is not valid base64") from None
-            if len(material) != _TOKEN_KEY_BYTES:
+            if len(key_bytes) != _TOKEN_KEY_BYTES:
                 raise ConfigError(
                     f"TOKEN_ENC_KEYS key {key_id} must decode to {_TOKEN_KEY_BYTES} bytes, "
-                    f"got {len(material)}"
+                    f"got {len(key_bytes)}"
                 )
-            ring[key_id] = material
+            ring[key_id] = key_bytes
 
         if not ring:
             raise ConfigError("TOKEN_ENC_KEYS must contain at least one key")

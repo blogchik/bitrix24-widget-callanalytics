@@ -98,13 +98,16 @@ async def purge_portal_data(
                 # ctid keeps the chunking identical for the surrogate-key table and the
                 # two composite-key ones; RLS applies to the sub-select as well.
                 result = await session.execute(
-                    text(  # noqa: S608 - table names come from a module constant
+                    # S608: `table` and `_CHUNK` are module constants, never input. The
+                    # table name cannot be a bound parameter, and the point of this
+                    # stand-in is to issue the same raw DELETE the real purge does.
+                    text(
                         f"""
                         DELETE FROM {table}
                         WHERE ctid IN (
                             SELECT ctid FROM {table} WHERE portal_id = :pid LIMIT {_CHUNK}
                         )
-                        """
+                        """  # noqa: S608
                     ),
                     {"pid": portal_id},
                 )

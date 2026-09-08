@@ -39,9 +39,8 @@ async def control_txn() -> AsyncIterator[AsyncSession]:
     purge asserts emptiness for exactly this reason: a DELETE issued from a
     control transaction reports success having deleted nothing.
     """
-    async with session_factory() as session:
-        async with session.begin():
-            yield session
+    async with session_factory() as session, session.begin():
+        yield session
 
 
 @asynccontextmanager
@@ -59,7 +58,6 @@ async def tenant_txn(portal_id: int) -> AsyncIterator[AsyncSession]:
     reaches us, indirectly, from a Bitrix24 payload.
     """
     pid = int(portal_id)  # reject anything that is not an integer id before it reaches SQL
-    async with session_factory() as session:
-        async with session.begin():
-            await session.execute(_SET_TENANT, {"pid": str(pid)})
-            yield session
+    async with session_factory() as session, session.begin():
+        await session.execute(_SET_TENANT, {"pid": str(pid)})
+        yield session

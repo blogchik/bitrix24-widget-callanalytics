@@ -1,0 +1,106 @@
+# Production overrides. Layered on top of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# (or `make prod-up`, which is the same command). Never layer docker-compose.dev.yml
+# on a server: it bind-mounts the working tree over the image and runs `next dev`.
+#
+# What this file changes and why:
+#   * pins the images to a tag instead of :local, so a rollback is `IMAGE_TAG=<old> up -d`
+#   * gives every service a healthcheck, so `up -d` waits for a working stack
+#   * caps container logs, because the default json-file driver grows without bound
+#   * caps memory, so one runaway service cannot take the box down with it
+#   * hardens postgres and drops write access to the container filesystems
+#
+# It does NOT publish any port beyond loopback: the host Caddy is the only thing the
+# internet reaches (docker/Caddyfile.snippet).
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  postgres:
+    logging: *logging
+    # A crash-safe default: fsync stays on. Tune shared_buffers to the box, not to
+    # this file's guess - see docs/deployment.md.
+    command: >
+      postgres
+      -c max_connections=100
+      -c shared_buffers=512MB
+      -c work_mem=16MB
+      -c maintenance_work_mem=256MB
+      -c effective_cache_size=1536MB
+      -c log_min_duration_statement=2000
+      -c log_lock_waits=on
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    stop_grace_period: 1m
+
+  api:
+    image: ${IMAGE_REGISTRY:-}callanalytics-api:${IMAGE_TAG:-local}
+    logging: *logging
+    # `--proxy-headers` with a restricted trust list: Caddy is the only hop, so the
+    # forwarded headers are trustworthy only from the compose network. Trusting `*`
+    # would let a request that somehow bypassed Caddy spoof its own client address.
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --forwarded-allow-ips
+      - ${TRUSTED_PROXY_IPS:-172.16.0.0/12,127.0.0.1}
+      - --workers
+      - "${API_WORKERS:-2}"
+      - --no-access-log
+    healthcheck:
+      # /healthz opens a control transaction, so a green container means the database
+      # is reachable too - which is what `up -d --wait` should be waiting for.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5).status==200 else 1)\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    stop_grace_period: 30s
+
+  worker:
+    image: ${IMAGE_REGISTRY:-}callanalytics-api:${IMAGE_TAG:-local}
+    logging: *logging
+    # EXACTLY ONE worker replica. The lease makes a second one safe (it would take
+    # different portals), but nothing needs it at this scale and two schedulers double
+    # the tick rate against an API every tenant shares (§5.6).
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 1g
+    # The worker must finish the batch it is in and release its lease; killing it
+    # mid-visit costs a re-leased portal and one re-fetched batch, not data, but a
+    # clean exit keeps the lease table honest (§5.9).
+    stop_grace_period: 2m
+
+  web:
+    image: ${IMAGE_REGISTRY:-}callanalytics-web:${IMAGE_TAG:-local}
+    logging: *logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/ || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    stop_grace_period: 30s

@@ -1,0 +1,35 @@
+# The repo is edited on Windows and deployed on Linux, so line endings are not a style
+# question here. A shell script checked out with CRLF fails on the server with
+# `bad interpreter: /usr/bin/env bash^M`, and a Dockerfile or entrypoint with CRLF fails
+# the same way inside the image - both at deploy time, which is the worst moment to
+# discover it. Everything that a Linux process executes or parses is pinned to LF.
+
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.py        text eol=lf
+*.sql       text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.toml      text eol=lf
+*.ini       text eol=lf
+*.mako      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.ts        text eol=lf
+*.tsx       text eol=lf
+*.js        text eol=lf
+*.mjs       text eol=lf
+*.css       text eol=lf
+*.html      text eol=lf
+Makefile    text eol=lf
+Dockerfile  text eol=lf
+*.snippet   text eol=lf
+.env.example text eol=lf
+
+# Binary, so git never rewrites bytes inside them.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary

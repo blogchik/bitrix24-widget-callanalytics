@@ -36,8 +36,8 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
-from app.bitrix.errors import BitrixError, InvalidGrant, TransportError
 from app.bitrix.client import BitrixClient
+from app.bitrix.errors import BitrixError, InvalidGrant, TransportError
 from app.bitrix.identity import NotAnAdministrator, verify_admin_token
 from app.bitrix.oauth import (
     CredentialUnavailable,

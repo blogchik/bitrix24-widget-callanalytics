@@ -6,7 +6,12 @@ COMPOSE ?= docker compose
 FILES   := -f docker-compose.yml -f docker-compose.dev.yml
 DC      := $(COMPOSE) $(FILES)
 
-.PHONY: up down build logs migrate revision test lint fmt psql shell
+# Production layers the prod override instead of the dev one. Never both: the dev file
+# bind-mounts the working tree over the image and runs `next dev`.
+PROD_FILES := -f docker-compose.yml -f docker-compose.prod.yml
+PROD       := $(COMPOSE) $(PROD_FILES)
+
+.PHONY: up down build logs migrate revision test lint fmt psql shell         prod-build prod-up prod-down prod-migrate prod-logs prod-ps prod-backup
 
 ## Start postgres, api, worker and web in the background (dev overrides on).
 up:
@@ -56,3 +61,37 @@ psql:
 ## Shell inside a fresh api container (non-root).
 shell:
 	$(DC) run --rm api bash
+
+
+# ---------------------------------------------------------------------------
+# Production (see docs/deployment.md). Every target honours IMAGE_TAG, which is
+# what makes a rollback `IMAGE_TAG=<old-sha> make prod-up` rather than a rebuild.
+# ---------------------------------------------------------------------------
+
+## Build the production images and tag them with IMAGE_TAG (default: the git sha).
+prod-build:
+	IMAGE_TAG=$${IMAGE_TAG:-$$(git rev-parse --short HEAD)} $(PROD) build
+
+## Start (or update) the stack and wait until every healthcheck is green.
+prod-up:
+	IMAGE_TAG=$${IMAGE_TAG:-$$(git rev-parse --short HEAD)} $(PROD) up -d --wait
+
+## Stop the stack. The postgres volume survives; `down -v` would not.
+prod-down:
+	$(PROD) down
+
+## Apply migrations as ca_owner. Run this BEFORE prod-up on an upgrade.
+prod-migrate:
+	IMAGE_TAG=$${IMAGE_TAG:-$$(git rev-parse --short HEAD)} $(PROD) run --rm api python -m alembic upgrade head
+
+## Follow the logs of the production stack.
+prod-logs:
+	$(PROD) logs -f --tail=200
+
+## What is running, and is it healthy.
+prod-ps:
+	$(PROD) ps
+
+## Verified database dump into /var/backups/callanalytics (override with DEST=...).
+prod-backup:
+	./tools/backup.sh $${DEST:-/var/backups/callanalytics}

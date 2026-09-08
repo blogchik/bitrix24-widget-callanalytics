@@ -58,3 +58,7 @@ desktop.ini
 *.local
 tmp/
 .review/
+
+# Created on the host by the dev bind mount that maps web/messages into the api
+# container (docker-compose.dev.yml); the real bundle lives in web/.
+api/i18n/

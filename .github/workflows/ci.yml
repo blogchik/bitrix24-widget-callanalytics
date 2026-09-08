@@ -1,0 +1,84 @@
+# CI runs the same commands a developer runs, through the same compose files, so a
+# green run here means the stack that would be deployed actually builds and passes.
+# It deliberately does NOT use a GitHub `services:` postgres: the roles, the RLS setup
+# and the ca_app/ca_owner split come from docker/postgres/init.sql on first boot, and
+# a hand-rolled service container would drift from what production does.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate a CI .env
+        # Placeholder vendor credentials: nothing in the suite talks to Bitrix24, every
+        # exchange is a mock transport. The secrets are real random values because
+        # config.py validates their shape at import.
+        run: ./tools/make-env.sh --ci
+
+      - name: Build images
+        # Builds api (which also type-checks nothing, but fails on a bad Dockerfile or
+        # a dependency that no longer resolves) and web (which runs `next build`, so a
+        # TypeScript error or a broken page fails here).
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml build
+
+      - name: Start PostgreSQL
+        run: |
+          docker compose up -d postgres
+          docker compose ps
+
+      - name: Apply migrations
+        # A separate step from the suite so a broken migration is reported as a broken
+        # migration rather than as 378 failing tests.
+        run: docker compose run --rm -T api python -m alembic upgrade head
+
+      - name: Verify the schema the migration produced
+        # The three properties the whole tenancy model rests on. Cheap to assert, and a
+        # migration that silently drops one would otherwise only surface as a data leak.
+        run: |
+          docker compose exec -T postgres psql -U postgres -d callanalytics -tAc "
+            SELECT CASE WHEN count(*) = 3 THEN 'ok' ELSE 'MISSING RLS' END
+              FROM pg_class
+             WHERE relname IN ('calls','employees','crm_contexts')
+               AND relrowsecurity AND relforcerowsecurity;
+          " | grep -q '^ok$'
+          docker compose exec -T postgres psql -U postgres -tAc "
+            SELECT CASE WHEN NOT rolbypassrls THEN 'ok' ELSE 'ca_app CAN BYPASS RLS' END
+              FROM pg_roles WHERE rolname = 'ca_app';
+          " | grep -q '^ok$'
+          docker compose exec -T postgres psql -U postgres -d callanalytics -tAc "
+            SELECT CASE WHEN count(*) = 3 THEN 'ok' ELSE 'MISSING POLICIES' END
+              FROM pg_policies WHERE schemaname = 'public';
+          " | grep -q '^ok$'
+
+      - name: Test
+        # The worker is not started in CI, so nothing competes for portal leases.
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile test run --rm -T test
+
+      - name: Lint and type-check the API
+        run: docker compose run --rm -T api sh -c "ruff check . && mypy app"
+
+      - name: Type-check the web app
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml run --rm -T web npx tsc --noEmit
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose logs --tail=200
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v

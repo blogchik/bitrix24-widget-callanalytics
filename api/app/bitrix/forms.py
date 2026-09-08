@@ -20,17 +20,17 @@ from typing import Any, Final
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 __all__ = [
-    "FormValidationError",
-    "IframePost",
-    "EventPost",
-    "is_event_body",
-    "parse_iframe_post",
-    "parse_event_post",
-    "expand_bracket_keys",
-    "PLACEMENTS",
     "CRM_PLACEMENTS",
     "MAX_BODY_BYTES",
     "MAX_PLACEMENT_OPTIONS_BYTES",
+    "PLACEMENTS",
+    "EventPost",
+    "FormValidationError",
+    "IframePost",
+    "expand_bracket_keys",
+    "is_event_body",
+    "parse_event_post",
+    "parse_iframe_post",
 ]
 
 
@@ -124,7 +124,7 @@ class IframePost(BaseModel):
     application_scope: str
     status: str | None
     placement: str
-    placement_options: dict
+    placement_options: dict[str, Any]
     scopes: frozenset[str]
     #: Bitrix24's ORIGINAL query string, carried through byte for byte and never
     #: rebuilt from the parsed fields: `handoff.html` must forward `APP_SID` or the
@@ -147,17 +147,22 @@ class EventPost(BaseModel):
     client_endpoint: str | None
     domain: str | None
     scope: str | None
-    data: dict
+    data: dict[str, Any]
 
 
 # --- small helpers ------------------------------------------------------------------
 
 
-def _ci_index(mapping: Mapping[str, str]) -> dict[str, str]:
+def _ci_index(mapping: Mapping[str, Any]) -> dict[str, str]:
     """Case-insensitive view of a form/query mapping.
 
     Bitrix24 mixes cases across cabinets (`member_id` lower, `DOMAIN` upper, and the
     query string repeats some of the body fields), so lookups are normalised once.
+
+    The value type is `Any`, not `str`, because the real argument is a Starlette
+    `FormData` holding whatever arrived on the wire - an upload part is not a string.
+    The isinstance guard below is therefore a runtime check on untrusted input, not
+    dead code (§4.2).
     """
     index: dict[str, str] = {}
     for key, value in mapping.items():
@@ -288,7 +293,7 @@ def _parse_scopes(application_scope: str) -> frozenset[str]:
     return frozenset(parts)
 
 
-def _parse_placement_options(raw: str | None, placement: str) -> dict:
+def _parse_placement_options(raw: str | None, placement: str) -> dict[str, Any]:
     """`PLACEMENT_OPTIONS`: valid JSON object <= 4 KB, numeric `ID` on a CRM tab (§4.2).
 
     The numeric check matters beyond hygiene: the id is fed to `crm.deal.get` and to the
@@ -311,7 +316,7 @@ def _parse_placement_options(raw: str | None, placement: str) -> dict:
     if not isinstance(parsed, dict):
         raise FormValidationError("PLACEMENT_OPTIONS", "not_an_object")
 
-    options: dict = dict(parsed)
+    options: dict[str, Any] = dict(parsed)
     if placement in CRM_PLACEMENTS:
         entity_id: Any = options.get("ID")
         if isinstance(entity_id, bool) or entity_id is None:
@@ -358,7 +363,7 @@ def is_event_body(form: Mapping[str, str]) -> bool:
     return False
 
 
-def expand_bracket_keys(form: Mapping[str, str]) -> dict:
+def expand_bracket_keys(form: Mapping[str, str]) -> dict[str, Any]:
     """PHP-style `auth[member_id]` / `data[FIELDS][ID]` -> nested dicts (§4.2, §4.9).
 
     Bounded on purpose: an attacker controls the key text, and an uncapped walk over
@@ -369,7 +374,7 @@ def expand_bracket_keys(form: Mapping[str, str]) -> dict:
     not use them, and this keeps the return type a plain dict.
     """
     _check_body_size(form)
-    root: dict = {}
+    root: dict[str, Any] = {}
     for key, value in form.items():
         match = _BRACKET_KEY_RE.match(key)
         if match is None:
@@ -382,7 +387,7 @@ def expand_bracket_keys(form: Mapping[str, str]) -> dict:
         if len(segments) + 1 > MAX_BRACKET_DEPTH:
             raise FormValidationError(key[:MAX_KEY_LENGTH], "key_too_deep")
 
-        node: dict = root
+        node: dict[str, Any] = root
         path: list[str] = [base, *segments]
         for segment in path[:-1]:
             name = segment if segment != "" else str(len(node))
@@ -498,7 +503,7 @@ def parse_event_post(form: Mapping[str, str]) -> EventPost:
     expanded = expand_bracket_keys(form)
     flat = _ci_index(form)
     auth_raw = expanded.get("auth")
-    auth: dict = auth_raw if isinstance(auth_raw, dict) else {}
+    auth: dict[str, Any] = auth_raw if isinstance(auth_raw, dict) else {}
     auth_index = _ci_index({k: v for k, v in auth.items() if isinstance(v, str)})
 
     def field(name: str) -> str | None:
@@ -534,7 +539,7 @@ def parse_event_post(form: Mapping[str, str]) -> EventPost:
         _parse_scopes(scope)  # same allowlist as APPLICATION_SCOPE; value kept verbatim
 
     data_raw = expanded.get("data")
-    data: dict = data_raw if isinstance(data_raw, dict) else {}
+    data: dict[str, Any] = data_raw if isinstance(data_raw, dict) else {}
 
     try:
         return EventPost(

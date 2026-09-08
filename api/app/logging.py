@@ -22,10 +22,18 @@ import sys
 from collections.abc import Mapping
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from types import TracebackType
 from typing import Any, Final
 
 from app.config import settings
 from app.security.redact import REDACTED, redact
+
+# The stdlib's own parameter types for `Logger.makeRecord`, spelled out because typeshed
+# keeps them private and `object` here makes the override incompatible with the base.
+type _ArgsType = tuple[object, ...] | Mapping[str, object]
+type _SysExcInfoType = (
+    tuple[type[BaseException], BaseException, TracebackType | None] | tuple[None, None, None]
+)
 
 _request_id: ContextVar[str | None] = ContextVar("request_id", default=None)
 
@@ -181,6 +189,15 @@ def setup_logging() -> None:
         uvicorn_logger.handlers.clear()
         uvicorn_logger.propagate = True
 
+    # uvicorn.access formats the raw request line, query string included, so it would
+    # write `GET /app/?AUTH_ID=...&APP_SID=... HTTP/1.1` into container stdout on every
+    # open - re-creating at the application exactly the leak the Caddy log filter strips
+    # at the edge (§4.10). Our own middleware already emits one structured line per
+    # request carrying the path and never the query, so this logger is pure duplication
+    # on top of a credential leak. Disabled here rather than via `--no-access-log` so it
+    # holds however the process is launched.
+    logging.getLogger("uvicorn.access").disabled = True
+
 
 class _SafeExtraLogger(logging.Logger):
     """Logger that cannot be killed by a colliding `extra` key.
@@ -195,15 +212,15 @@ class _SafeExtraLogger(logging.Logger):
     key is renamed to `ctx_<key>` instead of raising.
     """
 
-    def makeRecord(  # noqa: PLR0913 - signature fixed by the stdlib
+    def makeRecord(
         self,
         name: str,
         level: int,
         fn: str,
         lno: int,
         msg: object,
-        args: object,
-        exc_info: object,
+        args: _ArgsType,
+        exc_info: _SysExcInfoType | None,
         func: str | None = None,
         extra: Mapping[str, object] | None = None,
         sinfo: str | None = None,
@@ -215,9 +232,7 @@ class _SafeExtraLogger(logging.Logger):
                 collides = key in ("message", "asctime") or key in probe.__dict__
                 safe[f"ctx_{key}" if collides else key] = value
             extra = safe
-        return super().makeRecord(  # type: ignore[no-any-return,arg-type]
-            name, level, fn, lno, msg, args, exc_info, func, extra, sinfo
-        )
+        return super().makeRecord(name, level, fn, lno, msg, args, exc_info, func, extra, sinfo)
 
 
 logging.setLoggerClass(_SafeExtraLogger)

@@ -12,7 +12,8 @@ from sqlalchemy import text  # noqa: E402
 from app.db.session import control_txn, tenant_txn  # noqa: E402
 from app.security.session_token import issue_session  # noqa: E402
 
-MEMBER_ID = "5c0de5m0ke5c0de5m0ke5c0de5m0ke11"
+# 32 lowercase hex: portals_member_id_fmt rejects anything else (§3).
+MEMBER_ID = "5c0de5000ce5c0de5000ce5c0de50011"
 USERS = [(101, "Азиз", "Каримов"), (102, "Дилноза", "Юсупова"), (103, "Тимур", "Сафаров")]
 CODES = ["200", "200", "200", "304", "486", "603"]
 
@@ -51,6 +52,7 @@ async def main() -> None:
         started = now - dt.timedelta(days=rng.randint(0, 29), hours=rng.randint(8, 19),
                                      minutes=rng.randint(0, 59))
         code = CODES[rng.randrange(len(CODES))]
+        app_id = rng.choice([None, None, 41])
         rows.append(
             {
                 "p": portal_id,
@@ -61,7 +63,8 @@ async def main() -> None:
                 "c": code,
                 "u": USERS[rng.randrange(len(USERS))][0],
                 "ph": f"+9989{rng.randint(10_000_000, 99_999_999)}",
-                "app": rng.choice([None, None, 41]),
+                "app": app_id,
+                "appname": None if app_id is None else "SIP-линия",
             }
         )
 
@@ -78,8 +81,10 @@ async def main() -> None:
             text(
                 "INSERT INTO calls (portal_id, bx_id, call_type, call_start_date, "
                 "call_duration, call_failed_code, portal_user_id, phone_number, rest_app_id, "
-                "rest_app_name) VALUES (:p, :bx, :t, :d, :dur, :c, :u, :ph, :app, "
-                "CASE WHEN :app IS NULL THEN NULL ELSE 'SIP-линия' END)"
+                # asyncpg cannot infer a type for a parameter used only inside CASE,
+                # so the nullable integer is cast explicitly and the name passed in.
+                "rest_app_name) VALUES (:p, :bx, :t, :d, :dur, :c, :u, :ph, "
+                "cast(:app as integer), :appname)"
             ),
             rows,
         )

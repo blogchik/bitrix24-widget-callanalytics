@@ -1,0 +1,202 @@
+# CD: publish the images, then put them on the one production host.
+#
+# `main` is the deployment branch and nothing else. Development happens on `dev`, `main`
+# is reached only through a reviewed pull request whose CI was green, and a push to it is
+# what starts this workflow. There is no other path to production: the deploy key on the
+# server accepts three commands and no shell, so a human with SSH can still break glass
+# but a human with a laptop cannot quietly ship a build nobody saw.
+#
+# Two properties are worth reading before changing anything here:
+#
+#  * **The image is built once, here, and never on the server.** The host is shared
+#     production - two cores, 3.7 GiB, five other projects, three of them PostgreSQL -
+#     and a `docker compose build` there costs both cores and 2-4 GiB of disk while the
+#     neighbours are serving. The runner builds, GHCR stores, the host pulls.
+#  * **The `production` environment gates the second job.** The first job may publish an
+#     image freely; nothing reaches the host until a reviewer approves the deployment.
+#     That is the last cheap moment to say no.
+
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit to deploy (40 hex chars). Blank = the tip of main.'
+        required: false
+        type: string
+
+concurrency:
+  # NOT cancel-in-progress. Cancelling a deploy half way through leaves the host with
+  # some services on the new image and some on the old, which is the one state nothing
+  # here knows how to reason about.
+  group: cd-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build and publish images
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    outputs:
+      sha: ${{ steps.target.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: Resolve the commit being shipped
+        id: target
+        # The full 40-character sha, resolved from the checkout rather than taken from
+        # the input, so the tag on the image is provably the tree that was built.
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the API image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          # Repo root, not `api/`: the image carries the shared i18n bundle from
+          # `web/messages` and the ingress snippet, and `context: ./api` resolves neither.
+          context: .
+          file: api/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/callanalytics-api:${{ steps.target.outputs.sha }}
+            ghcr.io/${{ github.repository_owner }}/callanalytics-api:main
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+          provenance: false
+
+      - name: Build and push the web image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./web
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/callanalytics-web:${{ steps.target.outputs.sha }}
+            ghcr.io/${{ github.repository_owner }}/callanalytics-web:main
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,scope=web,mode=max
+          provenance: false
+
+      - name: Scan the API image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/callanalytics-api:${{ steps.target.outputs.sha }}
+          format: sarif
+          output: trivy-api.sarif
+          # `ignore-unfixed`: a CVE with no released fix is information, not a decision.
+          # It still reaches the Security tab through the SARIF upload below; what it
+          # does not do is block a deployment on something nobody can act on.
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
+      - name: Scan the web image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/callanalytics-web:${{ steps.target.outputs.sha }}
+          format: sarif
+          output: trivy-web.sarif
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
+      - name: Report both scans to code scanning
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: .
+
+      - name: Fail on a fixable CRITICAL
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/callanalytics-api:${{ steps.target.outputs.sha }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL
+
+  deploy:
+    name: Deploy to production
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: https://b24.texnobus.uz
+    steps:
+      - name: Authorise the runner against the host
+        env:
+          # Through the environment, never interpolated into the script body: a secret
+          # spliced into a shell line is a shell injection waiting for a value with a
+          # quote in it, and `${{ }}` substitution happens before the shell ever sees it.
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Pinned host key, not `StrictHostKeyChecking=no`: accepting whatever answers
+          # on port 22 is accepting a machine-in-the-middle, and this session carries a
+          # command that restarts production.
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          SHA: ${{ needs.publish.outputs.sha }}
+        # The key on the host carries `command="/usr/local/bin/callanalytics-deploy"`,
+        # so this string arrives as SSH_ORIGINAL_COMMAND and anything the script does not
+        # recognise is refused. There is no shell at the other end of this.
+        run: ssh -o BatchMode=yes -o ConnectTimeout=15 "$USER@$HOST" "deploy $SHA"
+
+      - name: Smoke-test the public URL
+        # From outside, through Cloudflare and the tunnel, because that is the path a
+        # portal takes. `/settings` is the one worth keeping: routing it to the API
+        # instead of the SPA returned raw JSON inside the iframe once, and a moderator
+        # would have seen it before we did.
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 20 https://b24.texnobus.uz/healthz | grep -q '"status":"ok"'
+          code=$(curl -fsS --max-time 20 -o /dev/null -w '%{http_code}' https://b24.texnobus.uz/)
+          [ "$code" = "200" ]
+          curl -fsSI --max-time 20 https://b24.texnobus.uz/ | grep -qi '^x-frame-options' \
+            && { echo 'X-Frame-Options is back; every portal iframe is now broken'; exit 1; } || true
+          curl -fsS --max-time 20 "https://b24.texnobus.uz/settings?DOMAIN=x.bitrix24.kz&PROTOCOL=1" \
+            | head -c 200 | grep -q '<!DOCTYPE html>'
+          echo 'smoke test passed'
+
+      - name: Roll back
+        if: failure()
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+        # Images are tagged, so this is a tag change and needs no build: it is the one
+        # recovery here that costs no CPU and no disk on a host shared with five other
+        # projects. Losing the rollback too is a page, not a retry.
+        run: |
+          ssh -o BatchMode=yes -o ConnectTimeout=15 "$USER@$HOST" "rollback"
+          echo '::error::deployment failed and was rolled back to the previous image tag'
+
+      - name: What is running now
+        if: always()
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+        run: ssh -o BatchMode=yes -o ConnectTimeout=15 "$USER@$HOST" "status"

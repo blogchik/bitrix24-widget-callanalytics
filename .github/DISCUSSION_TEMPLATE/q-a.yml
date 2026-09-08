@@ -1,0 +1,69 @@
+title: '[Q&A] '
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before you write: **if this is a security problem, do not post it here.**
+        Use [private vulnerability reporting](https://github.com/blogchik/bitrix24-widget-callanalytics/security/advisories/new)
+        or email `ops@texnobus.uz`. [SECURITY.md](https://github.com/blogchik/bitrix24-widget-callanalytics/blob/main/SECURITY.md)
+        explains why: this app holds several companies' telephony data in one database,
+        so a public post about a tenant-isolation flaw is a live exploit with an audience.
+
+        Two more things worth knowing before you spend time writing:
+
+        - **Never paste a token.** `AUTH_ID`, `REFRESH_ID`, `access_token`, `application_token`,
+          a `CALL_RECORD_URL` and anything from `.env` are live credentials. Redact them, and
+          say that you have one.
+        - **Bitrix24's own behaviour is not this project.** If the question is what
+          `voximplant.statistic.get` returns or how a placement is bound, `docs/bitrix24-api-research.md`
+          records what we verified; anything beyond that belongs to Bitrix24 support.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: What is this about?
+      options:
+        - Installing the app on a portal
+        - Running my own copy (Docker, deployment)
+        - The dashboard or the CRM tabs (UI)
+        - Sync — calls missing, duplicated or late
+        - Permissions — who sees whose calls
+        - Recordings and playback
+        - The code or the architecture
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: question
+    attributes:
+      label: The question
+      description: What are you trying to do, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: What you are running
+      description: |
+        Only what applies. A commit sha is worth more than a version, because there are
+        no releases — `main` is the code.
+      value: |
+        - Commit / branch:
+        - Own deployment or the hosted app:
+        - Bitrix24 region and plan (kz / ru / com; free or paid):
+        - Telephony: built-in Bitrix24, or an external provider (which)?
+        - Your role on the portal: administrator or ordinary employee
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Anything the logs said
+      description: 'Redact tokens first. `docker compose logs api --tail=100` is usually enough.'
+      render: text
+    validations:
+      required: false

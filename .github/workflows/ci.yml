@@ -1,41 +1,75 @@
-# CI runs the same commands a developer runs, through the same compose files, so a
-# green run here means the stack that would be deployed actually builds and passes.
-# It deliberately does NOT use a GitHub `services:` postgres: the roles, the RLS setup
-# and the ca_app/ca_owner split come from docker/postgres/init.sql on first boot, and
-# a hand-rolled service container would drift from what production does.
+# CI runs the same commands a developer runs, through the same compose files, so a green
+# run here means the stack that would be deployed actually builds and passes.
+#
+# It deliberately does NOT use a GitHub `services:` postgres: the roles, the RLS setup and
+# the ca_app/ca_owner split come from docker/postgres/init.sql on first boot, and a
+# hand-rolled service container would drift from what production does.
+#
+# The work is split across four jobs that run in parallel, because a single job means a
+# TypeScript error and a failing migration look identical from the outside - one red X -
+# and because the web checks need no Docker at all and finish in about a minute while the
+# API suite is still starting PostgreSQL.
 
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [dev, main]
   pull_request:
+    branches: [dev, main]
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# The job only reads the tree: it builds images, runs migrations and runs the suite.
-# Nothing here writes to the repository, opens a PR or publishes a package, so the
-# token it gets should not be able to either. Declared at workflow level so a job
-# added later starts from read-only and has to ask for more in writing.
+# Nothing here writes to the repository, opens a PR or publishes a package, so the token
+# it gets should not be able to either. Declared at workflow level so a job added later
+# starts from read-only and has to ask for more in writing.
 permissions:
   contents: read
 
 jobs:
-  build-and-test:
+  # ---------------------------------------------------------------------------------
+  # Seconds, not minutes, and it fails the things most likely to be wrong in a hurry.
+  # Kept first so a missing translation is reported before anyone waits for a build.
+  # ---------------------------------------------------------------------------------
+  invariants:
+    name: Invariants (i18n, compose)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 5
     steps:
       # v7, not v4: actions/checkout@v4 declares `using: node20`, and GitHub-hosted
       # runners now force those actions onto Node 24 while warning that Node 20 is
-      # deprecated. v5, v6 and v7 all declare node24; v7 is the current major. Its one
-      # breaking change — refusing to check out a fork PR under `pull_request_target`
-      # and `workflow_run` — does not apply here, because this workflow triggers on
-      # plain `pull_request`, which already runs against the merge ref without secrets.
-      - uses: actions/checkout@v7
+      # deprecated. Pinned by commit SHA rather than by tag - a tag is mutable, and an
+      # action is code this workflow executes with the repository checked out.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Message catalogues agree
+        # ru and en must have the same keys AND the same ICU placeholders per key. A
+        # dropped `{count}` renders as a sentence with the number missing and raises no
+        # error anywhere, in a language the author usually does not read.
+        run: node tools/check-i18n.mjs
+
+      - name: Generate a CI .env
+        # `env_file:` makes Compose refuse to even render a config without one.
+        run: ./tools/make-env.sh --ci
+
+      - name: Production compose invariants
+        # Publishes nothing, no source tree mounted over an image, images actually
+        # carry IMAGE_TAG, and the ingress still splits api from web.
+        run: ./tools/check-compose.sh
+
+  # ---------------------------------------------------------------------------------
+  # The API: migrations, the tenancy invariants they must produce, the suite, and the
+  # linters. This is the long pole and it owns the database.
+  # ---------------------------------------------------------------------------------
+  api:
+    name: API (migrate, RLS, tests, lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Generate a CI .env
         # Placeholder vendor credentials: nothing in the suite talks to Bitrix24, every
@@ -43,11 +77,8 @@ jobs:
         # config.py validates their shape at import.
         run: ./tools/make-env.sh --ci
 
-      - name: Build images
-        # Builds api (which also type-checks nothing, but fails on a bad Dockerfile or
-        # a dependency that no longer resolves) and web (which runs `next build`, so a
-        # TypeScript error or a broken page fails here).
-        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml build
+      - name: Build the API image
+        run: docker compose build api
 
       - name: Start PostgreSQL
         run: |
@@ -56,7 +87,7 @@ jobs:
 
       - name: Apply migrations
         # A separate step from the suite so a broken migration is reported as a broken
-        # migration rather than as 378 failing tests.
+        # migration rather than as 400 failing tests.
         run: docker compose run --rm -T api python -m alembic upgrade head
 
       - name: Verify the schema the migration produced
@@ -78,15 +109,20 @@ jobs:
               FROM pg_policies WHERE schemaname = 'public';
           " | grep -q '^ok$'
 
+      - name: Migrations are reversible
+        # `downgrade()` is written in every revision and is almost never run, which is
+        # how it rots. Down to base and back up on a throwaway database costs seconds
+        # and is the only thing that proves the rollback path exists.
+        run: |
+          docker compose run --rm -T api python -m alembic downgrade base
+          docker compose run --rm -T api python -m alembic upgrade head
+
       - name: Test
         # The worker is not started in CI, so nothing competes for portal leases.
         run: docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile test run --rm -T test
 
-      - name: Lint and type-check the API
+      - name: Lint and type-check
         run: docker compose run --rm -T api sh -c "ruff check . && mypy app"
-
-      - name: Type-check the web app
-        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml run --rm -T web npx tsc --noEmit
 
       - name: Container logs on failure
         if: failure()
@@ -95,3 +131,64 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v
+
+  # ---------------------------------------------------------------------------------
+  # The frontend needs no Docker: node, install, type-check, build. Running it on the
+  # bare runner turns a five-minute image build into a one-minute check, and `next
+  # build` is itself the type-check that matters, because it compiles every route.
+  # ---------------------------------------------------------------------------------
+  web:
+    name: Web (type-check, build, audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        # `npm ci`, never `npm install`: it installs the lockfile exactly and fails if
+        # package.json and the lock have drifted, which is the difference between
+        # testing what will ship and testing what npm felt like resolving today.
+        run: npm ci
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
+
+      - name: Audit dependencies
+        # A gate, not a report. Dependabot opens alerts asynchronously and they sit
+        # there; this fails the build on the same information, at the moment the
+        # lockfile changes. If an advisory has no upgrade path, the answer is an
+        # `overrides` entry with a comment - see the postcss entry in package.json -
+        # not a lowered threshold.
+        run: npm audit --audit-level=high
+
+  # ---------------------------------------------------------------------------------
+  # Blocks a pull request that ADDS a vulnerable or badly-licensed dependency, which is
+  # the moment it is cheapest to say no. It has nothing to review on a plain push.
+  # ---------------------------------------------------------------------------------
+  dependency-review:
+    name: Dependency review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          # A strong-copyleft or source-available dependency arriving unnoticed is a
+          # licensing problem that is very expensive to unwind once it ships. This
+          # repository has no LICENSE file yet, which is its own open question - until
+          # it does, keeping AGPL and SSPL out keeps every option open.
+          deny-licenses: AGPL-3.0, AGPL-3.0-only, AGPL-3.0-or-later, SSPL-1.0

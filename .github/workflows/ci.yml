@@ -16,13 +16,26 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# The job only reads the tree: it builds images, runs migrations and runs the suite.
+# Nothing here writes to the repository, opens a PR or publishes a package, so the
+# token it gets should not be able to either. Declared at workflow level so a job
+# added later starts from read-only and has to ask for more in writing.
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      # v7, not v4: actions/checkout@v4 declares `using: node20`, and GitHub-hosted
+      # runners now force those actions onto Node 24 while warning that Node 20 is
+      # deprecated. v5, v6 and v7 all declare node24; v7 is the current major. Its one
+      # breaking change — refusing to check out a fork PR under `pull_request_target`
+      # and `workflow_run` — does not apply here, because this workflow triggers on
+      # plain `pull_request`, which already runs against the merge ref without secrets.
+      - uses: actions/checkout@v7
 
       - name: Generate a CI .env
         # Placeholder vendor credentials: nothing in the suite talks to Bitrix24, every

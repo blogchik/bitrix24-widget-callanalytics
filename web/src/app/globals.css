@@ -28,6 +28,48 @@
   --ca-accent: #2067b0;
   --ca-accent-contrast: #ffffff;
   --ca-accent-soft: #eaf2fa;
+
+  /* ---- control geometry -------------------------------------------------
+   * One height for every control so a filter row lines up without per-element
+   * tweaking. 40px on a mouse matches Bitrix24's own density; a coarse pointer
+   * gets 44px, which is the touch-target floor. Setting it here rather than per
+   * component is what stops selects, inputs and buttons drifting apart. */
+  --ca-control-h: 40px;
+  --ca-control-px: 12px;
+  --ca-radius: 8px;
+  --ca-radius-lg: 12px;
+
+  /* ---- motion -----------------------------------------------------------
+   * Micro-interactions 150-200ms, panels 200-260ms, exits ~70% of the enter so
+   * dismissal feels prompt. One easing pair everywhere, so the whole interface
+   * moves with the same rhythm instead of each component inventing its own. */
+  --ca-dur-fast: 150ms;
+  --ca-dur: 200ms;
+  --ca-dur-panel: 240ms;
+  --ca-dur-exit: 140ms;
+  --ca-ease: cubic-bezier(0.2, 0, 0, 1);
+  --ca-ease-out: cubic-bezier(0.05, 0.7, 0.1, 1);
+
+  --ca-shadow-pop: 0 8px 24px -6px rgb(16 24 40 / 0.16), 0 2px 6px -2px rgb(16 24 40 / 0.1);
+  --ca-z-pop: 60;
+}
+
+@media (pointer: coarse) {
+  :root {
+    --ca-control-h: 44px;
+    --ca-control-px: 14px;
+  }
+}
+
+/* Every animation in the app is expressed with these tokens, so honouring the
+ * system preference is one rule rather than a per-component audit. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --ca-dur-fast: 1ms;
+    --ca-dur: 1ms;
+    --ca-dur-panel: 1ms;
+    --ca-dur-exit: 1ms;
+  }
 }
 
 @media (prefers-color-scheme: dark) {
@@ -42,6 +84,7 @@
     --ca-accent: #63a8e6;
     --ca-accent-contrast: #10141a;
     --ca-accent-soft: #1d2733;
+    --ca-shadow-pop: 0 8px 24px -6px rgb(0 0 0 / 0.5), 0 2px 6px -2px rgb(0 0 0 / 0.4);
   }
 }
 
@@ -106,19 +149,36 @@
   .ca-button {
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     gap: 6px;
-    padding: 7px 14px;
-    border-radius: 8px;
+    /* The height comes from the control token, not from padding: it made this button 38px,
+     * which is under the touch floor on the one surface where it matters most - the retry
+     * button on an error state, on a phone, is the only control on the screen. The token is
+     * 40px with a mouse and 44px with a finger, so the button now matches every control in
+     * the filter row instead of being three pixels short of all of them. */
+    min-height: var(--ca-control-h);
+    padding: 0 14px;
+    border-radius: var(--ca-radius);
     border: 1px solid var(--ca-accent);
     background: var(--ca-accent);
     color: var(--ca-accent-contrast);
     font-size: 14px;
     font-weight: 500;
     cursor: pointer;
+    transition:
+      filter var(--ca-dur-fast) var(--ca-ease),
+      background-color var(--ca-dur-fast) var(--ca-ease),
+      transform var(--ca-dur-fast) var(--ca-ease);
   }
 
   .ca-button:hover {
     filter: brightness(1.06);
+  }
+
+  /* Presses in, rather than jumping: a scale under 1 keeps the press inside the button's
+   * own footprint, so nothing beside it moves at the moment of the click. */
+  .ca-button:active {
+    transform: scale(0.98);
   }
 
   .ca-button-quiet {

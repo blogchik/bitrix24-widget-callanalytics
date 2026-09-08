@@ -18,6 +18,16 @@
  * Bars are laid out with CSS grid rather than SVG: they are axis-aligned rectangles with
  * text beside them, so the grid gives the same marks with real text wrapping and no
  * measurement pass.
+ *
+ * Two layout rules, both of them about the panel this sits in rather than about bars:
+ *
+ *  * **The name column is a share of the panel, not 168 fixed pixels.** Beside a heatmap
+ *    at 375 that fixed column left the bars 74px to say everything in - the marks were
+ *    the smallest thing in a chart made of marks.
+ *  * **The name wraps; it is never truncated with an ellipsis.** A clipped name is the
+ *    one thing in this panel a reader cannot recover by looking harder, and the row it
+ *    belongs to is exactly the row they were looking for. Rows carry a minimum height
+ *    instead, so the rhythm holds whether a name takes one line or two.
  */
 
 import { useTranslations } from 'next-intl';
@@ -57,10 +67,17 @@ const MAX_NAMED = 8;
 
 const BAR_HEIGHT = 14;
 
+/** One row of the rhythm: 14px of mark inside a 24px slot, on the 4px scale. */
+const ROW_HEIGHT = 24;
+
+/** The tooltip's fixed width, so it can be kept inside the panel it is drawn over. */
+const TOOLTIP_W = 156;
+
 interface HoverState {
   index: number;
-  x: number;
-  y: number;
+  /** Already clamped into the panel, so the tooltip can never leave the viewport. */
+  left: number;
+  top: number;
 }
 
 export function EmployeeBars({ employees, locale }: EmployeeBarsProps) {
@@ -103,10 +120,14 @@ export function EmployeeBars({ employees, locale }: EmployeeBarsProps) {
     const host = event.currentTarget.offsetParent as HTMLElement | null;
     const box = event.currentTarget.getBoundingClientRect();
     const hostBox = host?.getBoundingClientRect();
+    const pointer = event.clientX - (hostBox?.left ?? 0);
+    const room = (hostBox?.width ?? 0) - TOOLTIP_W;
     setHover({
       index,
-      x: event.clientX - (hostBox?.left ?? 0),
-      y: box.top - (hostBox?.top ?? 0),
+      // Clamped both ways: a tooltip that hangs off the right of a 375px panel is a
+      // second horizontal overflow, and this one appears under the reader's own cursor.
+      left: Math.max(0, Math.min(pointer - TOOLTIP_W / 2, room)),
+      top: Math.max(0, box.top - (hostBox?.top ?? 0) - 74),
     });
   };
 
@@ -114,7 +135,7 @@ export function EmployeeBars({ employees, locale }: EmployeeBarsProps) {
 
   return (
     <div className="ca-viz-plot">
-      <div className="flex flex-col gap-2">
+      <div className="flex flex-col gap-1">
         {rows.map((row, index) => {
           const share = max > 0 ? row.total / max : 0;
           return (
@@ -128,14 +149,26 @@ export function EmployeeBars({ employees, locale }: EmployeeBarsProps) {
                     ? 'unassigned'
                     : String(row.employee_id)
               }
-              className="grid items-center gap-3"
-              style={{ gridTemplateColumns: 'minmax(88px, 168px) 1fr auto' }}
+              className="grid items-center gap-x-2"
+              style={{
+                // As much as the longest name needs and not one pixel more, capped at
+                // 38% of the panel. A fixed 168px column wasted half of itself on a wide
+                // slider and still wrapped "Дилноза Юсупова" at 375; `fit-content` is the
+                // one track sizing that gets both of those right without measuring.
+                // `overflow-wrap: anywhere` below keeps the min-content floor at one
+                // character, so an unbreakable name cannot push the track past the cap.
+                gridTemplateColumns: 'fit-content(38%) minmax(0, 1fr) auto',
+                minHeight: ROW_HEIGHT,
+              }}
               onMouseMove={(event) => onMove(event, index)}
               onMouseLeave={() => setHover(null)}
             >
               <span
-                className="truncate text-[13px]"
-                style={{ color: row.other ? 'var(--ca-viz-muted)' : 'var(--ca-viz-ink)' }}
+                className="text-[13px] leading-tight"
+                style={{
+                  color: row.other ? 'var(--ca-viz-muted)' : 'var(--ca-viz-ink)',
+                  overflowWrap: 'anywhere',
+                }}
                 title={label(row)}
               >
                 {label(row)}
@@ -164,8 +197,8 @@ export function EmployeeBars({ employees, locale }: EmployeeBarsProps) {
               </span>
 
               <span
-                className="ca-viz-num text-[13px]"
-                style={{ color: 'var(--ca-viz-ink)', minWidth: 40, textAlign: 'right' }}
+                className="ca-viz-num text-[13px] leading-tight"
+                style={{ color: 'var(--ca-viz-ink)', minWidth: 36, textAlign: 'right' }}
               >
                 {formatCount(row.total, locale)}
               </span>
@@ -177,7 +210,7 @@ export function EmployeeBars({ employees, locale }: EmployeeBarsProps) {
       {hovered && hover ? (
         <div
           className="ca-viz-tooltip"
-          style={{ left: Math.max(0, hover.x - 78), top: Math.max(0, hover.y - 74), width: 156 }}
+          style={{ left: hover.left, top: hover.top, width: TOOLTIP_W }}
         >
           <div className="mb-1 font-medium">{label(hovered)}</div>
           {SERIES_ORDER.map((group) => (

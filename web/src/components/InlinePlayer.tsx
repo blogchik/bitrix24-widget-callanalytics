@@ -28,9 +28,16 @@
  *
  * The component never sees `call_record_url`: §9 keeps it server-side, so there is
  * nothing here that could leak a credential-bearing URL into a screenshot.
+ *
+ * The transport itself - the button, the seek bar, the times - lives in
+ * `components/ui/AudioPlayer.tsx` and knows none of the above. It is handed a finished
+ * `src` and finished words, which is what keeps the credential handling in one file and
+ * makes the player something a test can mount with a `blob:` URL.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import AudioPlayer from '@/components/ui/AudioPlayer';
+import type { AudioPlayerLabels } from '@/components/ui/AudioPlayer';
 import { ApiError } from '@/lib/api';
 import { openPath } from '@/lib/bx24';
 import {
@@ -59,7 +66,32 @@ const PRINCIPAL_CODES: ReadonlySet<string> = new Set([
 ]);
 
 const CSS = `
+/*
+ * The row does not snap open, it grows: a 0fr -> 1fr grid row is a real height
+ * animation without anybody having to measure the panel first. A browser that cannot
+ * interpolate the track still gets the fade, which is a shorter version of the same
+ * gesture rather than a different one - and under prefers-reduced-motion the token is
+ * 1ms, so this whole rule costs nothing.
+ */
+.ca-player-reveal {
+  display: grid;
+  grid-template-rows: 0fr;
+  animation: ca-player-open var(--ca-dur-panel) var(--ca-ease-out) forwards;
+}
+@keyframes ca-player-open {
+  from {
+    grid-template-rows: 0fr;
+    opacity: 0;
+  }
+  to {
+    grid-template-rows: 1fr;
+    opacity: 1;
+  }
+}
 .ca-player {
+  /* Both needed for the grid row above to be able to squeeze this to nothing. */
+  min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -67,11 +99,6 @@ const CSS = `
   border-radius: 10px;
   background: var(--ca-surface-soft);
   border: 1px solid var(--ca-border-soft);
-}
-.ca-player-audio {
-  width: 100%;
-  max-width: 520px;
-  height: 36px;
 }
 .ca-player-note {
   margin: 0;
@@ -91,10 +118,18 @@ const CSS = `
   align-items: flex-start;
   gap: 10px;
 }
+/* The disabled-playback state is a decision, not a failure, so it gets a real
+ * icon plate rather than a lonely line of grey text. */
 .ca-player-glyph {
   flex: 0 0 auto;
-  margin-top: 1px;
-  color: var(--ca-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  background: var(--ca-accent-soft);
+  color: var(--ca-accent);
 }
 .ca-player-actions {
   display: flex;
@@ -106,7 +141,14 @@ const CSS = `
 
 type PlayerState =
   | { kind: 'loading' }
-  | { kind: 'ready'; src: string }
+  /**
+   * `duration` is what `play-url` reported, not what the file says.
+   *
+   * It is carried so the transport can print a total length before the element has
+   * fetched a byte of metadata - on a proxied source that is a visible moment, and a
+   * dash that turns into a number reads like a glitch.
+   */
+  | { kind: 'ready'; src: string; duration: number | null }
   /** `RECORDING_MODE=off` (§9): deliberate, not broken. */
   | { kind: 'off' }
   /** The server says this call has no audio (any more). */
@@ -215,7 +257,7 @@ export function InlinePlayer({ callId, fallbackPath, recordingMode = null }: Inl
       try {
         const source = await mintPlaybackSource(callId, null, controller.signal);
         if (!cancelled && mounted.current) {
-          setState({ kind: 'ready', src: source.src });
+          setState({ kind: 'ready', src: source.src, duration: source.duration });
         }
         return;
       } catch (error: unknown) {
@@ -239,7 +281,7 @@ export function InlinePlayer({ callId, fallbackPath, recordingMode = null }: Inl
         try {
           const source = await mintPlaybackSource(callId, token, controller.signal);
           if (!cancelled && mounted.current) {
-            setState({ kind: 'ready', src: source.src });
+            setState({ kind: 'ready', src: source.src, duration: source.duration });
           }
         } catch (second: unknown) {
           if (!cancelled && mounted.current) {
@@ -298,99 +340,128 @@ export function InlinePlayer({ callId, fallbackPath, recordingMode = null }: Inl
     </button>
   );
 
+  /**
+   * Every word the transport renders, translated here.
+   *
+   * `ui/AudioPlayer` owns no copy at all, so this object is the whole of its vocabulary.
+   * Memoised because a fresh identity on every keystroke of the parent would re-render a
+   * component that is, four times a second, redrawing a progress bar.
+   */
+  const labels = useMemo<AudioPlayerLabels>(
+    () => ({
+      player: c('app.calls.player.transport'),
+      play: c('app.calls.player.play'),
+      pause: c('app.calls.player.pause'),
+      seek: c('app.calls.player.seek'),
+      position: (current: string, total: string) =>
+        c('app.calls.player.position', { current, total }),
+      elapsed: c('app.calls.player.elapsed'),
+      total: c('app.calls.player.total'),
+      loading: c('app.calls.player.loading'),
+      mute: c('app.calls.player.mute'),
+      unmute: c('app.calls.player.unmute'),
+      rate: c('app.calls.player.rate'),
+      // The transport's own last-resort error is the same sentence the `failed` state
+      // below uses: from a listener's seat it is the same situation.
+      error: c('app.calls.player.failed'),
+      unsupported: c('app.calls.player.unsupported'),
+    }),
+    [c],
+  );
+
   return (
-    <div className="ca-player">
-      <style href={STYLE_ID} precedence="default" dangerouslySetInnerHTML={{ __html: CSS }} />
+    <div className="ca-player-reveal">
+      <div className="ca-player">
+        <style href={STYLE_ID} precedence="default" dangerouslySetInnerHTML={{ __html: CSS }} />
 
-      {state.kind === 'loading' ? (
-        <p className="ca-player-note" role="status">
-          {c('app.calls.player.loading')}
-        </p>
-      ) : null}
+        {state.kind === 'loading' ? (
+          <p className="ca-player-note" role="status">
+            {c('app.calls.player.loading')}
+          </p>
+        ) : null}
 
-      {state.kind === 'ready' ? (
-        <audio
-          key={state.src}
-          className="ca-player-audio"
-          controls
-          // `metadata` so a dead link surfaces immediately rather than on the first click,
-          // and so a ten-minute recording is not streamed into a row nobody plays.
-          preload="metadata"
-          src={state.src}
-          onError={handleAudioError}
-        >
-          {c('app.calls.player.unsupported')}
-        </audio>
-      ) : null}
+        {state.kind === 'ready' ? (
+          <AudioPlayer
+            src={state.src}
+            duration={state.duration}
+            labels={labels}
+            // A stalled first byte is the same cure as a media error: §5.7's one refresh,
+            // then the sentence that names the likely cause. Either way the panel below
+            // replaces the transport, so nothing is left spinning.
+            onError={handleAudioError}
+            fallback={openButton}
+          />
+        ) : null}
 
-      {state.kind === 'off' ? (
-        <>
-          <div className="ca-player-head">
-            <SpeakerGlyph />
-            <div>
-              <p className="ca-player-title">{c('app.calls.player.offTitle')}</p>
-              <p className="ca-player-note">{c('app.calls.player.offBody')}</p>
+        {state.kind === 'off' ? (
+          <>
+            <div className="ca-player-head">
+              <SpeakerGlyph />
+              <div>
+                <p className="ca-player-title">{c('app.calls.player.offTitle')}</p>
+                <p className="ca-player-note">{c('app.calls.player.offBody')}</p>
+              </div>
             </div>
-          </div>
-          <div className="ca-player-actions">{openButton}</div>
-        </>
-      ) : null}
+            <div className="ca-player-actions">{openButton}</div>
+          </>
+        ) : null}
 
-      {state.kind === 'missing' ? (
-        <p className="ca-player-note">{c('app.calls.player.missing')}</p>
-      ) : null}
+        {state.kind === 'missing' ? (
+          <p className="ca-player-note">{c('app.calls.player.missing')}</p>
+        ) : null}
 
-      {state.kind === 'no_viewer_token' ? (
-        <>
-          <p className="ca-player-note">{c('app.calls.player.noViewerToken')}</p>
-          <div className="ca-player-actions">{openButton}</div>
-        </>
-      ) : null}
+        {state.kind === 'no_viewer_token' ? (
+          <>
+            <p className="ca-player-note">{c('app.calls.player.noViewerToken')}</p>
+            <div className="ca-player-actions">{openButton}</div>
+          </>
+        ) : null}
 
-      {state.kind === 'stale' ? (
-        <>
-          <p className="ca-player-note">{c('app.calls.player.stale')}</p>
-          <div className="ca-player-actions">
-            <button type="button" className="ca-button ca-button-quiet" onClick={retry}>
-              {c('app.calls.player.retry')}
-            </button>
-            {openButton}
-          </div>
-        </>
-      ) : null}
+        {state.kind === 'stale' ? (
+          <>
+            <p className="ca-player-note">{c('app.calls.player.stale')}</p>
+            <div className="ca-player-actions">
+              <button type="button" className="ca-button ca-button-quiet" onClick={retry}>
+                {c('app.calls.player.retry')}
+              </button>
+              {openButton}
+            </div>
+          </>
+        ) : null}
 
-      {state.kind === 'failed' ? (
-        <>
-          <p className="ca-player-note">{c('app.calls.player.failed')}</p>
-          <div className="ca-player-actions">{openButton}</div>
-        </>
-      ) : null}
+        {state.kind === 'failed' ? (
+          <>
+            <p className="ca-player-note">{c('app.calls.player.failed')}</p>
+            <div className="ca-player-actions">{openButton}</div>
+          </>
+        ) : null}
 
-      {openFailed ? <p className="ca-player-note">{c('app.calls.player.openFailed')}</p> : null}
+        {openFailed ? <p className="ca-player-note">{c('app.calls.player.openFailed')}</p> : null}
+      </div>
     </div>
   );
 }
 
-/** A speaker outline. Decorative: every state it appears in also says it in words. */
+/** A speaker outline on a plate. Decorative: every state it appears in says it in words. */
 function SpeakerGlyph() {
   return (
-    <svg
-      className="ca-player-glyph"
-      width="18"
-      height="18"
-      viewBox="0 0 18 18"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.4"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-      focusable="false"
-    >
-      <path d="M3 7v4h2.5L9 14V4L5.5 7H3z" />
-      <path d="M11.6 6.4a3.6 3.6 0 0 1 0 5.2" />
-      <path d="M13.8 4.2a6.8 6.8 0 0 1 0 9.6" />
-    </svg>
+    <span className="ca-player-glyph" aria-hidden="true">
+      <svg
+        width="18"
+        height="18"
+        viewBox="0 0 18 18"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        focusable="false"
+      >
+        <path d="M3 7v4h2.5L9 14V4L5.5 7H3z" />
+        <path d="M11.6 6.4a3.6 3.6 0 0 1 0 5.2" />
+        <path d="M13.8 4.2a6.8 6.8 0 0 1 0 9.6" />
+      </svg>
+    </span>
   );
 }
 

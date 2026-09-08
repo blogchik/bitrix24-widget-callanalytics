@@ -12,17 +12,26 @@
  *    (§4.6 `tz` claim; open question 9 resolves "today" to the viewer's zone). All date
  *    maths below happens on `YYYY-MM-DD` strings through UTC midnight, so a portal in
  *    another region reads its own clock and no DST transition can move a day boundary.
- *  * **The custom period is capped at `MAX_PERIOD_DAYS` (366)** and clamped here rather
- *    than only server-side, so a moderator dragging a date picker gets a sentence
- *    instead of a 400.
+ *  * **The custom period is capped at `MAX_PERIOD_DAYS` (366)** on the client as well as
+ *    server-side, so the cap is something a moderator can see rather than a 400 they have
+ *    to provoke. `ui/DateRange` enforces it as geometry - the days past the cap are simply
+ *    not reachable - which is why this file no longer clamps a range after the fact.
  *  * **`acc='own'` hides the employee filter entirely** (§4.7): the scope is already
  *    pinned server-side by `scope_filter`, and a control that can only ever select the
  *    viewer is a control that suggests the data might be someone else's.
  */
 
 import { useTranslations } from 'next-intl';
-import { useId, useMemo, useState, type ChangeEvent } from 'react';
+import { useMemo } from 'react';
 
+import {
+  DateRange,
+  Field,
+  Select,
+  SegmentedControl,
+  type SegmentedOption,
+  type SelectOption,
+} from '@/components/ui';
 import { RESULT_GROUPS } from '@/lib/viz';
 
 /** §10 step 5: the custom period is capped at 366 days (`MAX_PERIOD_DAYS`). */
@@ -192,6 +201,16 @@ export interface FiltersProps {
 
 const PRESETS: readonly PeriodPreset[] = ['today', 'd7', 'd30', 'custom'];
 
+/**
+ * The row is two tiers, not one wrapping line.
+ *
+ * A single `flex-wrap` row of content-sized controls is what produced the defect this
+ * replaces: at 1440px the last control ("Line") wrapped alone onto a second line beside a
+ * large empty margin, and at 375px the whole row became a ragged staircase. The period is
+ * one decision and the four narrowing filters are another, so they get one tier each, and
+ * the narrowing tier is a grid whose columns are computed from the available width - four
+ * across on a desktop, one per line on a phone, with no breakpoint list to keep in step.
+ */
 export function Filters({
   value,
   onChange,
@@ -201,13 +220,8 @@ export function Filters({
   busy = false,
 }: FiltersProps) {
   const t = useTranslations();
-  const fieldId = useId();
-  const [notice, setNotice] = useState<string | null>(null);
-
-  const today = useMemo(() => todayInZone(timeZone), [timeZone]);
 
   const selectPreset = (preset: PeriodPreset): void => {
-    setNotice(null);
     if (preset === 'custom') {
       onChange({ ...value, preset });
       return;
@@ -216,282 +230,163 @@ export function Filters({
     onChange({ ...value, preset, from: range.from, to: range.to });
   };
 
-  /**
-   * Move one end of a custom period, keeping `[from, to]` ordered and <= 366 days.
-   *
-   * The end the moderator did *not* touch is the one that gives way, which is the only
-   * behaviour that never fights the pointer.
-   */
-  const moveEnd = (end: 'from' | 'to', raw: string): void => {
-    if (!raw || Number.isNaN(dayToUtc(raw))) {
-      return;
-    }
-    let from = end === 'from' ? raw : value.from;
-    let to = end === 'to' ? raw : value.to;
-    let clamped = false;
+  const allLabel = t('app.dashboard.filter.all');
 
-    if (dayToUtc(to) < dayToUtc(from)) {
-      if (end === 'from') {
-        to = from;
-      } else {
-        from = to;
-      }
-    }
-    if (daysBetween(from, to) > MAX_PERIOD_DAYS) {
-      clamped = true;
-      if (end === 'from') {
-        to = addDays(from, MAX_PERIOD_DAYS - 1);
-      } else {
-        from = addDays(to, -(MAX_PERIOD_DAYS - 1));
-      }
-    }
-    setNotice(clamped ? t('app.dashboard.period.tooLong', { days: MAX_PERIOD_DAYS }) : null);
-    onChange({ ...value, preset: 'custom', from, to });
-  };
+  const presetOptions = useMemo(
+    (): readonly SegmentedOption<PeriodPreset>[] =>
+      PRESETS.map((preset) => ({ value: preset, label: t(`app.dashboard.period.${preset}`) })),
+    [t],
+  );
+
+  /**
+   * A dismissed employee keeps their calls (§7) and stays selectable. "Dismissed" is the
+   * option's `hint`, not part of its label: as a suffix it was what made these rows the
+   * longest in the list and pushed the control wider than every other control in the row.
+   */
+  const employeeOptions = useMemo(
+    (): readonly SelectOption[] => [
+      { value: '', label: allLabel },
+      ...options.employees.map((employee) => {
+        const name = employee.name?.trim();
+        return {
+          value: String(employee.id),
+          label:
+            name || t('app.dashboard.filter.unknownEmployee', { id: String(employee.id) }),
+          hint:
+            employee.active === false ? t('app.dashboard.filter.dismissed') : undefined,
+        };
+      }),
+    ],
+    [allLabel, options.employees, t],
+  );
+
+  const directionOptions = useMemo(
+    (): readonly SelectOption[] => [
+      { value: '', label: allLabel },
+      ...DIRECTION_VALUES.map((code) => ({ value: code, label: t(`call.direction.${code}`) })),
+    ],
+    [allLabel, t],
+  );
+
+  const resultOptions = useMemo(
+    (): readonly SelectOption[] => [
+      { value: '', label: allLabel },
+      ...RESULT_GROUPS.map((group) => ({
+        value: group,
+        label: t(`app.dashboard.series.${group}`),
+      })),
+    ],
+    [allLabel, t],
+  );
+
+  const lineOptions = useMemo(
+    (): readonly SelectOption[] => [
+      { value: '', label: allLabel },
+      ...options.lines.map((line) => {
+        if (line.id === null) {
+          return { value: BUILTIN_LINE, label: t('app.dashboard.filter.builtin') };
+        }
+        const name = line.name?.trim();
+        return {
+          value: String(line.id),
+          label: name || t('app.dashboard.filter.unknownLine', { id: String(line.id) }),
+        };
+      }),
+    ],
+    [allLabel, options.lines, t],
+  );
 
   const setField = (field: 'employee' | 'direction' | 'result' | 'line') => {
-    return (event: ChangeEvent<HTMLSelectElement>): void => {
-      onChange({ ...value, [field]: event.target.value });
+    return (next: string): void => {
+      onChange({ ...value, [field]: next });
     };
-  };
-
-  const employeeLabel = (employee: EmployeeOption): string => {
-    const name = employee.name?.trim();
-    const base = name || t('app.dashboard.filter.unknownEmployee', { id: String(employee.id) });
-    return employee.active === false
-      ? `${base} · ${t('app.dashboard.filter.dismissed')}`
-      : base;
-  };
-
-  const lineLabel = (line: LineOption): string => {
-    if (line.id === null) {
-      return t('app.dashboard.filter.builtin');
-    }
-    const name = line.name?.trim();
-    return name || t('app.dashboard.filter.unknownLine', { id: String(line.id) });
   };
 
   return (
     <div className={busy ? 'ca-viz-dim' : undefined}>
-      <div className="flex flex-wrap items-end gap-x-6 gap-y-4">
-        <div>
-          <span className="ca-viz-label mb-1.5 block">{t('app.dashboard.period.label')}</span>
-          <div
-            className="inline-flex rounded-lg border"
-            style={{ borderColor: 'var(--ca-border)' }}
-            role="group"
-            aria-label={t('app.dashboard.period.label')}
-          >
-            {PRESETS.map((preset, index) => {
-              const active = value.preset === preset;
-              return (
-                <button
-                  key={preset}
-                  type="button"
-                  aria-pressed={active}
-                  onClick={() => selectPreset(preset)}
-                  className="px-3 py-[7px] text-[13px] font-medium"
-                  style={{
-                    minHeight: 32,
-                    background: active ? 'var(--ca-accent-soft)' : 'transparent',
-                    color: active ? 'var(--ca-accent)' : 'var(--ca-muted)',
-                    borderLeft: index === 0 ? 'none' : '1px solid var(--ca-border)',
-                    borderRadius:
-                      index === 0
-                        ? '7px 0 0 7px'
-                        : index === PRESETS.length - 1
-                          ? '0 7px 7px 0'
-                          : undefined,
-                  }}
-                >
-                  {t(`app.dashboard.period.${preset}`)}
-                </button>
-              );
-            })}
-          </div>
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-end gap-3">
+          <SegmentedControl<PeriodPreset>
+            label={t('app.dashboard.period.label')}
+            value={value.preset}
+            onChange={selectPreset}
+            options={presetOptions}
+            className="min-w-0 max-w-full"
+          />
+
+          {value.preset === 'custom' ? (
+            // The picker owns the 366-day cap now, and shows it as unreachable days rather
+            // than moving the end the moderator just set and explaining it afterwards -
+            // which is why the old `tooLong` notice is gone from this row.
+            <Field
+              group
+              label={t('app.dashboard.period.custom')}
+              className="min-w-0 flex-1 basis-[240px] sm:max-w-[360px]"
+            >
+              {(control) => (
+                <DateRange
+                  id={control.controlId}
+                  aria-labelledby={control.labelId}
+                  aria-describedby={control.describedBy}
+                  value={{ from: value.from, to: value.to }}
+                  onChange={(next) =>
+                    onChange({ ...value, preset: 'custom', from: next.from, to: next.to })
+                  }
+                  timeZone={timeZone}
+                  maxSpanDays={MAX_PERIOD_DAYS}
+                />
+              )}
+            </Field>
+          ) : null}
         </div>
 
-        {value.preset === 'custom' ? (
-          <>
-            <DateField
-              id={`${fieldId}-from`}
-              label={t('app.dashboard.period.from')}
-              value={value.from}
-              max={today}
-              onChange={(raw) => moveEnd('from', raw)}
+        <div className="grid items-end gap-3 [grid-template-columns:repeat(auto-fit,minmax(176px,1fr))]">
+          {showEmployee ? (
+            <Select
+              label={t('app.dashboard.filter.employee')}
+              value={value.employee}
+              onChange={setField('employee')}
+              options={employeeOptions}
             />
-            <DateField
-              id={`${fieldId}-to`}
-              label={t('app.dashboard.period.to')}
-              value={value.to}
-              max={today}
-              onChange={(raw) => moveEnd('to', raw)}
-            />
-          </>
-        ) : null}
+          ) : null}
 
-        {showEmployee ? (
-          <SelectField
-            id={`${fieldId}-employee`}
-            label={t('app.dashboard.filter.employee')}
-            value={value.employee}
-            onChange={setField('employee')}
-            allLabel={t('app.dashboard.filter.all')}
-            items={options.employees.map((employee) => ({
-              value: String(employee.id),
-              label: employeeLabel(employee),
-            }))}
+          <Select
+            label={t('app.dashboard.filter.direction')}
+            value={value.direction}
+            onChange={setField('direction')}
+            options={directionOptions}
           />
-        ) : null}
 
-        <SelectField
-          id={`${fieldId}-direction`}
-          label={t('app.dashboard.filter.direction')}
-          value={value.direction}
-          onChange={setField('direction')}
-          allLabel={t('app.dashboard.filter.all')}
-          items={DIRECTION_VALUES.map((code) => ({
-            value: code,
-            label: t(`call.direction.${code}`),
-          }))}
-        />
+          <Select
+            label={t('app.dashboard.filter.result')}
+            value={value.result}
+            onChange={setField('result')}
+            options={resultOptions}
+          />
 
-        <SelectField
-          id={`${fieldId}-result`}
-          label={t('app.dashboard.filter.result')}
-          value={value.result}
-          onChange={setField('result')}
-          allLabel={t('app.dashboard.filter.all')}
-          items={RESULT_GROUPS.map((group) => ({
-            value: group,
-            label: t(`app.dashboard.series.${group}`),
-          }))}
-        />
+          <Select
+            label={t('app.dashboard.filter.line')}
+            value={value.line}
+            onChange={setField('line')}
+            options={lineOptions}
+          />
 
-        <SelectField
-          id={`${fieldId}-line`}
-          label={t('app.dashboard.filter.line')}
-          value={value.line}
-          onChange={setField('line')}
-          allLabel={t('app.dashboard.filter.all')}
-          items={options.lines.map((line) => ({
-            value: line.id === null ? BUILTIN_LINE : String(line.id),
-            label: lineLabel(line),
-          }))}
-        />
-
-        {hasNarrowingFilter(value) ? (
-          <button
-            type="button"
-            className="ca-button ca-button-quiet"
-            style={{ minHeight: 32 }}
-            onClick={() =>
-              onChange({ ...value, employee: '', direction: '', result: '', line: '' })
-            }
-          >
-            {t('app.dashboard.filter.reset')}
-          </button>
-        ) : null}
+          {hasNarrowingFilter(value) ? (
+            <div className="flex">
+              <button
+                type="button"
+                className="ca-button ca-button-quiet w-full"
+                style={{ minHeight: 'var(--ca-control-h)' }}
+                onClick={() =>
+                  onChange({ ...value, employee: '', direction: '', result: '', line: '' })
+                }
+              >
+                {t('app.dashboard.filter.reset')}
+              </button>
+            </div>
+          ) : null}
+        </div>
       </div>
-
-      {notice ? (
-        <p className="ca-muted mt-2 text-[12px]" role="status">
-          {notice}
-        </p>
-      ) : null}
-    </div>
-  );
-}
-
-interface SelectItem {
-  value: string;
-  label: string;
-}
-
-/**
- * A native `<select>`.
- *
- * Native on purpose: it inherits the portal's own font, it opens above the iframe edge
- * instead of being clipped by the slider, and it is keyboard- and screen-reader-correct
- * without a line of code. A hand-rolled listbox inside a frame we do not size is how a
- * dropdown ends up unreachable.
- */
-function SelectField({
-  id,
-  label,
-  value,
-  onChange,
-  allLabel,
-  items,
-}: {
-  id: string;
-  label: string;
-  value: string;
-  onChange: (event: ChangeEvent<HTMLSelectElement>) => void;
-  allLabel: string;
-  items: SelectItem[];
-}) {
-  return (
-    <div className="min-w-0">
-      <label className="ca-viz-label mb-1.5 block" htmlFor={id}>
-        {label}
-      </label>
-      <select
-        id={id}
-        value={value}
-        onChange={onChange}
-        className="rounded-lg px-2.5 text-[13px]"
-        style={{
-          minHeight: 32,
-          maxWidth: 220,
-          background: 'var(--ca-surface)',
-          color: 'var(--ca-text)',
-          border: '1px solid var(--ca-border)',
-        }}
-      >
-        <option value="">{allLabel}</option>
-        {items.map((item) => (
-          <option key={item.value} value={item.value}>
-            {item.label}
-          </option>
-        ))}
-      </select>
-    </div>
-  );
-}
-
-function DateField({
-  id,
-  label,
-  value,
-  max,
-  onChange,
-}: {
-  id: string;
-  label: string;
-  value: string;
-  max: string;
-  onChange: (raw: string) => void;
-}) {
-  return (
-    <div>
-      <label className="ca-viz-label mb-1.5 block" htmlFor={id}>
-        {label}
-      </label>
-      <input
-        id={id}
-        type="date"
-        value={value}
-        max={max}
-        onChange={(event) => onChange(event.target.value)}
-        className="ca-viz-num rounded-lg px-2.5 text-[13px]"
-        style={{
-          minHeight: 32,
-          background: 'var(--ca-surface)',
-          color: 'var(--ca-text)',
-          border: '1px solid var(--ca-border)',
-        }}
-      />
     </div>
   );
 }

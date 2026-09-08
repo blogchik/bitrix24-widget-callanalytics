@@ -7,16 +7,26 @@
     },
     "calls": {
       "player": {
+        "elapsed": "Elapsed",
         "failed": "The recording is still unavailable. Open the call in Bitrix24 to check whether it still exists.",
         "loading": "Preparing the recording...",
         "missing": "This call has no recording any more.",
+        "mute": "Mute",
         "noViewerToken": "Bitrix24 did not confirm your session, so the recording cannot be played here. Open the call in Bitrix24 instead.",
         "offBody": "This portal plays call recordings in Bitrix24 itself. Open the call there to listen to it.",
         "offTitle": "Recordings are played in Bitrix24",
         "open": "Open in Bitrix24",
         "openFailed": "Bitrix24 did not open the page. Look for the call in Bitrix24 under Telephony.",
+        "pause": "Pause",
+        "play": "Play",
+        "position": "{current} of {total}",
+        "rate": "Playback speed",
         "retry": "Try again",
+        "seek": "Playback position",
         "stale": "The recording did not play. It may have been deleted in Bitrix24. A fresh link has been requested - try again in a moment.",
+        "total": "Total length",
+        "transport": "Recording player",
+        "unmute": "Unmute",
         "unsupported": "This browser cannot play the recording."
       },
       "table": {
@@ -84,11 +94,17 @@
         "total": "Total"
       },
       "period": {
+        "apply": "Apply",
+        "cancel": "Cancel",
         "custom": "Custom",
         "d30": "30 days",
         "d7": "7 days",
         "from": "From",
         "label": "Period",
+        "maxDays": "At most {days, plural, one {# day} other {# days}}",
+        "nextMonth": "Next month",
+        "pickEnd": "Pick the end of the period",
+        "prevMonth": "Previous month",
         "to": "To",
         "today": "Today",
         "tooLong": "A period can cover at most {days} days, so the other end was moved."

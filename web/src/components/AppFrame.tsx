@@ -113,28 +113,55 @@ export interface PageShellProps {
   children: ReactNode;
 }
 
-/** The one page layout: a title block, an optional banner, then content. */
+/**
+ * The one page layout: a title block, an optional banner, then content.
+ *
+ * Two measurements decide the numbers here, and both are about the frame this renders
+ * in rather than about taste:
+ *
+ *  * **The column is 1280px on a wide slider, not 1024.** A Bitrix24 slider opens close
+ *    to the full width of a desktop browser; at 1440 the old `max-w-5xl` left ~230px of
+ *    empty margin on each side while the summary tiles inside it were narrow enough to
+ *    wrap their own comparison line. Width is the cheapest fix for a cramped tile.
+ *  * **The gutter is 16px on a phone, not 24.** The dashboard puts its two chart panels
+ *    in a `minmax(340px, 1fr)` grid, so at 375 the panel is 340px wide whatever the
+ *    padding is; every pixel taken off the gutter goes to the heatmap inside it.
+ *
+ * Everything is a multiple of 4, and vertical steps come in one pair (16 on a phone,
+ * 20-32 from `sm` up) so the page has a single rhythm instead of one per component.
+ */
 export function PageShell({ title, subtitle, chips, banner, children }: PageShellProps) {
   return (
-    <div className="mx-auto w-full max-w-5xl px-6 py-8">
-      <header className="mb-6 flex flex-wrap items-start justify-between gap-3">
-        <div>
+    <div className={`${SHELL_WIDTH} px-4 py-6 sm:px-6 lg:px-8 lg:py-8`}>
+      <header className="mb-4 flex flex-wrap items-start justify-between gap-3 sm:mb-6">
+        <div className="min-w-0">
           <h1 className="text-[20px] font-semibold leading-tight">{title}</h1>
           {subtitle ? <p className="ca-muted mt-1 text-[13px]">{subtitle}</p> : null}
         </div>
         {chips ? <div className="flex flex-wrap items-center gap-2">{chips}</div> : null}
       </header>
-      {banner ? <div className="ca-banner mb-6">{banner}</div> : null}
-      <div className="flex flex-col gap-5">{children}</div>
+      {banner ? <div className="ca-banner mb-4 sm:mb-6">{banner}</div> : null}
+      <div className="flex flex-col gap-4 sm:gap-5">{children}</div>
     </div>
   );
 }
 
-/** A titled card. Milestone 5 drops charts and tables into these. */
+/** The content column, shared by {@link PageShell} and {@link LoadingBlock}. */
+const SHELL_WIDTH = 'mx-auto w-full max-w-[1280px]';
+
+/**
+ * A titled card. Milestone 5 drops charts and tables into these.
+ *
+ * `min-w-0` is load-bearing: these are grid items on the dashboard, and without it a
+ * chart's own minimum content width would push the card wider than its track instead of
+ * letting the chart shrink (or, where it genuinely cannot, scroll inside itself).
+ */
 export function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <section className="ca-card px-6 py-5">
-      <h2 className="ca-muted mb-4 text-[12px] font-semibold uppercase tracking-wider">{title}</h2>
+    <section className="ca-card min-w-0 px-4 py-4 sm:px-6 sm:py-5">
+      <h2 className="ca-muted mb-3 text-[12px] font-semibold uppercase tracking-wider sm:mb-4">
+        {title}
+      </h2>
       {children}
     </section>
   );
@@ -158,10 +185,14 @@ export function FieldList({ children }: { children: ReactNode }) {
 /** Content-shaped placeholder while `GET /me` is in flight. */
 export function LoadingBlock({ label }: { label: string }) {
   return (
-    <div className="mx-auto w-full max-w-5xl px-6 py-8" role="status" aria-label={label}>
+    <div
+      className={`${SHELL_WIDTH} px-4 py-6 sm:px-6 lg:px-8 lg:py-8`}
+      role="status"
+      aria-label={label}
+    >
       <div className="ca-skeleton h-6 w-56" />
       <div className="ca-skeleton mt-3 h-4 w-80" />
-      <div className="ca-card mt-6 px-6 py-5">
+      <div className="ca-card mt-6 px-4 py-4 sm:px-6 sm:py-5">
         <div className="ca-skeleton h-4 w-40" />
         <div className="ca-skeleton mt-4 h-4 w-full" />
         <div className="ca-skeleton mt-2 h-4 w-5/6" />

@@ -1,0 +1,53 @@
+# Local UI audit topology. Layer it on the base file plus the tunnel file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tunnel.yml -f docker-compose.audit.yml up -d caddy api web
+#
+# Why this exists: the SPA calls /api/v1/* on its OWN origin, which in production is
+# our Caddy splitting paths between web and api. Running `next dev` on :3000 and the
+# API on :8000 is two origins, so a browser audit has to rewrite requests, and a
+# rewrite is exactly the kind of harness artefact that produces findings the real app
+# does not have. This publishes our Caddy on one loopback port so the audit sees the
+# same single-origin app a portal user sees.
+#
+# It also stubs the tunnel: cloudflared is not wanted locally and would refuse to start
+# without a token.
+
+services:
+  caddy:
+    ports:
+      - "127.0.0.1:8080:80"
+
+  cloudflared:
+    # Replaced by a no-op so the tunnel file can be layered without a real token.
+    image: alpine:3.20
+    command: ["sh", "-c", "sleep infinity"]
+    environment:
+      TUNNEL_TOKEN: "unused-locally"
+
+  web:
+    # The UI work needs a feedback loop measured in seconds, not in image rebuilds.
+    # The base file runs the production `runner` stage, which bakes the source in:
+    # a component edit is invisible at :8080 until `docker compose build web`, so an
+    # audit run against it silently measures the previous version of the app. Stop at
+    # the `build` stage instead and bind-mount the source, exactly as
+    # docker-compose.dev.yml does, keeping node_modules and .next from the image.
+    build:
+      context: ./web
+      target: build
+    image: callanalytics-web:dev
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+      - /app/.next
+    command: ["npm", "run", "dev"]
+    # docker-compose.prod.yml caps web at 256M, sized for `next start` serving a
+    # prebuilt app on the shared host. `next dev` compiles on demand and would be
+    # OOM-killed under that ceiling. This override runs on a developer machine, not
+    # on the shared box, so the production sizing note does not apply here.
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    environment:
+      NODE_ENV: development
+      WATCHPACK_POLLING: "true"

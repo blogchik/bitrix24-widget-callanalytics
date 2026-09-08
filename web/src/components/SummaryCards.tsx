@@ -13,10 +13,22 @@
  * that uses them, and it carries an arrow icon and the word ("up" / "down") beside the
  * number, so the direction survives a colourblind viewer, a greyscale print and a
  * screen reader. Every other tile shows its delta in ink.
+ *
+ * Two things the comparison chip is not allowed to do, because it did both:
+ *
+ *  * **It never wraps.** "-9 п.п. / снижение / к предыдущему периоду" broken over three
+ *    lines is not a chip, it is a paragraph with a pink background - and it wrapped at
+ *    1440 as readily as at 375. The chip is now the number and its direction only, on one
+ *    line; "к предыдущему периоду" is the chip's `title`, where a phrase that is identical
+ *    on all four tiles belongs.
+ *  * **It never reports a four-digit percentage.** A portal whose previous period holds
+ *    four calls produced "+2 108 % рост", which is arithmetic, not information. Past
+ *    {@link MULTIPLIER_FROM}x the change is stated as a multiplier ("×22") and the base it
+ *    is measured against moves into the title, so the reader can see for themselves that
+ *    the comparison rests on almost nothing.
  */
 
 import { useTranslations } from 'next-intl';
-import type { ReactNode } from 'react';
 
 import { formatCount, formatDuration } from '@/lib/format';
 
@@ -102,6 +114,32 @@ function signedPoints(value: number, locale: string): string {
   }
 }
 
+/**
+ * Growth at or beyond this ratio is shown as "×N" rather than as a percentage.
+ *
+ * Ten times over is where a percentage stops being read as a quantity: nobody converts
+ * "+2 108 %" back into "twenty-two times as many", and the four digits only advertise
+ * that the denominator was tiny. Decline needs no such rule - it is bounded at -100 %.
+ */
+const MULTIPLIER_FROM = 10;
+
+/** `×22`, `×1,4` - whole once the ratio is large enough for a fraction to be noise. */
+function multiplier(ratio: number, locale: string): string {
+  const digits = ratio >= MULTIPLIER_FROM ? 0 : 1;
+  try {
+    return `×${new Intl.NumberFormat(locale, {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: digits,
+    }).format(ratio)}`;
+  } catch {
+    return `×${digits === 0 ? Math.round(ratio) : Math.round(ratio * 10) / 10}`;
+  }
+}
+
+/** The chip is one line at every width, and `max-w-full` keeps it inside its tile. */
+const CHIP_CLASS =
+  'inline-flex max-w-full items-center gap-1.5 whitespace-nowrap rounded-full text-[12px]';
+
 type Direction = 'up' | 'down' | 'flat';
 
 function directionOf(delta: number | null): Direction {
@@ -119,6 +157,41 @@ function relativeDelta(current: number, previous: number | null | undefined): nu
   return (current - previous) / previous;
 }
 
+/** What one tile says about the period before it. A `null` `text` means "nothing to say". */
+interface Comparison {
+  direction: Direction;
+  text: string | null;
+  /** The previous value, already formatted, when the chip had to fall back to a ratio. */
+  base?: string;
+}
+
+/**
+ * A count-like measure against the same measure one period ago.
+ *
+ * The percentage is the normal answer; past {@link MULTIPLIER_FROM}x it becomes a
+ * multiplier, and the base comes back with it so the title can name what the multiple is
+ * a multiple *of*.
+ */
+function compareCounts(
+  current: number | null,
+  previous: number | null | undefined,
+  locale: string,
+  formatBase: (value: number) => string = (value) => formatCount(value, locale),
+): Comparison {
+  if (current === null || previous === null || previous === undefined) {
+    return { direction: 'flat', text: null };
+  }
+  const delta = relativeDelta(current, previous);
+  if (delta === null) {
+    return { direction: 'flat', text: null };
+  }
+  const ratio = current / previous;
+  if (ratio >= MULTIPLIER_FROM) {
+    return { direction: 'up', text: multiplier(ratio, locale), base: formatBase(previous) };
+  }
+  return { direction: directionOf(delta), text: signedPercent(delta, locale) };
+}
+
 export function SummaryCards({ summary, locale }: SummaryCardsProps) {
   const t = useTranslations();
 
@@ -130,24 +203,15 @@ export function SummaryCards({ summary, locale }: SummaryCardsProps) {
 
   const ratePoints = rate !== null && previousRate !== null ? rate - previousRate : null;
 
+  // One column on a phone, two from `sm`, four from `lg`. `auto-fit` with a 184px floor
+  // produced five cramped columns on a wide slider and a chip that wrapped inside every
+  // one of them; a stated column count is what keeps the chip on one line at every width.
   return (
-    <div
-      className="grid gap-3"
-      style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(184px, 1fr))' }}
-    >
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
       <Tile
         label={t('app.dashboard.summary.total')}
         value={formatCount(summary.total, locale)}
-        delta={
-          <Delta
-            direction={directionOf(relativeDelta(summary.total, previous?.total))}
-            text={
-              relativeDelta(summary.total, previous?.total) === null
-                ? null
-                : signedPercent(relativeDelta(summary.total, previous?.total) as number, locale)
-            }
-          />
-        }
+        comparison={compareCounts(summary.total, previous?.total, locale)}
       />
 
       <Tile
@@ -157,35 +221,25 @@ export function SummaryCards({ summary, locale }: SummaryCardsProps) {
           answered: formatCount(summary.answered, locale),
           total: formatCount(summary.total, locale),
         })}
-        delta={
-          <Delta
-            direction={directionOf(ratePoints)}
-            text={ratePoints === null ? null : t('app.dashboard.summary.points', {
-              value: signedPoints(ratePoints, locale),
-            })}
-            tone="status"
-          />
-        }
+        // Points, never a percentage of a percentage: a rate that moved from 4 % to 8 %
+        // did not grow by 100 %, it grew by four points, and only one of those two
+        // sentences survives being read quickly. This is also the one tile allowed the
+        // status hues, so its chip carries the arrow and the word beside the number.
+        comparison={{
+          direction: directionOf(ratePoints),
+          text:
+            ratePoints === null
+              ? null
+              : t('app.dashboard.summary.points', { value: signedPoints(ratePoints, locale) }),
+        }}
+        tone="status"
       />
 
       <Tile
         label={t('app.dashboard.summary.missed')}
         value={formatCount(summary.missed, locale)}
-        hint={
-          summary.total > 0
-            ? percent(summary.missed / summary.total, locale)
-            : undefined
-        }
-        delta={
-          <Delta
-            direction={directionOf(relativeDelta(summary.missed, previous?.missed))}
-            text={
-              relativeDelta(summary.missed, previous?.missed) === null
-                ? null
-                : signedPercent(relativeDelta(summary.missed, previous?.missed) as number, locale)
-            }
-          />
-        }
+        hint={summary.total > 0 ? percent(summary.missed / summary.total, locale) : undefined}
+        comparison={compareCounts(summary.missed, previous?.missed, locale)}
       />
 
       <Tile
@@ -194,16 +248,9 @@ export function SummaryCards({ summary, locale }: SummaryCardsProps) {
         hint={t('app.dashboard.summary.talkTotal', {
           duration: formatDuration(summary.talk_seconds),
         })}
-        delta={
-          <Delta
-            direction={directionOf(relativeDelta(talk ?? 0, previousTalk))}
-            text={
-              talk === null || relativeDelta(talk, previousTalk) === null
-                ? null
-                : signedPercent(relativeDelta(talk, previousTalk) as number, locale)
-            }
-          />
-        }
+        comparison={compareCounts(talk, previousTalk, locale, (seconds) =>
+          formatDuration(Math.round(seconds)),
+        )}
       />
     </div>
   );
@@ -213,15 +260,20 @@ function Tile({
   label,
   value,
   hint,
-  delta,
+  comparison,
+  tone = 'neutral',
 }: {
   label: string;
   value: string;
   hint?: string;
-  delta: ReactNode;
+  comparison: Comparison;
+  tone?: 'neutral' | 'status';
 }) {
   return (
-    <div className="ca-panel px-4 py-3.5">
+    // `min-w-0` so a long grouped number shrinks the tile's contents rather than its grid
+    // track; `mt-auto` on the chip puts all four chips on one baseline even though only
+    // three of the tiles carry a hint line above it.
+    <div className="ca-panel flex min-w-0 flex-col px-4 py-3.5">
       <div className="ca-viz-label">{label}</div>
       <div
         className="ca-viz-num mt-1 font-semibold leading-none"
@@ -229,31 +281,35 @@ function Tile({
       >
         {value}
       </div>
-      {hint ? (
-        <div className="ca-viz-num ca-muted mt-1.5 text-[12px]">{hint}</div>
-      ) : null}
-      <div className="mt-2">{delta}</div>
+      {hint ? <div className="ca-viz-num ca-muted mt-1.5 text-[12px]">{hint}</div> : null}
+      <div className="mt-auto pt-2">
+        <Delta comparison={comparison} tone={tone} />
+      </div>
     </div>
   );
 }
 
 /**
- * The comparison line: an arrow, a number, and the word for the direction.
+ * The comparison line: an arrow, a number, and the word for the direction. One line.
  *
  * `tone="status"` adds the permitted green/red - as a soft pill and the arrow's fill,
  * with the number and the word left in ink so the sentence stays legible at 12px
  * regardless of how the two hues score against the surface.
+ *
+ * What the chip does *not* carry is "к предыдущему периоду". It is the same six words on
+ * every tile, it is what a comparison chip means anyway, and it was what forced the chip
+ * onto a third line. It is the `title` instead - together with the previous value itself
+ * whenever the change was large enough to be shown as a multiplier.
  */
 function Delta({
-  direction,
-  text,
+  comparison,
   tone = 'neutral',
 }: {
-  direction: Direction;
-  text: string | null;
+  comparison: Comparison;
   tone?: 'neutral' | 'status';
 }) {
   const t = useTranslations();
+  const { direction, text, base } = comparison;
 
   if (text === null) {
     return <span className="ca-muted text-[12px]">{t('app.dashboard.summary.noPrevious')}</span>;
@@ -261,10 +317,12 @@ function Delta({
 
   const statusVar = direction === 'up' ? 'var(--ca-viz-up)' : 'var(--ca-viz-down)';
   const colored = tone === 'status' && direction !== 'flat';
+  const vsPrevious = t('app.dashboard.summary.vsPrevious');
 
   return (
     <span
-      className="inline-flex items-center gap-1.5 rounded-full text-[12px]"
+      className={CHIP_CLASS}
+      title={base === undefined ? vsPrevious : `${vsPrevious}: ${base}`}
       style={{
         padding: colored ? '2px 8px' : undefined,
         background: colored
@@ -281,7 +339,6 @@ function Delta({
       <span style={{ color: 'var(--ca-viz-ink-2)' }}>
         {t(`app.dashboard.summary.${direction}`)}
       </span>
-      <span className="ca-muted">{t('app.dashboard.summary.vsPrevious')}</span>
     </span>
   );
 }

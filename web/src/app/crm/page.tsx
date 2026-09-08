@@ -40,15 +40,26 @@ const STYLE_ID = 'ca-crm-page';
 
 /** The one style this page owns: the entity link in the header. */
 const CSS = `
+/* Drawn as a link, sized as a target: the glyphs are 20px tall, which is under the touch
+ * floor on the surface this page exists for - a CRM card opened on a phone. The height
+ * comes from the control token and the negative margin keeps the text where the header
+ * puts it, so the box grows without the layout moving. */
 .ca-entity-link {
-  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--ca-control-h);
+  margin: 0 -6px;
+  padding: 0 6px;
   border: 0;
+  border-radius: var(--ca-radius);
   background: none;
   font: inherit;
   color: var(--ca-accent);
   cursor: pointer;
+  transition: background-color var(--ca-dur-fast) var(--ca-ease);
 }
 .ca-entity-link:hover {
+  background: var(--ca-accent-soft);
   text-decoration: underline;
 }
 `;

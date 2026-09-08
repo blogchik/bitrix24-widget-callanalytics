@@ -23,7 +23,7 @@ offers an "open in Bitrix24" link instead.
 | Lifecycle events, purge, retention | done |
 | Recording playback spike | needs a real portal — see `docs/spike-recording-playback.md` |
 
-396 tests pass against a real PostgreSQL 16.
+403 tests pass against a real PostgreSQL 16.
 
 ## Running it locally
 

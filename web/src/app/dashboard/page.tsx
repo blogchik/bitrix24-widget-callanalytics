@@ -191,7 +191,12 @@ export default function DashboardPage() {
 
                 <div
                   className="grid gap-5"
-                  style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))' }}
+                  // `min(340px, 100%)` and not a bare 340px: a bare track floor is a floor
+                  // the grid will honour even when the column is narrower than it, so at
+                  // 320px this pushed the page 36px wider than the viewport and the whole
+                  // dashboard scrolled sideways. With `min()` the floor gives way once it
+                  // no longer fits, which is the only width at which it was ever wrong.
+                  style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(340px, 100%), 1fr))' }}
                 >
                   <Section title={t('app.dashboard.heatmap.title')}>
                     <HourWeekdayHeatmap cells={data.hour_weekday} locale={locale} />

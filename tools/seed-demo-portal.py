@@ -17,6 +17,13 @@ MEMBER_ID = "5c0de5000ce5c0de5000ce5c0de50011"
 USERS = [(101, "Азиз", "Каримов"), (102, "Дилноза", "Юсупова"), (103, "Тимур", "Сафаров")]
 CODES = ["200", "200", "200", "304", "486", "603"]
 
+# The CRM tab is reached from a deal, a lead, a contact or a company card, so a portal with
+# no CRM-linked calls can only ever render that tab's empty state. Roughly a third of the
+# seeded calls are attached to one of four fixed cards, which is also what makes the call
+# table's CRM column - hidden when every loaded row is empty for it - testable in both of
+# its states rather than only the hidden one.
+CRM_CARDS = [("DEAL", 4021), ("LEAD", 1187), ("CONTACT", 903), ("COMPANY", 55)]
+
 
 async def main() -> None:
     async with control_txn() as session:
@@ -53,6 +60,12 @@ async def main() -> None:
                                      minutes=rng.randint(0, 59))
         code = CODES[rng.randrange(len(CODES))]
         app_id = rng.choice([None, None, 41])
+        card = rng.choice([None, None, *CRM_CARDS])
+        # Only answered calls carry a recording, which is what a real provider does and what
+        # keeps the "no recording" cell meaningful rather than uniform. The URL is a local
+        # placeholder: `RECORDING_MODE` is `off` in every environment this script runs in, so
+        # nothing ever fetches it, and it must not resemble a real provider link.
+        recorded = code == "200" and rng.random() < 0.45
         rows.append(
             {
                 "p": portal_id,
@@ -65,6 +78,10 @@ async def main() -> None:
                 "ph": f"+9989{rng.randint(10_000_000, 99_999_999)}",
                 "app": app_id,
                 "appname": None if app_id is None else "SIP-линия",
+                "ctype": None if card is None else card[0],
+                "cid": None if card is None else card[1],
+                "cact": None if card is None else 900_000 + i,
+                "rurl": f"https://example.invalid/demo-recording/{i}.mp3" if recorded else None,
             }
         )
 
@@ -83,8 +100,10 @@ async def main() -> None:
                 "call_duration, call_failed_code, portal_user_id, phone_number, rest_app_id, "
                 # asyncpg cannot infer a type for a parameter used only inside CASE,
                 # so the nullable integer is cast explicitly and the name passed in.
-                "rest_app_name) VALUES (:p, :bx, :t, :d, :dur, :c, :u, :ph, "
-                "cast(:app as integer), :appname)"
+                "rest_app_name, crm_entity_type, crm_entity_id, crm_activity_id, "
+                "call_record_url) VALUES (:p, :bx, :t, :d, :dur, :c, :u, :ph, "
+                "cast(:app as integer), :appname, :ctype, cast(:cid as integer), "
+                "cast(:cact as bigint), :rurl)"
             ),
             rows,
         )
@@ -101,8 +120,42 @@ async def main() -> None:
         ent=None,
         ttl_seconds=3600,
     )
+    # The CRM tab reads its entity from the JWT, never from the query string (§4.4 step 5),
+    # so a token minted for the left-menu placement cannot open it. This second one can.
+    crm_token = issue_session(
+        pid=portal_id,
+        mid=MEMBER_ID,
+        sub=101,
+        adm=True,
+        acc="all",
+        tz="Asia/Tashkent",
+        lang="ru",
+        plc="CRM_DEAL_DETAIL_TAB",
+        ent={"t": CRM_CARDS[0][0], "id": CRM_CARDS[0][1]},
+        ttl_seconds=3600,
+    )
+
+    # Written AFTER the token is minted, and that order is the whole point: §4.8 serves a
+    # CRM tab only from a context resolved no earlier than the JWT was, so a row inserted
+    # first is one the API correctly refuses with 409 `context_missing`. Seeding it in the
+    # other order produced a tab that could never render its table.
+    #
+    # `entity_keys` and `activity_ids` stay empty on purpose. The match clause also tests
+    # the raw `(ent.t, ent.id)` pair, which is what the seeded calls carry, so an empty
+    # cache row exercises the path a portal that emits DEAL in its statistics rows takes.
+    async with tenant_txn(portal_id) as session:
+        for entity_type, entity_id in CRM_CARDS:
+            await session.execute(
+                text(
+                    "INSERT INTO crm_contexts (portal_id, entity_type, entity_id, "
+                    "resolved_by_user_id, resolved_at) VALUES (:p, :t, :i, 101, now())"
+                ),
+                {"p": portal_id, "t": entity_type, "i": entity_id},
+            )
+
     print(f"PORTAL_ID={portal_id}")
     print(f"TOKEN={token}")
+    print(f"CRM_TOKEN={crm_token}")
 
 
 asyncio.run(main())

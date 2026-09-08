@@ -390,8 +390,16 @@ async def _stream(
                 },
             )
         finally:
-            await upstream.aclose()
-            await client.aclose()
+            # Both closes can themselves raise on a connection that already timed out,
+            # and an exception here escapes the generator into Starlette's task group -
+            # which is how a caught ReadTimeout still surfaced as a 500 with an exception
+            # group in the log. Closing is best-effort by definition: the request is over
+            # either way, and there is nobody left to tell.
+            for closer in (upstream.aclose, client.aclose):
+                try:
+                    await closer()
+                except Exception:  # noqa: BLE001 - teardown must not fail the response
+                    pass
 
     headers = {
         key: value

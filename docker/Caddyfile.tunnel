@@ -1,0 +1,176 @@
+# =============================================================================
+# docker/Caddyfile.tunnel  --  the ingress that ACTUALLY RUNS in production.
+# docs/architecture.md §2 (routing) and §4.10 (frame embedding, TLS, headers)
+#
+# Mounted read-only at /etc/caddy/Caddyfile by docker-compose.tunnel.yml, into a
+# caddy container inside OUR compose project.  Nothing about it is host-global:
+# the host's own :80/:443 belong to another project's Caddy, which we never touch.
+#
+# The request path is:
+#
+#   browser --https--> Cloudflare edge --tunnel--> cloudflared (our container)
+#           --http://caddy:80--> THIS FILE --> api:8000 / web:3000
+#
+# So this Caddy is an INTERNAL, PLAIN-HTTP path splitter on the compose network.
+# TLS is Cloudflare's, start to finish; this server must never attempt ACME and
+# must never redirect to https itself.  Both of those are enforced below and both
+# were confirmed deployment blockers, not theory.
+#
+# The sibling file docker/Caddyfile.snippet is the same routing for a DEDICATED
+# host where Caddy owns :80/:443 and gets its own certificate.  The routing, the
+# header rules and the log filter are identical by design and are covered for both
+# files by api/tests/test_routing.py; only the TLS/forwarded-header/log-sink
+# differences below are specific to living behind the tunnel.
+# =============================================================================
+{
+	# ---------------------------------------------------- forwarded headers
+	# HOST-SPECIFIC.  Do not delete this block and do not "fix" the reverse_proxy
+	# blocks below by re-setting the forwarded scheme there.
+	#
+	# Caddy IGNORES incoming X-Forwarded-* by default (anti-spoofing) and derives
+	# them from the connection it sees.  The connection it sees here is plain HTTP
+	# from cloudflared, so the derived scheme is `http` - and the app builds
+	# absolute URLs and issues redirects from the forwarded scheme.  A slash-less
+	# handler URL (`/app` -> `/app/`, §4.11) would then send the browser to
+	# http://b24.texnobus.uz/app/ from inside an HTTPS iframe: mixed content, a
+	# blocked navigation, and a blank frame in the Bitrix24 portal.
+	#
+	# cloudflared already forwards the edge's own, correct X-Forwarded-* (scheme
+	# https, the real client address).  Declaring it a trusted proxy makes Caddy
+	# PRESERVE those values instead of overwriting them, which is exactly what we
+	# want and is why no `header_up` line appears in this file at all.
+	#
+	# `private_ranges` (10/8, 172.16/12, 192.168/16, 127.0.0.0/8, fc00::/7) covers
+	# whatever subnet Docker hands the callanalytics_default network - it is not
+	# fixed, so it cannot be hard-coded.  This is not a spoofing hole: the compose
+	# file publishes NO ports, so nothing outside that network can open a
+	# connection to this server in the first place.
+	servers {
+		trusted_proxies static private_ranges
+	}
+
+	# The admin API stays on its default localhost:2019, container-local and
+	# unpublished; the compose healthcheck probes it.  Do not expose it.
+}
+
+# ---------------------------------------------------------------- site address
+# `:80`, NOT `b24.texnobus.uz`.  A hostname as the site address turns on Caddy's
+# automatic HTTPS, which behind a tunnel is fatal twice over:
+#
+#   1. Caddy would try to obtain an ACME certificate for a name it cannot validate
+#      - the public :80/:443 of this box belong to another project's Caddy and the
+#        DNS record points at Cloudflare, not at us - so it would retry, and log,
+#        forever.
+#   2. Automatic HTTPS also installs the plain-HTTP -> HTTPS redirect on :80.
+#      Every request cloudflared delivers arrives on :80, so every request would
+#      come back as a 308 to https://b24.texnobus.uz/..., which the browser sends
+#      back to Cloudflare, back down the tunnel, onto :80 again.  An infinite
+#      redirect loop for 100% of traffic.
+#
+# A bare port as the site address disables automatic HTTPS entirely, which is the
+# documented way to run Caddy behind a TLS-terminating proxy.  Never put the
+# hostname back here; hostname-based routing is not needed because the Cloudflare
+# dashboard already routes exactly one hostname to http://caddy:80.
+:80 {
+	encode zstd gzip
+
+	# ---------------------------------------------------------------- headers
+	# NO HSTS HEADER HERE, on purpose - the dedicated-host snippet sets one and
+	# this file deliberately does not.  Cloudflare terminates TLS for this zone
+	# and owns its HSTS policy (dashboard: SSL/TLS -> Edge Certificates).  A
+	# max-age emitted from behind the tunnel is at best a duplicate of the edge's
+	# policy and at worst a second, conflicting one that nobody can find.
+	header {
+		# §4.10: the app is rendered INSIDE a Bitrix24 iframe.  X-Frame-Options has
+		# no origin granularity and would break every portal, so it is stripped here
+		# no matter what an upstream sets.  Framing is controlled exclusively by the
+		# per-request `Content-Security-Policy: frame-ancestors` that web/middleware.ts
+		# and the server-rendered install/handoff/state pages emit from the validated
+		# DOMAIN.  Never add X-Frame-Options back.
+		-X-Frame-Options
+
+		# Do not advertise the stack.
+		-Server
+		-X-Powered-By
+
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+
+	# ---------------------------------------------------------------- routing
+	# Bitrix24-facing form POSTs, the SPA's JSON API and the health probe are the
+	# FastAPI app; everything else is the Next.js frontend (§2).
+	#
+	# THE TRAILING SLASH IS LOAD-BEARING, and `/settings` is why this comment exists.
+	# Caddy's `path` matcher is an EXACT comparison unless the token carries a `*`, so
+	# each spelling routes on its own:
+	#
+	#   /settings/  -> api   the Bitrix24 handler URL registered in the vendor cabinet;
+	#                        Bitrix24 POSTs the iframe form here (§4.5).
+	#   /settings   -> web   the SPA's admin page.  It is where the handoff sends the
+	#                        browser (`_SETTINGS_PATH` in api/app/handlers/open.py writes
+	#                        `location.replace("/settings?<query>#s=<jwt>")`, §4.4 step 8)
+	#                        and where SyncBanner's "open settings" link points.
+	#
+	# Listing the bare token `/settings` here would divert that GET to FastAPI, which
+	# serves no page there - the moderation walk-through (docs/moderation-checklist.md
+	# step 8) would end in an error instead of the settings page, which §4.11 counts as
+	# a rejection.  §2 lists `/settings/*` for the api and nothing else; keep it that
+	# way.  The regression test is api/tests/test_routing.py, which parses this line.
+	#
+	# `/app`, `/install` and `/events` keep their slash-less token: no SPA route uses
+	# those names, so nothing is stolen, and a request that arrives without the slash
+	# reaches the api - which redirects a POST onto the real handler and renders the
+	# "open this app from Bitrix24" page for a GET (§4.11) rather than falling through
+	# to a bare Next.js 404.
+	@api path /app /app/* /install /install/* /settings/* /events /events/* /api/* /healthz
+
+	handle @api {
+		# Bare proxy on purpose.  The forwarded headers are the tunnel's (see the
+		# `trusted_proxies` note at the top of this file); anything set here would
+		# replace the edge's values with this hop's plain-HTTP view of the world.
+		reverse_proxy api:8000
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+
+	# ---------------------------------------------------------------- access log
+	# §4.10: a session JWT travels in a URL fragment and, at handoff time, inside the
+	# Location header; Bitrix24's own POST-back query string carries AUTH_ID/APP_SID.
+	# None of it may ever be persisted to disk, so the encoder DELETES the Location
+	# response header and REWRITES the logged URI to drop the query string entirely.
+	# Keep this filter in sync with any new field you add - the default json encoder
+	# logs everything it is given.
+	log {
+		# stderr, NOT a file.  A log file would land in the container's writable
+		# layer, where Caddy's own roll settings are the only thing bounding it and
+		# nothing on the host rotates or ships it.  On stderr it becomes container
+		# output, so Docker's json-file driver owns the rotation - and
+		# docker-compose.tunnel.yml caps that driver's size and file count.
+		output stderr
+
+		format filter {
+			wrap json
+
+			fields {
+				# Drop the whole query string: `/app/?AUTH_ID=...&APP_SID=...` -> `/app/`.
+				# Everything after the first `?` goes, so a parameter added later by
+				# Bitrix24 cannot leak by being unknown to a per-parameter filter.
+				request>uri regexp "\?.*$" ""
+
+				# The handoff response's Location contains the target plus `#s=<jwt>`.
+				# Some proxies log fragments; delete the header rather than trust that.
+				resp_headers>Location delete
+
+				# Nothing below is needed to debug a portal and all of it is either
+				# a credential or personal data.
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>Referer delete
+				resp_headers>Set-Cookie delete
+			}
+		}
+	}
+}

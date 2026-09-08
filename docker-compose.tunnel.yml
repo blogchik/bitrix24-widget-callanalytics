@@ -1,0 +1,148 @@
+# =============================================================================
+# Ingress override for the SHARED HOST (89.167.6.101 / karimov-academy).
+# Always layered LAST, on top of the base file and the production overrides:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#                  -f docker-compose.tunnel.yml up -d
+#
+# It requires docker-compose.prod.yml: the `depends_on` conditions below wait on
+# the api and web healthchecks, which only that file defines.
+#
+# WHY A TUNNEL AT ALL.  This box is shared production - five other compose
+# projects, 20 containers.  Ports 80 and 443 are already published by
+# karimov-academy-caddy (config: /opt/karimov-academy/caddy/Caddyfile), which we
+# never touch.  So b24.texnobus.uz arrives over OUR OWN Cloudflare Tunnel
+# instead, and nothing in this project publishes a port on the host:
+#
+#   browser --https--> Cloudflare edge --tunnel--> cloudflared (below)
+#           --http://caddy:80--> caddy (below) --> api:8000 / web:3000
+#
+# The tunnel is REMOTELY MANAGED (created in the Cloudflare dashboard), so the
+# connector needs no config file and no credentials volume - just the token, and
+# the dashboard holds the single ingress rule `b24.texnobus.uz -> http://caddy:80`
+# with no path matching. The path split is docker/Caddyfile.tunnel's job.
+#
+# This file adds exactly two services and changes nothing else.
+# =============================================================================
+
+# The `x-logging` anchor in docker-compose.prod.yml cannot be referenced from
+# another file (YAML anchors do not cross documents), so the two sidecars carry
+# their own cap. Uncapped json-file logs are how a shared host runs out of disk;
+# this one has 24 GiB free and no database backups on it at all.
+x-sidecar-logging: &sidecar-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ---------------------------------------------------------------- caddy
+  # Path splitter only. Plain HTTP on the compose network; TLS is Cloudflare's.
+  # See docker/Caddyfile.tunnel for why its site address is `:80` and why it must
+  # not set the forwarded headers itself.
+  caddy:
+    # HOST-SPECIFIC PIN. caddy:2.10-alpine is ALREADY on this host - it is the
+    # image karimov-academy-caddy runs - so this brings up with no pull and no
+    # extra disk. The digest is that exact local image
+    # (caddy@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d,
+    # verified 2026-09-08); with `pull_policy: missing` nothing re-resolves the
+    # shared 2.10-alpine tag on our account, so our `up` can never move the image
+    # under the neighbour that publishes :80/:443.
+    image: caddy:2.10-alpine
+    pull_policy: missing
+    restart: unless-stopped
+    logging: *sidecar-logging
+    volumes:
+      # Read-only: this container has no business rewriting its own config.
+      - ./docker/Caddyfile.tunnel:/etc/caddy/Caddyfile:ro
+    # NO `ports:` KEY ANYWHERE IN THIS FILE. Publishing :80 here would collide
+    # with karimov-academy-caddy and take that project's site down with a bind
+    # error. cloudflared reaches this container by its compose DNS name.
+    #
+    # No volume for /data either: automatic HTTPS is off (see the Caddyfile), so
+    # Caddy stores no certificates and nothing here needs to survive a recreate.
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    healthcheck:
+      # Caddy's own admin API on its default localhost:2019 - it proves this
+      # process is up and its config loaded WITHOUT depending on the upstreams,
+      # so an api restart cannot flap the ingress and take cloudflared with it.
+      # (Same probe the neighbouring caddy container on this host uses.)
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          # A reverse proxy with two upstreams and no TLS handshakes to do. The
+          # neighbouring Caddy, which terminates TLS for a whole site, runs at a
+          # few tens of MiB. 64M is deliberate on a 3.7 GiB shared box: see the
+          # sizing note in docker-compose.prod.yml for why ceilings larger than
+          # the machine are worse than no ceilings.
+          memory: 64M
+    stop_grace_period: 15s
+
+  # ---------------------------------------------------------------- cloudflared
+  cloudflared:
+    # PINNED ON PURPOSE - do NOT change this to `cloudflare/cloudflared:latest`.
+    # Three other projects on this host (kc-analytics, kc-homepage, workly) run
+    # that floating tag. Bringing our stack up with `:latest` would re-resolve it
+    # and silently re-point their connector image at the next `up` or recreate.
+    # 2026.8.2 is the version all three are running right now (verified from
+    # their container logs, 2026-09-08); the digest is the image already present
+    # on the host, so this pulls nothing and moves no shared tag.
+    image: cloudflare/cloudflared:2026.8.2@sha256:0aa26e284f05e6c77ae375b8c9c11d9eb6a448fb7bcd8d40f31cb6176189eb38
+    pull_policy: missing
+    restart: unless-stopped
+    logging: *sidecar-logging
+    # Remotely-managed tunnel: the whole configuration is the token, which the
+    # Cloudflare dashboard issues. No config.yml, no cert.pem, therefore NO
+    # VOLUMES - and no `env_file`, because this container has no business seeing
+    # the application's database passwords or token-encryption keys.
+    # `:?` makes a missing token a clear `up` failure instead of a crash loop.
+    command:
+      - tunnel
+      - --no-autoupdate
+      - run
+      - --token
+      - ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env - see .env.example}
+    depends_on:
+      caddy:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          # One Go process holding four QUIC connections to the edge; the three
+          # cloudflared containers already on this host sit around 20-30 MiB.
+          memory: 64M
+    stop_grace_period: 30s
+
+# =============================================================================
+# DELIBERATELY NO `networks:` BLOCK. Read this before adding one.
+#
+# This topology is modelled on /opt/workly/docker-compose.tunnel.yml, which ends
+# with:
+#
+#     networks:
+#       default:
+#         name: workly
+#
+# Copying that stanza here - with any name that already exists - would attach our
+# containers to a NETWORK WE SHARE WITH ANOTHER PROJECT. workly's services are
+# also called `api`, `worker` and `postgres`, exactly like ours, so both sets
+# would answer to the same Docker DNS aliases: workly's api would intermittently
+# resolve `postgres` to OUR database, and ours to theirs. Round-robin, so it
+# would look like a flaky bug, not a misconfiguration.
+#
+# With no networks block, Compose creates the project's own default network,
+# `callanalytics_default`, isolated from every other project on the box. That is
+# all this stack needs: cloudflared -> caddy -> api/web/postgres all resolve
+# inside it. Existing networks on this host (do not join any of them):
+# karimov-academy_academy_network, karimov-capital-mycrmstats_default,
+# kc-analytics, kc-homepage_default, workly.
+# =============================================================================

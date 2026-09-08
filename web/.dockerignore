@@ -1,0 +1,63 @@
+# Build context for the `web` image (docker-compose.yml sets `build: ./web`, so the
+# context is this directory, NOT the repo root - the root .dockerignore does not apply
+# here and everything below has to be listed again).
+#
+# The Dockerfile's build stage does `COPY . .` after installing dependencies from the
+# manifests, so anything left in the context is copied into the image layer and, worse,
+# is uploaded to the daemon on every build. On the shared host that matters twice over:
+# the context travels through /var/lib/docker on a 38 G disk that three neighbouring
+# PostgreSQL instances live on, and a stale `.next` copied over the freshly installed
+# one is how a build silently ships yesterday's bundle.
+
+# ---------------------------------------------------------------- install output
+# `npm ci` runs inside the deps stage from package.json + package-lock.json alone.
+# A node_modules built on the developer's machine is both the largest thing in this
+# directory and the wrong platform's binaries; copying it over the deps stage's own
+# tree is exactly the bug this file exists to prevent.
+node_modules
+
+# ---------------------------------------------------------------- build output
+# `npm run build` regenerates these inside the image. A local .next also contains
+# absolute host paths and, in dev, a webpack cache of several hundred megabytes.
+.next
+out
+build
+dist
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# ---------------------------------------------------------------- caches
+.cache
+.turbo
+.swc
+.eslintcache
+.npm
+.yarn
+coverage
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ---------------------------------------------------------------- secrets
+# Nothing in this image reads .env at build time - the containers get their
+# environment from the compose `env_file` at RUN time - so a .env here could only
+# ever be an accident, and an accident baked into a layer is one `docker save` away
+# from being public. `.env.example` is documentation and carries no values.
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------- repository / editor
+.git
+.gitignore
+.dockerignore
+Dockerfile
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

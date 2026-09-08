@@ -2,18 +2,29 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 #
-# (or `make prod-up`, which is the same command). Never layer docker-compose.dev.yml
-# on a server: it bind-mounts the working tree over the image and runs `next dev`.
+# Never layer docker-compose.dev.yml on a server: it bind-mounts the working tree
+# over the image and runs `next dev`.
 #
 # What this file changes and why:
 #   * pins the images to a tag instead of :local, so a rollback is `IMAGE_TAG=<old> up -d`
 #   * gives every service a healthcheck, so `up -d` waits for a working stack
 #   * caps container logs, because the default json-file driver grows without bound
-#   * caps memory, so one runaway service cannot take the box down with it
+#   * REMOVES the loopback port publications the base file declares (see below)
+#   * caps memory and CPU, sized for a SHARED host (see the sizing note below)
 #   * hardens postgres and drops write access to the container filesystems
 #
-# It does NOT publish any port beyond loopback: the host Caddy is the only thing the
-# internet reaches (docker/Caddyfile.snippet).
+# Ports: the base docker-compose.yml publishes 127.0.0.1:8000 (api) and
+# 127.0.0.1:3000 (web) for local work. Compose MERGES `ports` by appending, so an
+# override cannot drop them by restating the key - it needs the `!reset` tag
+# (Compose >= 2.24; the target host runs v5.5.0). In production NOTHING is
+# published on any service: the only listener on this box is another project's
+# Caddy on 80/443, which we do not touch. Our traffic arrives over our own
+# Cloudflare Tunnel -> our own Caddy, entirely on the compose network.
+# Verify after any edit to this file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml config | grep -n "ports"
+#
+# must print nothing.
 
 x-logging: &logging
   driver: json-file
@@ -21,29 +32,88 @@ x-logging: &logging
     max-size: "50m"
     max-file: "5"
 
+# ---------------------------------------------------------------------------
+# Sizing note - HOST-SPECIFIC. Do not "restore" bigger numbers.
+#
+# The target host is SHARED PRODUCTION: 2 CPU cores, 3.7 GiB RAM (~2.5 GiB
+# available), 20 containers across five other compose projects, three of them
+# PostgreSQL. Its convention is 192M-512M per container, and the whole box idles
+# around 800 MiB resident.
+#
+# Ceilings larger than the machine are worse than no ceilings. The point of a
+# cgroup cap is that a leak gets killed inside OUR cgroup. If our limits sum past
+# what is actually free, a leak trips the GLOBAL OOM killer first and the kernel
+# picks a victim across every cgroup on the box - which here can be a neighbour's
+# PostgreSQL, one of which has restart policy `no` and would simply stay down
+# until a human noticed.
+#
+# Our four limits total 1344M against ~2.5 GiB available, which leaves real
+# headroom for the neighbours and for our own cloudflared/caddy sidecars.
+# ---------------------------------------------------------------------------
+
 services:
   postgres:
     logging: *logging
-    # A crash-safe default: fsync stays on. Tune shared_buffers to the box, not to
-    # this file's guess - see docs/deployment.md.
+    # PostgreSQL tuning for a 384M container on a shared 3.7 GiB host.
+    #
+    # HARD RULE: shared_buffers must always stay WELL under the container memory
+    # limit. It is allocated up front, so a shared_buffers at or near the cgroup
+    # cap does not merely run slowly - the daemon is OOM-killed during startup and
+    # the stack never comes up. 96MB is 25% of the 384M cap and leaves ~288M for
+    # backends, autovacuum, WAL buffers and the postmaster itself.
+    #
+    # Workload is metadata only: a few hundred thousand rows per portal, a single
+    # writer (the worker), and short dashboard aggregations. It needs neither a
+    # large buffer cache, nor a large work_mem, nor parallelism.
+    #
+    # max_connections=50 is derived, not guessed: it is the theoretical ceiling of
+    # our own pools. api runs ${API_WORKERS:-2} uvicorn processes x SQLAlchemy
+    # pool_size 10 + max_overflow 5 (api/app/db/engine.py) = 30, the worker adds
+    # 15, and the remaining 5 cover migrations, psql and the superuser reserve.
+    #
+    # work_mem=4MB is per sort/hash NODE, so the honest figure is (active queries x
+    # nodes), not (max_connections x work_mem). Realistic concurrency here is a
+    # handful of queries; the previous 16MB against 100 connections was a promise
+    # this container could never keep.
+    #
+    # effective_cache_size=256MB is a planner hint about page cache we can actually
+    # expect to get. The host's ~2.3 GiB of buff/cache is shared with three other
+    # database instances and five other projects, so 1536MB was a lie to the
+    # planner, not a tuning knob.
+    #
+    # max_parallel_workers_per_gather=0: two cores shared with five projects. A
+    # parallel scan buys nothing at our row counts, and it would push dynamic
+    # shared memory into the container's default 64M /dev/shm.
+    #
+    # A crash-safe default: fsync stays on.
     command: >
       postgres
-      -c max_connections=100
-      -c shared_buffers=512MB
-      -c work_mem=16MB
-      -c maintenance_work_mem=256MB
-      -c effective_cache_size=1536MB
+      -c max_connections=50
+      -c shared_buffers=96MB
+      -c work_mem=4MB
+      -c maintenance_work_mem=32MB
+      -c effective_cache_size=256MB
+      -c max_parallel_workers_per_gather=0
       -c log_min_duration_statement=2000
       -c log_lock_waits=on
     deploy:
       resources:
         limits:
-          memory: 2g
+          # 384M matches this host's existing postgres convention (a neighbour's
+          # postgres is capped at 384M, another at 512M) and those instances run at
+          # 18-36 MiB resident. 96M of ours is shared_buffers; the rest is backend
+          # and autovacuum headroom.
+          memory: 384M
     stop_grace_period: 1m
 
   api:
     image: ${IMAGE_REGISTRY:-}callanalytics-api:${IMAGE_TAG:-local}
     logging: *logging
+    # Not published - see the header. The base file's 127.0.0.1:8000 is a local
+    # development convenience, and because Compose appends `ports`, only `!reset`
+    # actually removes it. Our Caddy reaches this service at http://api:8000 on the
+    # compose network.
+    ports: !reset []
     # `--proxy-headers` with a restricted trust list: Caddy is the only hop, so the
     # forwarded headers are trustworthy only from the compose network. Trusting `*`
     # would let a request that somehow bypassed Caddy spoof its own client address.
@@ -71,7 +141,15 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1g
+          # Two uvicorn workers serving JSON aggregations: no in-process caches and
+          # no large response buffering. The closest comparable service on this host
+          # is capped at 384M and runs at ~13 MiB, so 384M is generous for two
+          # Python processes and still absorbs a request spike.
+          memory: 384M
+          # 0.75 of the box's 2 cores. No other project on this host sets a CPU
+          # limit, so ours is the only thing between a request burst and five
+          # neighbours losing their scheduler share.
+          cpus: "0.75"
     stop_grace_period: 30s
 
   worker:
@@ -84,7 +162,14 @@ services:
       replicas: 1
       resources:
         limits:
-          memory: 1g
+          # One Python process holding one batch of call metadata at a time. Smaller
+          # than api because it has no concurrent request fan-out; the equivalent
+          # worker on this host runs under a 256M cap.
+          memory: 320M
+          # 0.5 core. The backfill is paced for the Bitrix24 rate limit, NOT for
+          # CPU, so a burst of JSON parsing and hashing has no reason to consume a
+          # whole core of a two-core shared box.
+          cpus: "0.5"
     # The worker must finish the batch it is in and release its lease; killing it
     # mid-visit costs a re-leased portal and one re-fetched batch, not data, but a
     # clean exit keeps the lease table honest (§5.9).
@@ -93,6 +178,10 @@ services:
   web:
     image: ${IMAGE_REGISTRY:-}callanalytics-web:${IMAGE_TAG:-local}
     logging: *logging
+    # Not published - same reasoning as api. The base file's 127.0.0.1:3000 is a
+    # development convenience and `ports` merges by append, so `!reset` is required
+    # to remove it. Our Caddy reaches this service at http://web:3000.
+    ports: !reset []
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/ || exit 1"]
       interval: 15s
@@ -102,5 +191,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512m
+          # `next start` serving a prebuilt app. The same shape of workload on this
+          # host sits at ~20 MiB; 256M is the host's smallest sensible convention
+          # step and still leaves room for Next's route cache.
+          memory: 256M
     stop_grace_period: 30s

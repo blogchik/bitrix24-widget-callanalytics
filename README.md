@@ -23,7 +23,7 @@ offers an "open in Bitrix24" link instead.
 | Lifecycle events, purge, retention | done |
 | Recording playback spike | needs a real portal — see `docs/spike-recording-playback.md` |
 
-336 tests pass against a real PostgreSQL 16.
+396 tests pass against a real PostgreSQL 16.
 
 ## Running it locally
 
@@ -37,8 +37,10 @@ curl http://127.0.0.1:8000/healthz
 
 `make test` runs the suite; `make migrate` applies migrations; `make logs` tails everything.
 `tools/README.md` explains how to seed a demo portal and screenshot the dashboard.
-To put it on a server, follow [docs/deployment.md](docs/deployment.md) — it covers the
-first deploy, upgrades, rollback, backups and what to look at when a portal complains.
+To put it on a server, follow [docs/deployment.md](docs/deployment.md) — written for the
+shared host it actually runs on (Cloudflare Tunnel ingress, no published ports, raw
+`docker compose` because there is no `make` there), and covering upgrades, rollback,
+backups and what to look at when a portal complains.
 
 The app itself is only reachable through Bitrix24, which POSTs to `/install/`, `/app/` and
 `/settings/`. Opening `http://127.0.0.1:3000/` directly renders "open this app from Bitrix24",

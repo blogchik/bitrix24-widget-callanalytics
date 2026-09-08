@@ -17,7 +17,10 @@ const nextConfig: NextConfig = {
   // UI audit as an undersized, off-viewport target that is not ours. It has no
   // production equivalent, so turning it off costs nothing and stops the harness
   // measuring Next.js instead of us.
-  devIndicators: { appIsrStatus: false, buildActivity: false },
+  //
+  // `false`, not the `{appIsrStatus, buildActivity}` pair this used to be: Next 15.2
+  // collapsed those two flags into one boolean and warns on the old shape.
+  devIndicators: false,
 };
 
 export default withNextIntl(nextConfig);

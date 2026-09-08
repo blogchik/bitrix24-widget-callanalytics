@@ -50,6 +50,25 @@ argument="${request[1]:-}"
 
 is_sha() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
 
+# Are both images for this commit actually in the registry?
+#
+# Asked BEFORE anything is touched, because the alternative is what happened on the first
+# run of this pipeline: `docker compose pull` failed half way through a rollback, having
+# already checked the tree out at the target commit. Nothing was restarted - `set -e` saw
+# to that - but the checkout and the state file no longer agreed with the containers.
+#
+# It is also the honest answer to "why can I not roll back to that commit": a release
+# deployed by hand, before this pipeline existed, was built on the host and never pushed
+# anywhere. There is no image to return to, and finding that out mid-incident is the worst
+# possible moment.
+images_exist() {
+  local sha="$1" repo
+  for repo in callanalytics-api callanalytics-web; do
+    docker manifest inspect "${REGISTRY}${repo}:${sha}" >/dev/null 2>&1 || return 1
+  done
+  return 0
+}
+
 mkdir -p "$STATE_DIR"
 current_file="$STATE_DIR/current"
 previous_file="$STATE_DIR/previous"
@@ -62,6 +81,11 @@ apply() {
   cd "$APP_DIR"
 
   log "$reason $sha"
+
+  images_exist "$sha" || die \
+    "no images for $sha in $REGISTRY - nothing was changed. A commit built on this host
+     before the pipeline existed has no published image and cannot be deployed or rolled
+     back to; push it through CD, or use the break-glass procedure in docs/deployment.md."
 
   # The tree is still needed even though nothing is built from it: the compose files,
   # the Caddyfile and the alembic revisions all come from the checkout.
@@ -88,11 +112,25 @@ apply() {
 
   # Inside first, so a failure says where it is. If this passes and the public URL does
   # not, the fault is the tunnel or the zone, not the stack.
+  #
+  # Captured and matched with `case`, never `... | grep -q`. Under `pipefail` that idiom
+  # is a trap: `grep -q` exits on its first match, the pipe closes under the writer, the
+  # writer dies of EPIPE and the pipeline reports ITS failure. It survives here only
+  # because the payload is fifteen bytes and fits the pipe buffer before grep can leave -
+  # which is luck, not a design. The same idiom in the workflow's smoke test failed on the
+  # first real run and tried to roll back a healthy deployment.
   log 'verifying from inside the network'
-  dc exec -T web wget -qO- http://api:8000/healthz | grep -q '"status":"ok"' \
-    || die 'the api container is up but not healthy'
-  dc exec -T web wget -qO- http://caddy/healthz | grep -q '"status":"ok"' \
-    || die 'the api is healthy but our caddy does not reach it'
+  local answer
+  answer="$(dc exec -T web wget -qO- http://api:8000/healthz || true)"
+  case "$answer" in
+    *'"status":"ok"'*) ;;
+    *) die "the api container is up but not healthy; /healthz said: ${answer:-<nothing>}" ;;
+  esac
+  answer="$(dc exec -T web wget -qO- http://caddy/healthz || true)"
+  case "$answer" in
+    *'"status":"ok"'*) ;;
+    *) die "the api is healthy but our caddy does not reach it; it said: ${answer:-<nothing>}" ;;
+  esac
 
   log 'deployed'
 }
@@ -104,14 +142,26 @@ case "$action" in
     # rollback target pointing at the last version that actually worked.
     previous="$(cat "$current_file" 2>/dev/null || true)"
     apply "$argument" 'deploying'
-    [ -n "$previous" ] && printf '%s\n' "$previous" > "$previous_file"
+    # A rollback target is only worth recording if it can be pulled. Writing one that
+    # cannot turns `rollback` from a recovery into a second failure, at the exact moment
+    # somebody is relying on it.
+    if [ -n "$previous" ] && images_exist "$previous"; then
+      printf '%s\n' "$previous" > "$previous_file"
+    else
+      [ -n "$previous" ] && log "not recording $previous as a rollback target: no image for it"
+      : > "$previous_file"
+    fi
     printf '%s\n' "$argument" > "$current_file"
     ;;
 
   rollback)
     [ -z "$argument" ] || refuse "rollback takes no argument"
     target="$(cat "$previous_file" 2>/dev/null || true)"
-    [ -n "$target" ] || die 'nothing to roll back to: no previous deployment recorded'
+    [ -n "$target" ] || die \
+      'nothing to roll back to. Either this is the first pipeline deployment, or the
+       release before it was built on this host and never published, so there is no image
+       to return to. Whatever is running now is still running: this refused, it did not
+       half-apply.'
     apply "$target" 'rolling back to'
     # The two swap. Rolling back twice returns to where you started rather than walking
     # backwards through history one deployment at a time, which is almost never what
@@ -123,12 +173,14 @@ case "$action" in
   status)
     [ -z "$argument" ] || refuse "status takes no argument"
     cd "$APP_DIR"
-    echo "current:  $(cat "$current_file" 2>/dev/null || echo 'unrecorded')"
-    echo "previous: $(cat "$previous_file" 2>/dev/null || echo 'none')"
+    cur="$(cat "$current_file" 2>/dev/null || true)"
+    prev="$(cat "$previous_file" 2>/dev/null || true)"
+    echo "current:  ${cur:-unrecorded}"
+    echo "previous: ${prev:-none - rollback would refuse}"
     echo "checkout: $(git rev-parse HEAD)"
     echo
-    IMAGE_REGISTRY="$REGISTRY" IMAGE_TAG="$(cat "$current_file" 2>/dev/null || echo local)" \
-      dc ps --format '{{.Service}}\t{{.Image}}\t{{.Status}}'
+    IMAGE_REGISTRY="$REGISTRY" \
+      IMAGE_TAG="${cur:-local}" dc ps --format '{{.Service}}\t{{.Image}}\t{{.Status}}'
     ;;
 
   *)

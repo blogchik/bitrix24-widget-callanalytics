@@ -187,8 +187,7 @@ jobs:
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: high
-          # A strong-copyleft or source-available dependency arriving unnoticed is a
-          # licensing problem that is very expensive to unwind once it ships. This
-          # repository has no LICENSE file yet, which is its own open question - until
-          # it does, keeping AGPL and SSPL out keeps every option open.
+          # This project is MIT. A strong-copyleft or source-available dependency
+          # arriving unnoticed would make that licence undeliverable, and unwinding it
+          # after it has shipped is very expensive - so it is refused at the diff.
           deny-licenses: AGPL-3.0, AGPL-3.0-only, AGPL-3.0-or-later, SSPL-1.0

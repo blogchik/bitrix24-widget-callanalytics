@@ -1,0 +1,62 @@
+title: '[Idea] '
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas are welcome. Two constraints shape what can be built here, and knowing them
+        up front saves everyone a round trip:
+
+        - **The app reads `voximplant.statistic.get` and presents it.** It registers no
+          calls, uploads no recordings and connects no PBX. An idea that needs the app to
+          *originate* telephony is a different product.
+        - **Its scopes are `crm`, `telephony`, `placement` and `user_brief` — no `disk`.**
+          Adding a scope changes the Marketplace listing and forces every installed portal
+          to re-consent, so "just read it from Disk" is a product decision with a real
+          cost, not an implementation detail.
+
+        `docs/architecture.md` is the design and `docs/architecture-appendix.md` lists the
+        open questions — an idea that answers one of those is especially useful.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What can't you do today?
+      description: |
+        The situation, not the solution. "I cannot tell which manager loses the most calls
+        before 10am" is something to design against; "add a filter dropdown" is already an
+        answer to a question nobody has read yet.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+    validations:
+      required: false
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where would it live?
+      options:
+        - The left-menu dashboard
+        - A CRM detail tab (deal, lead, contact, company)
+        - The settings page
+        - The sync / backend, with no visible surface
+        - Somewhere new
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: who
+    attributes:
+      label: Who is it for, and how often would they use it?
+      description: |
+        A portal administrator looking at the whole company, or an employee looking at their
+        own calls? Daily, or once a quarter when a report is due? This decides whether it
+        earns a place on the screen.
+    validations:
+      required: false

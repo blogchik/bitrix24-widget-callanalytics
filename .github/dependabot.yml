@@ -1,0 +1,98 @@
+# Dependabot, aimed at `dev`.
+#
+# Every update opens against `dev`, never `main`: `main` is the deployment branch and the
+# only way onto it is a reviewed pull request whose CI was green. A bot opening a PR
+# straight against the deployment branch would be a second door into production.
+#
+# Grouping is the point of this file. Thirty open alerts on this repository were fifteen
+# advisories against one package, and thirty separate pull requests would have been
+# thirty separate CI runs to review the same upgrade. One PR per ecosystem per week, with
+# security fixes allowed to jump the queue on their own.
+
+version: 2
+
+updates:
+  # --- the frontend ------------------------------------------------------------------
+  - package-ecosystem: npm
+    directory: /web
+    target-branch: dev
+    schedule:
+      interval: weekly
+      day: monday
+      time: '04:00'
+      timezone: Asia/Tashkent
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'chore(deps)'
+      prefix-development: 'chore(deps-dev)'
+    groups:
+      # Next and React move together and are never worth reviewing apart: a React bump
+      # without the matching Next bump is a PR that cannot pass CI.
+      next:
+        patterns: ['next', 'next-intl', 'react', 'react-dom', '@types/react', '@types/react-dom']
+      tooling:
+        patterns: ['typescript', 'tailwindcss', 'postcss', 'autoprefixer', '@types/node']
+    ignore:
+      # A framework major is a project decision with its own verification pass - the UI
+      # is measured against this one at four viewport widths - not something to review at
+      # 04:00 on a Monday. Security fixes are exempt: Dependabot always raises those.
+      - dependency-name: next
+        update-types: ['version-update:semver-major']
+      - dependency-name: react
+        update-types: ['version-update:semver-major']
+      - dependency-name: react-dom
+        update-types: ['version-update:semver-major']
+
+  # --- the API -----------------------------------------------------------------------
+  # `pyproject.toml` already carries deliberate upper bounds ("a surprise major of
+  # SQLAlchemy, pydantic or httpx must be an explicit decision"), so Dependabot can only
+  # propose what those bounds allow, which is exactly the intent.
+  - package-ecosystem: pip
+    directory: /api
+    target-branch: dev
+    schedule:
+      interval: weekly
+      day: monday
+      time: '04:00'
+      timezone: Asia/Tashkent
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'chore(deps)'
+    groups:
+      python:
+        patterns: ['*']
+
+  # --- base images -------------------------------------------------------------------
+  # The two Dockerfiles pin `node:22-alpine` and a python base. A base image is where
+  # most of a container's CVE surface lives and it is the easiest thing in the project to
+  # forget, because nothing fails when it goes stale.
+  - package-ecosystem: docker
+    directories:
+      - /api
+      - /web
+    target-branch: dev
+    schedule:
+      interval: weekly
+      day: monday
+      time: '04:00'
+      timezone: Asia/Tashkent
+    commit-message:
+      prefix: 'chore(deps)'
+
+  # --- the workflows themselves ------------------------------------------------------
+  # Every action in .github/workflows is pinned to a commit sha, which is the right thing
+  # to do and also means nothing updates them by itself. This is what unpins them safely:
+  # Dependabot rewrites the sha AND the trailing `# v7.0.1` comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+      day: monday
+      time: '04:00'
+      timezone: Asia/Tashkent
+    commit-message:
+      prefix: 'chore(ci)'
+    groups:
+      actions:
+        patterns: ['*']

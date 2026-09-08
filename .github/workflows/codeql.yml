@@ -1,0 +1,72 @@
+# CodeQL: the static analysis that looks for the shapes of bugs rather than for known
+# vulnerable versions. `npm audit` and Dependabot answer "is this dependency known bad";
+# this answers "does this code do something known bad with its own input".
+#
+# It runs on a schedule as well as on changes, because the query packs improve after the
+# code stops changing: a rule published next month should find a bug written last month,
+# and nothing else in this repository would ever look again.
+#
+# It is a separate workflow from CI on purpose. CodeQL takes minutes and needs
+# `security-events: write`, and CI is a read-only gate that has to stay fast enough to
+# run on every push to `dev`.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  schedule:
+    # Monday 04:20 UTC. Offset from Dependabot's 04:00 Asia/Tashkent so the two do not
+    # queue behind each other on the same free-tier runner minutes.
+    - cron: '20 4 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      # Needed for the fine-grained token when the repository is a fork; harmless here.
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: actions
+            build-mode: none
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # `security-extended` over the default pack. This app takes anonymous POST
+          # bodies from Bitrix24 on four handler paths and builds SQL, HTTP requests and
+          # HTML from tenant-supplied values; the extra queries are precisely the
+          # injection and SSRF shapes that matters for, and the noise they add is worth
+          # reading on a codebase this size.
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}

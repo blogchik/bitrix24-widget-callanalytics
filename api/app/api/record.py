@@ -113,7 +113,15 @@ _FORWARDED_REQUEST_HEADERS: Final[tuple[str, ...]] = ("range", "if-range")
 
 #: Streaming timeouts. The read timeout is per chunk, not per response, so a long file is
 #: fine while a stalled upstream is not. Well under §5.1's 120 s ceiling for REST calls.
-_TIMEOUT: Final[httpx.Timeout] = httpx.Timeout(connect=15.0, read=60.0, write=15.0, pool=15.0)
+#:
+#: 60 s was measured to be far too patient. On the first real portal the provider
+#: (sipuni.com, reached through `CALL_RECORD_URL`) answers a small byte range in 0.2 s but
+#: returns headers and then NOTHING for a whole-file or open-ended request. Every such
+#: playback held a worker for a full minute and then raised, so the browser waited a minute
+#: to learn nothing. A stalled upstream is not a slow upstream: if the first byte has not
+#: arrived in 15 s it is not coming, and the SPA is better served by a prompt machine code
+#: it can turn into "open it in Bitrix24".
+_TIMEOUT: Final[httpx.Timeout] = httpx.Timeout(connect=15.0, read=15.0, write=15.0, pool=15.0)
 
 #: 64 KiB chunks: large enough that the event loop is not woken per packet, small enough
 #: that a dozen concurrent listeners cost kilobytes rather than the whole file (§9 step 3
@@ -366,6 +374,21 @@ async def _stream(
             # bytes - but if an upstream ignores that, this is the pair that stays honest.
             async for chunk in upstream.aiter_bytes(_CHUNK_BYTES):
                 yield chunk
+        except httpx.HTTPError as exc:
+            # The response has already begun, so the status is spent and there is no way
+            # left to tell the client anything but "the body stopped". Swallowing it keeps
+            # the failure out of the 500 handler, which would otherwise log a full
+            # traceback per stalled playback and report an application fault for what is
+            # an upstream one. The class name alone: httpx puts the request URL in the
+            # message, and that URL is a live listen-link (§9 results).
+            _log.warning(
+                "record: upstream stopped mid-stream",
+                extra={
+                    "portal_id": portal_id,
+                    "call_id": call_id,
+                    "error": type(exc).__name__,
+                },
+            )
         finally:
             await upstream.aclose()
             await client.aclose()

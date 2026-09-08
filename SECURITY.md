@@ -16,15 +16,20 @@ Everything below follows from that. The design and its rationale are in
 
 ## Supported versions
 
-The project has no tagged releases. `main` is the code, and the deployment at
-`https://b24.texnobus.uz` is the instance.
+The project has no tagged releases. Two branches carry everything:
 
-| Version | Supported |
-| --- | --- |
-| `main` (current HEAD) | ✅ |
-| Any older commit, fork, or modified deployment | ❌ |
+| Branch | What it is | Supported |
+| --- | --- | --- |
+| `main` | The deployment branch. Its head is what runs at `https://b24.texnobus.uz`. | ✅ |
+| `dev` | Where work happens. Reaches `main` only through a reviewed pull request with green CI. | ✅ — report against it, but the fix ships from `main` |
+| Any older commit, fork, or modified deployment | — | ❌ |
 
-Fixes land on `main` and are deployed from there. There are no backports and no LTS branch.
+A fix lands on `dev`, is promoted to `main` by pull request, and is deployed from there by
+[the CD pipeline](.github/workflows/cd.yml) — never by hand, except as break-glass. There
+are no backports and no LTS branch.
+
+Because a deployment is a commit sha, "the version you tested" is the sha you tested. That
+is the single most useful thing you can put in a report.
 
 ---
 
@@ -218,15 +223,55 @@ So you know what is covered before you spend time on it:
 - **Envelope encryption at rest** for OAuth and application tokens: a key-ringed AES-256-GCM
   envelope in `api/app/security/crypto.py`.
 - **CI on every pull request** ([.github/workflows/ci.yml](.github/workflows/ci.yml)): it
-  builds both images, applies the migrations, asserts the RLS invariants, runs the suite
-  against a real PostgreSQL 16, and lints and type-checks the API and the web app. It runs
-  with a read-only `GITHUB_TOKEN`.
+  builds the API image, applies the migrations, asserts the RLS invariants against the
+  database those migrations actually produced, runs the migrations down to base and back
+  up so the rollback path is exercised rather than assumed, runs the suite against a real
+  PostgreSQL 16, lints and type-checks both halves, and fails on a high-severity `npm
+  audit` finding. It runs with a read-only `GITHUB_TOKEN`.
+- **A pull request cannot introduce a known-vulnerable dependency**: `dependency-review`
+  fails it at the diff, before it is merged and before Dependabot would have noticed.
+- **CodeQL** ([.github/workflows/codeql.yml](.github/workflows/codeql.yml)) over Python,
+  TypeScript and the workflows themselves, with the `security-extended` query pack, on a
+  schedule as well as on changes — a query published next month should find a bug written
+  last month.
+- **Every published image is scanned** with Trivy before it can be deployed, and the
+  findings are reported to code scanning rather than to a log nobody reads.
+- **Secret scanning with push protection is on**, so a token in a commit is rejected at
+  `git push` rather than discovered afterwards.
+- **Every action is pinned to a commit sha**, not to a tag. A tag is mutable and an action
+  is code that runs with this repository checked out.
 - **A log trail designed to be safe**: request query strings and `Location` response headers
   are dropped from the proxy's access log, the session JWT travels only in a URL fragment,
   and `/api/v1/session/exchange` and `/api/v1/portal/reauthorize` bodies are excluded from
   all exception logging.
 
 ---
+
+## How code reaches production
+
+Worth knowing, because "can you make the deployment do something it should not" is a real
+question about a real attack surface, and the answer is bounded deliberately.
+
+- **`main` is the only branch that deploys, and nothing pushes to it directly.** It is a
+  protected branch: pull request required, linear history required, every CI check green,
+  no force push, no deletion.
+- **Images are built on the GitHub runner, never on the host.** The production box is
+  shared with five unrelated projects; a build there costs both its cores. The host only
+  pulls a tag.
+- **A deployment waits for a human.** The `production` environment carries a required
+  reviewer and is restricted to the `main` branch, so publishing an image and putting it
+  in front of live portals are two decisions, not one.
+- **The deploy key has no shell.** It is pinned with `command=` to a script installed
+  outside the repository checkout, and accepts exactly `deploy <40-hex-sha>`, `rollback`
+  and `status`. Anything else exits 64. A stolen key can move production between two
+  commits that already exist in this repository ~ which is bad ~ but cannot read `.env`,
+  cannot reach PostgreSQL and cannot touch a neighbouring project.
+- **The four deployment secrets are environment secrets**, not repository secrets: a
+  workflow that does not use the `production` environment cannot read them, and the
+  environment cannot be used from a branch other than `main`.
+
+If you find a way around any of those, it is in scope under item 2 (credential
+compromise) or item 7, and we would very much like to hear about it.
 
 ## Operators running their own copy
 

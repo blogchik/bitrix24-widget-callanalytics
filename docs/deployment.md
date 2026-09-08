@@ -438,15 +438,74 @@ Then install on a development portal and walk
 
 ## Upgrading
 
-The same shape as the first deploy, under the same two host rules: check the disk, and
-build at a quiet hour, one service at a time.
+**Normally you do not.** [`.github/workflows/cd.yml`](../.github/workflows/cd.yml) does
+this, and it is the only path anything should take:
+
+```
+merge to main -> CD builds both images on the runner
+              -> pushes them to ghcr.io/blogchik/callanalytics-{api,web}:<full-sha>
+              -> Trivy scans them
+              -> the `production` environment waits for a human to approve
+              -> ssh <host> "deploy <sha>"   (the key can run nothing else)
+              -> smoke test from outside, through Cloudflare
+              -> on failure: ssh <host> "rollback"
+```
+
+Watch it in the repository's **Actions** tab. Approving the deployment is a button on the
+run; declining it costs nothing, because the images are already published and a later run
+can deploy the same sha.
+
+The three commands the deploy key may run, which are also the three you can run yourself
+from any machine holding a key that is *not* restricted:
+
+| Command | What it does |
+| --- | --- |
+| `deploy <40-hex-sha>` | Fetch, check the tree out at that commit, pull those image tags, migrate, `up -d --wait`, verify from inside. Records the previous tag first. |
+| `rollback` | Re-run the above against the previously recorded tag. No build, no migration. |
+| `status` | What is running, what `rollback` would return to, and the checkout's HEAD. |
+
+The script behind them is [`deploy/ci-deploy.sh`](../deploy/ci-deploy.sh) in this
+repository, installed on the host as `/usr/local/bin/callanalytics-deploy`. **Editing the
+repository copy does not change the host.** That is deliberate: a deployment checks the
+tree out at the requested commit, so a script living inside `/opt/callanalytics` would
+rewrite the very thing `authorized_keys` pins the key to. Updating it is a manual root
+action:
+
+```bash
+scp deploy/ci-deploy.sh root@89.167.6.101:/tmp/cd.sh
+ssh root@89.167.6.101 'install -m 755 -o root -g root /tmp/cd.sh /usr/local/bin/callanalytics-deploy && rm /tmp/cd.sh'
+```
+
+### Rolling back
+
+```bash
+ssh root@89.167.6.101 'callanalytics-deploy' <<< 'rollback'   # or, with the CI key:
+ssh -i <cd-key> root@89.167.6.101 rollback
+```
+
+Images are tagged, so this is a tag change: no CPU, no disk, no risk to a neighbour. On
+this box, reach for it before you reach for a rebuild.
+
+A schema rollback is a different question and usually the wrong move. `downgrade()` exists
+in every revision and CI proves it still runs, but executing it discards whatever the
+newer columns hold. Prefer rolling the images back and leaving the schema forward.
+
+---
+
+## Break glass: deploying by hand
+
+For when GitHub is down, the tunnel is down, or you are debugging the pipeline itself.
+This is the old procedure and it still works, with one difference: **it builds on the
+host**, which costs both cores and 2-4 GiB of disk while five other projects are serving.
+Check the disk and pick a quiet hour.
 
 ```bash
 cd /opt/callanalytics
 git fetch && git checkout <tag-or-sha>
 export IMAGE_TAG=$(git rev-parse --short HEAD)
+unset IMAGE_REGISTRY                     # build locally, do not look for a GHCR tag
 
-df -h /                                  # ≥ 6 GiB free, or prune the builder first
+df -h /                                  # >= 6 GiB free, or prune the builder first
 
 nice -n 19 ionice -c3 docker compose \
   -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.tunnel.yml build api
@@ -455,7 +514,7 @@ nice -n 19 ionice -c3 docker compose \
 
 # migrations before the new code runs, so old code never sees a new schema
 docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.tunnel.yml \
-  run --rm api alembic upgrade head
+  run --rm api python -m alembic upgrade head
 
 docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.tunnel.yml \
   up -d --wait                           # recreates only what changed, waits for health
@@ -463,40 +522,28 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compos
 docker builder prune -af                 # give the disk back
 ```
 
-Two things make this safe to do during the day:
+If you do this, **tell the pipeline afterwards** — write the sha into
+`/var/lib/callanalytics/current` — or the next `rollback` will target whatever the last
+CD run recorded rather than what is actually running:
+
+```bash
+git rev-parse HEAD > /var/lib/callanalytics/current
+```
+
+Two things make either path safe to run during the day:
 
 - The worker holds a lease on each portal it is syncing and is given two minutes to
-  finish. A visit cut short costs one re-fetched batch, never data: rows and cursor
-  commit in the same transaction.
+  finish. A visit cut short costs one re-fetched batch, never data: rows and cursor commit
+  in the same transaction.
 - The API is stateless. The session token is a signed JWT, so a restart does not log
   anyone out; the browser simply retries.
 
-Run migrations **before** the new containers start. A migration is additive by
-convention, so old code tolerates a new column; the reverse is not true.
+Run migrations **before** the new containers start. A migration is additive by convention,
+so old code tolerates a new column; the reverse is not true.
 
 `caddy` and `cloudflared` are untouched by an app upgrade — `up -d` recreates only the
 services whose definition or image changed — so the tunnel never drops and the public
 hostname never goes away mid-deploy.
-
-## Rolling back
-
-Images are tagged, so a rollback is a tag change and needs no build:
-
-```bash
-export IMAGE_TAG=<previous-sha>
-docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.tunnel.yml \
-  up -d --wait
-```
-
-This is the one operation here that costs nothing: no CPU, no disk, no risk to a
-neighbour. Which is a reason to reach for it first — on this box, do not begin debugging
-with a rebuild.
-
-A schema rollback is a different question and usually the wrong move. `downgrade()`
-exists in every revision and is correct, but running it discards whatever the newer
-columns hold. Prefer rolling the images back and leaving the schema forward.
-
----
 
 ## Reclaiming disk
 

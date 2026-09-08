@@ -9,9 +9,9 @@ connects no PBX. It reads `voximplant.statistic.get` and presents it.
 
 ## Status
 
-Milestone 1 is built and verified. The recording-playback spike is the one open item: it
-needs a real portal with recorded calls, so `RECORDING_MODE` stays `off` and the player
-offers an "open in Bitrix24" link instead.
+Deployed and serving a real portal at `https://b24.texnobus.uz`. Milestone 1 is built and
+verified end to end; the UI was rebuilt on a control kit of its own and measured at four
+viewport widths; and the project now ships through CI/CD rather than by hand.
 
 | Step | State |
 | --- | --- |
@@ -21,7 +21,11 @@ offers an "open in Bitrix24" link instead.
 | Incremental sync pulling calls into PostgreSQL | done |
 | Dashboard rendering real numbers with the permission states | done |
 | Lifecycle events, purge, retention | done |
-| Recording playback spike | needs a real portal — see `docs/spike-recording-playback.md` |
+| Deployed to production behind a Cloudflare Tunnel | done |
+| Custom UI kit: select, input, date range, audio player, responsive layout | done |
+| CI/CD: `dev` for work, `main` for deployment, images from GHCR | done |
+| Recording playback in a real browser, inside a real portal | open — `docs/spike-recording-playback.md` |
+| Bitrix24 Marketplace moderation | not started — `docs/moderation-checklist.md` |
 
 403 tests pass against a real PostgreSQL 16.
 
@@ -50,8 +54,12 @@ which is the correct answer rather than an error.
 
 - **`api/`** — Python 3.12, FastAPI, SQLAlchemy 2 async, Alembic, PostgreSQL 16, httpx,
   APScheduler. One image serves both the web API and the sync worker.
-- **`web/`** — Next.js App Router, TypeScript, Tailwind, `next-intl`, rendered inside the
-  Bitrix24 iframe.
+- **`web/`** — Next.js 15 App Router, TypeScript, Tailwind, `next-intl` 4, rendered inside
+  the Bitrix24 iframe. Every control it needs and cannot get from the platform — select,
+  text input, segmented control, date range, audio transport — is in
+  `web/src/components/ui/`, sharing one height, one radius and one motion vocabulary, all
+  of it expressed as CSS custom properties so `prefers-reduced-motion` is honoured in one
+  place rather than in twenty.
 - **PostgreSQL is the only stateful component.** No Redis, no broker: every unit of work the
   worker does is derivable from columns, so a crash resumes from committed state.
 
@@ -70,6 +78,76 @@ Three properties are worth knowing before reading the code:
    everyone else, probes the statistics method with the viewer's own token. Administrators
    see the portal's calls, everyone else sees their own, and a user with no rights gets an
    explanation rather than an empty screen.
+
+## How it is developed and shipped
+
+Two branches, and the difference between them is the whole workflow.
+
+| Branch | What it is | What may push to it |
+| --- | --- | --- |
+| `dev` | Where the work happens. The default branch: a clone lands here and a new pull request targets it. | Anyone with write access, directly. It cannot be force-pushed or deleted. |
+| `main` | The deployment branch. What is on it is what is in production, or about to be. | Nothing directly. A pull request from `dev`, with every CI check green and a linear history. |
+
+A change therefore travels: `dev` — pull request — CI — `main` — images published — a
+human approves the deployment — the host pulls. Nothing skips a step, and the last two
+are separate on purpose: publishing an image is cheap and reversible, and putting it in
+front of other companies' telephony data is neither.
+
+### What CI checks
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml), four jobs in parallel so a
+TypeScript error and a failing migration are not the same red X:
+
+- **Invariants** — the message catalogues carry the same keys *and* the same ICU
+  placeholders in every language ([`tools/check-i18n.mjs`](tools/check-i18n.mjs)), and the
+  production compose render publishes no port, mounts no source tree over an image,
+  carries a real `IMAGE_TAG` and still splits `api` from `web`
+  ([`tools/check-compose.sh`](tools/check-compose.sh)). Both of those were being done by
+  eye, and both had already been got wrong once.
+- **API** — builds the image, applies the migrations, asserts the three tenancy
+  properties they must produce against the database they actually produced, runs the
+  migrations *down to base and back up* because `downgrade()` is the rollback path and is
+  otherwise never executed, runs the suite against a real PostgreSQL 16, then `ruff` and
+  `mypy`.
+- **Web** — `npm ci`, `tsc --noEmit`, `next build`, and `npm audit` as a gate rather than
+  a report.
+- **Dependency review** — on pull requests, blocks one that introduces a vulnerable or
+  strong-copyleft dependency, which is the cheapest moment to say no.
+
+[CodeQL](.github/workflows/codeql.yml) runs alongside on a schedule as well as on
+changes: a query published next month should find a bug written last month, and nothing
+else here would ever look again.
+
+### How a deployment happens
+
+[`.github/workflows/cd.yml`](.github/workflows/cd.yml). Merging to `main` builds both
+images **on the runner**, tags them with the full commit sha, pushes them to GHCR and
+scans them with Trivy. Nothing is built on the production host: it is a shared box with
+two cores and five other projects, three of them PostgreSQL, and a build there is felt by
+all of them.
+
+The deploy job then waits for a human. Approving it runs exactly one command over SSH,
+and the key on the host can run exactly three:
+
+```
+deploy <40-hex-sha>    pull that tag, migrate, restart, verify from inside
+rollback               go back to the previously recorded tag; no build, no migration
+status                 what is running, and what rollback would return to
+```
+
+That is enforced by `command=` in `authorized_keys`, so the key has no shell, no pty and
+no port forwarding. The script it is pinned to
+([`deploy/ci-deploy.sh`](deploy/ci-deploy.sh)) is installed *outside* the checkout, as
+`/usr/local/bin/callanalytics-deploy`, because a deployment checks the tree out at the
+requested commit — a copy living inside that tree would rewrite the very thing the forced
+command points at, and the restriction would hold only until the first deployment.
+
+After the restart the workflow smoke-tests the public URL from outside, through
+Cloudflare and the tunnel, the way a portal reaches it. A failure rolls back to the
+previous tag automatically.
+
+Deploying by hand is still possible — [docs/deployment.md](docs/deployment.md) documents
+it as the break-glass path — but it is no longer how anything normally ships.
 
 ## Documents
 

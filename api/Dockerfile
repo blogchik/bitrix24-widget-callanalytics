@@ -1,6 +1,6 @@
 # One image for both the `api` and the `worker` service (docs/architecture.md §2).
 # CMD is uvicorn; docker-compose.yml overrides it with `python -m app.worker`.
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

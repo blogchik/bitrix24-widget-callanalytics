@@ -57,7 +57,19 @@ for (const vp of VIEWPORTS) {
     // that as a failed request; it is the cleanup working, not a broken endpoint.
     const why = r.failure()?.errorText ?? '';
     if (why.includes('ABORTED')) return;
-    if (!u.includes('api.bitrix24.com')) errors.push(`failed: ${u.slice(0, 80)} (${why})`);
+    // Compare the HOST, not a substring of the URL. `u.includes('api.bitrix24.com')`
+    // also matches `https://api.bitrix24.com.evil.test/` and `https://x/?a=api.bitrix24.com`,
+    // which is how a substring check on a URL usually goes wrong. Here it would only
+    // silence a finding rather than admit an attacker, but a harness that lies about
+    // what it ignored is worth even less than one that misses something.
+    let host = '';
+    try {
+      host = new URL(u).hostname;
+    } catch {
+      host = '';
+    }
+    const expected = host === 'api.bitrix24.com' || host.endsWith('.bitrix24.com');
+    if (!expected) errors.push(`failed: ${u.slice(0, 80)} (${why})`);
   });
 
   // No request rewriting: BASE serves the SPA and the API on one origin, the way our

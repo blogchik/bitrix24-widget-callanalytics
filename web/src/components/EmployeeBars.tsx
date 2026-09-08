@@ -35,6 +35,12 @@ export interface EmployeeBucket {
   active?: boolean | null;
   /** True on the server-side "everyone past the top N" row. */
   other?: boolean | null;
+  /**
+   * True on the bucket `stats.py` emits for calls with no `portal_user_id` (§3 allows
+   * NULL). It is not an employee and not the "Other" residue: it is every call that
+   * belongs to nobody, kept so the axes add up.
+   */
+  unassigned?: boolean | null;
   total: number;
   answered: number;
   missed: number;
@@ -82,7 +88,15 @@ export function EmployeeBars({ employees, locale }: EmployeeBarsProps) {
     if (name) {
       return name;
     }
-    return t('app.dashboard.filter.unknownEmployee', { id: String(row.employee_id ?? 0) });
+    // A row with no `portal_user_id` is nobody's call (§3 allows NULL, and `stats.py`
+    // flags the bucket rather than dropping it). Naming it "User #0" invents a person:
+    // 0 is a legal Bitrix24 id, so the label is unactionable AND collides with a real
+    // employee. `lib/calls.ts` draws an em dash for exactly these rows in the table; the
+    // chart needs a word, so it gets its own. Never coerce a missing id to a number.
+    if (row.unassigned || row.employee_id === null || row.employee_id === undefined) {
+      return t('app.dashboard.employees.unassigned');
+    }
+    return t('app.dashboard.filter.unknownEmployee', { id: String(row.employee_id) });
   };
 
   const onMove = (event: ReactMouseEvent<HTMLDivElement>, index: number): void => {
@@ -105,7 +119,15 @@ export function EmployeeBars({ employees, locale }: EmployeeBarsProps) {
           const share = max > 0 ? row.total / max : 0;
           return (
             <div
-              key={row.other ? 'other' : String(row.employee_id ?? `row-${index}`)}
+              // The no-employee bucket gets a name of its own here too: keyed by position
+              // it borrowed the identity of whichever row happened to sort into its place.
+              key={
+                row.other
+                  ? 'other'
+                  : row.employee_id === null || row.employee_id === undefined
+                    ? 'unassigned'
+                    : String(row.employee_id)
+              }
               className="grid items-center gap-3"
               style={{ gridTemplateColumns: 'minmax(88px, 168px) 1fr auto' }}
               onMouseMove={(event) => onMove(event, index)}

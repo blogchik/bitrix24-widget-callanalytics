@@ -150,6 +150,31 @@ async def run_backfill(
                 # cursor stays put and the next visit re-reads it.
                 errors.extend(outcome.errors)
                 break
+            if outcome.rows or outcome.rejected or outcome.errors:
+                # Rows DID come back - they were just unusable here. `prefix_bx_ids`
+                # withholds the ids of quarantined rows whenever the batch also carried a
+                # per-command error (one of them might belong to a page after the failure,
+                # and crossing it would skip pages nobody read), so "no id" is not "no
+                # rows". §5.3 finishes the backfill only when a fetch returns NO ROWS, and
+                # `backfill_status='done'` is permanent - `_phase_backfill` runs only
+                # while it is `running` and `head_fetch` only for `pending`/`head`, so
+                # nothing would ever look at the rest of this portal's history again.
+                # The page is therefore re-read next visit, exactly like the branch above.
+                _added, quarantined_now = await commit_progress(
+                    fence, [], rejected=outcome.rejected
+                )
+                quarantined += quarantined_now
+                log.warning(
+                    "backfill: a page returned rows but no usable ID; not finishing",
+                    extra={
+                        "portal_id": fence.portal_id,
+                        "low_id": floor,
+                        "rejected": len(outcome.rejected),
+                        "errors": len(outcome.errors),
+                    },
+                )
+                errors.extend(outcome.errors)
+                break
             # An error-free page with no rows at all: the history below `low_id` is
             # exhausted. This is the ONLY way the backfill finishes (§5.3).
             status = "done"

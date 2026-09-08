@@ -34,7 +34,12 @@ revision:
 
 ## Run pytest in the dev-only `test` service against the same postgres.
 test:
+	@# The worker leases due portals every 15 s from the same database the tests use,
+	@# so a live worker steals the lease a fencing test is about to take and the suite
+	@# fails for a reason that has nothing to do with the code under test.
+	-$(DC) stop worker
 	$(DC) --profile test run --rm test
+	-$(DC) start worker
 
 ## Static checks: ruff lint + mypy.
 lint:

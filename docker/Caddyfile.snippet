@@ -49,7 +49,30 @@ b24.texnobus.uz {
 	# ---------------------------------------------------------------- routing
 	# Bitrix24-facing form POSTs, the SPA's JSON API and the health probe are the
 	# FastAPI app; everything else is the Next.js frontend (§2).
-	@api path /app /app/* /install /install/* /settings /settings/* /events /events/* /api/* /healthz
+	#
+	# THE TRAILING SLASH IS LOAD-BEARING, and `/settings` is why this comment exists.
+	# Caddy's `path` matcher is an EXACT comparison unless the token carries a `*`, so
+	# each spelling routes on its own:
+	#
+	#   /settings/  -> api   the Bitrix24 handler URL registered in the vendor cabinet;
+	#                        Bitrix24 POSTs the iframe form here (§4.5).
+	#   /settings   -> web   the SPA's admin page.  It is where the handoff sends the
+	#                        browser (`_SETTINGS_PATH` in api/app/handlers/open.py writes
+	#                        `location.replace("/settings?<query>#s=<jwt>")`, §4.4 step 8)
+	#                        and where SyncBanner's "open settings" link points.
+	#
+	# Listing the bare token `/settings` here would divert that GET to FastAPI, which
+	# serves no page there - the moderation walk-through (docs/moderation-checklist.md
+	# step 8) would end in an error instead of the settings page, which §4.11 counts as
+	# a rejection.  §2 lists `/settings/*` for the api and nothing else; keep it that
+	# way.  The regression test is api/tests/test_routing.py, which parses this line.
+	#
+	# `/app`, `/install` and `/events` keep their slash-less token: no SPA route uses
+	# those names, so nothing is stolen, and a request that arrives without the slash
+	# reaches the api - which redirects a POST onto the real handler and renders the
+	# "open this app from Bitrix24" page for a GET (§4.11) rather than falling through
+	# to a bare Next.js 404.
+	@api path /app /app/* /install /install/* /settings/* /events /events/* /api/* /healthz
 
 	handle @api {
 		reverse_proxy api:8000 {

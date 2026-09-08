@@ -660,3 +660,100 @@ async def test_a_quiet_period_does_not_turn_the_rescan_into_a_full_history_re_re
 
     after = await active.sync()
     assert 100 <= after["rescan_from_id"] <= 600, "rescan_from_id must advance monotonically"
+
+
+async def test_backfill_does_not_finish_on_a_page_whose_rows_were_all_quarantined(
+    tenant_factory: Callable[..., Awaitable[Tenant]],
+) -> None:
+    """§5.3 - "no rows" ends the backfill; "rows we could not use" does not.
+
+    `prefix_bx_ids` withholds the ids of quarantined rows whenever the same batch also
+    carried a per-command error (a rejected id after the first failure might belong to a
+    page nobody read), so an error-free prefix whose every row was unparsable yields no
+    usable id at all. Reading that as "the history below `low_id` is exhausted" writes
+    `backfill_status='done'` - which is permanent: `_phase_backfill` only runs while the
+    status is `running`, `head_fetch` only for `pending`/`head`, and nothing else ever
+    sets it back. The rest of the portal's history is then abandoned silently, with a
+    cursor that still points at the page that was never read.
+    """
+    tenant = await tenant_factory(backfill_status="running", high_id=2000, low_id=2000)
+    client = FakeStatistics(range(1000, 2000))
+    for bx_id in range(1950, 2000):
+        # A build with no UTC offset (or an integration posting one): §5.5 quarantines
+        # the row, so the whole DESC page 0 parses to nothing.
+        client.rows[bx_id]["CALL_START_DATE"] = (_BASE_START + timedelta(minutes=bx_id)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+    client.errors[(0, 1)] = UnknownBitrixError(
+        "INTERNAL_SERVER_ERROR", description="oops", http_status=500
+    )
+
+    await backfill_visit(tenant, client)
+
+    sync = await tenant.sync()
+    assert sync["backfill_status"] == "running", (
+        "a page that returned 50 rows finished the backfill; ids 1000..1949 are now "
+        "unreachable forever (§5.3: only ZERO rows ends the import)"
+    )
+    assert sync["low_id"] == 2000, "the unread page must be re-read, so the cursor stays put"
+    assert sync["rejected_rows"] == 50, "the quarantined rows are the only support signal here"
+
+    # The transient per-command error is gone on the next visit: the prefix is now the
+    # whole batch, §5.5 lets the cursor step over the quarantined ids, and the history
+    # below them is imported instead of abandoned.
+    healthy = FakeStatistics(range(1000, 2000))
+    await backfill_visit(tenant, healthy)
+
+    after = await tenant.sync()
+    assert after["low_id"] is not None and int(after["low_id"]) < 1950
+    assert 1000 in await tenant.bx_ids(), "the history the first visit gave up on"
+
+
+async def test_a_rescan_window_larger_than_one_pass_resumes_where_it_stopped(
+    tenant_factory: Callable[..., Awaitable[Tenant]],
+) -> None:
+    """§5.7 item 1 - the hourly window walk must advance, not restart at the bottom.
+
+    The pass budget (`MAX_RESCAN_BATCHES` x `batch_pages` x 50) is smaller than the 72 h
+    window of any busy portal. Restarting the walk at `rescan_from_id` every hour re-reads
+    the same oldest rows for ever: the recording, vote, comment and transcript attached to
+    a call an hour ago - the only reason this pass exists - are never re-read until the
+    sliding floor has carried that row down to the covered slice, a day or two later.
+    """
+    tenant = await tenant_factory(backfill_status="done", high_id=500)
+    await tenant.set_sync("rescan_from_id = 1, batch_pages = 1, last_rescan_at = NULL")
+    client = FakeStatistics(range(1, 501))
+
+    async def one_pass() -> Any:
+        sync = await tenant.sync()
+        return await run_id_window_rescan(
+            tenant.fence,
+            client,
+            rescan_from_id=sync["rescan_from_id"],
+            high_id=int(sync["high_id"]),
+            batch_pages=int(sync["batch_pages"]),
+            max_batches=2,  # 2 batches x 1 page x 50 rows = a 100-row budget per pass
+        )
+
+    await one_pass()
+    first_pass = await tenant.bx_ids()
+    assert first_pass == list(range(1, 101)), "the pass budget is 100 rows from the floor"
+
+    requests_before = len(client.stat_requests)
+    await one_pass()
+    resumed = client.stat_requests[requests_before:]
+    assert resumed, "the second hourly pass issued no request at all"
+    for request in resumed:
+        for _key, _method, params in request:
+            low, _high = id_bounds(params)
+            assert low is not None and low > 100, (
+                "the second pass restarted at the bottom of the window and re-read the "
+                "rows the first pass had just read (§5.7: resume, do not restart)"
+            )
+
+    for _ in range(3):  # 5 passes x 100 rows is the whole 500-row window
+        await one_pass()
+
+    assert await tenant.bx_ids() == list(range(1, 501)), (
+        "the walk never reached the newest end of the window, where the late updates are"
+    )

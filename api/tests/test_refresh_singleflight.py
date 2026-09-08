@@ -16,6 +16,7 @@ NOBYPASSRLS `ca_app` role - and forces genuine overlap with a slow OAuth transpo
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 from collections.abc import AsyncIterator, Awaitable, Callable
 
 import pytest
@@ -67,7 +68,8 @@ async def read_credential(portal_id: int, member_id: str) -> dict[str, object]:
             await session.execute(
                 text(
                     "SELECT token_version, access_token_enc, refresh_token_enc, "
-                    "client_endpoint, token_refreshed_at FROM portals WHERE id = :pid"
+                    "client_endpoint, token_refreshed_at, token_expires_at "
+                    "FROM portals WHERE id = :pid"
                 ),
                 {"pid": portal_id},
             )
@@ -78,6 +80,7 @@ async def read_credential(portal_id: int, member_id: str) -> dict[str, object]:
         "refresh": decrypt(row["refresh_token_enc"], member_id=member_id, column="refresh_token"),
         "client_endpoint": row["client_endpoint"],
         "token_refreshed_at": row["token_refreshed_at"],
+        "token_expires_at": row["token_expires_at"],
     }
 
 
@@ -269,3 +272,107 @@ async def test_two_different_portals_refresh_independently(app_engine: AsyncEngi
     finally:
         await delete_portal(first.member_id)
         await delete_portal(second.member_id)
+
+
+# --- the expiry the refresh writes (§5.8 step 1) -------------------------------------
+#
+# `portals.token_expires_at` has exactly two writers - `store_portal_credential()` and
+# `_refresh_locked()` here - and step 1 refreshes proactively whenever the stored value
+# is within 60 s of now, with `rate_limit=False`. So a written expiry that is already in
+# the past is not a cosmetic wrong number: it makes every following phase start with an
+# OAuth exchange at our single `client_id`, which is exactly the "renewal on a schedule"
+# §4.1 rule 3 says gets the whole application blocked - for every tenant, not this one.
+# Both tests below drive the value the OAuth server sent through the real write path.
+
+
+async def refresh_and_call(portal: SeededPortal) -> bool:
+    """One `with_portal_token` visit whose stored token is refused, forcing a refresh."""
+
+    async def work(access_token: str) -> bool:
+        async with BitrixClient(
+            endpoint=CLIENT_ENDPOINT, access_token=access_token, portal_id=portal.portal_id,
+        ) as client:
+            return bool(await client.call("user.admin"))
+
+    return await with_portal_token(portal.portal_id, work)
+
+
+async def test_a_refresh_whose_expires_is_in_the_past_does_not_refresh_on_every_visit(
+    portal: SeededPortal,
+) -> None:
+    """A stale absolute `expires` must be floored, exactly as the install writer floors it.
+
+    `services/portals.py::_expires_at` degrades to `expires_in` when the absolute value
+    is not plausibly in the future ("a portal whose clock is wrong ... must not persist
+    an expiry in 1970 that makes every worker run refresh first"). The refresh writer
+    must reach the same value from the same response, or the two disagree and the one
+    without the floor wins on every subsequent visit.
+
+    The second `with_portal_token` below is the whole point: it needs nothing from OAuth,
+    and an exchange there is the loop §4.1 rule 3 forbids.
+    """
+    fake = FakeBitrix()
+    stale = token_response(member_id=portal.member_id)
+    # An hour in OUR past - a container clock ahead of the auth server, or an on-premise
+    # build that sent `expires` as a relative value. Nothing else about it is unusual.
+    stale["expires"] = int((dt.datetime.now(tz=dt.UTC) - dt.timedelta(hours=1)).timestamp())
+    fake.on_oauth(stale)
+    fake.on(
+        "user.admin",
+        lambda record: True if record.access_token == FRESH_ACCESS else Err("expired_token"),
+    )
+
+    with patch_httpx(fake):
+        assert await refresh_and_call(portal) is True
+        assert fake.oauth_count == 1, "the stored token was refused, so one exchange is right"
+
+        stored = await read_credential(portal.portal_id, portal.member_id)
+        assert stored["access"] == FRESH_ACCESS
+        expires_at = stored["token_expires_at"]
+        assert isinstance(expires_at, dt.datetime)
+        assert expires_at > dt.datetime.now(tz=dt.UTC), (
+            "the refresh writer stored an expiry that is already in the past: §5.8 step 1 "
+            "will now refresh before every phase"
+        )
+
+        # The next visit: the credential is fresh, so it must be used as it stands.
+        assert await refresh_and_call(portal) is True
+
+    assert fake.oauth_count == 1, (
+        "a second exchange means the stored expiry looked stale to `_expires_soon()` - "
+        "the rate-limit-exempt refresh loop of §4.1 rule 3"
+    )
+
+
+async def test_a_refresh_whose_expires_is_out_of_range_still_stores_the_rotated_pair(
+    portal: SeededPortal,
+) -> None:
+    """An unusable `expires` must not cost the portal its refresh chain (§5.8).
+
+    `dt.datetime.fromtimestamp()` raises on an out-of-range epoch. Raising *here* is
+    unrecoverable in a way a wrong number is not: `exchange_refresh_token` has already
+    succeeded, so the OAuth server has rotated the single-use pair, and an exception
+    inside `control_txn` rolls back the write that keeps it - the portal is left holding
+    a spent refresh token and dies at `invalid_grant` on the next visit.
+    """
+    fake = FakeBitrix()
+    absurd = token_response(member_id=portal.member_id)
+    absurd["expires"] = 99_999_999_999_999  # year 3170843
+    fake.on_oauth(absurd)
+    fake.on(
+        "user.admin",
+        lambda record: True if record.access_token == FRESH_ACCESS else Err("expired_token"),
+    )
+
+    with patch_httpx(fake):
+        assert await refresh_and_call(portal) is True
+
+    stored = await read_credential(portal.portal_id, portal.member_id)
+    assert stored["token_version"] == 8, "the exchange happened, so its write must have too"
+    assert stored["access"] == FRESH_ACCESS
+    assert stored["refresh"] == FRESH_REFRESH, (
+        "the rotated refresh token was discarded: the old one is already spent (§5.8)"
+    )
+    expires_at = stored["token_expires_at"]
+    assert isinstance(expires_at, dt.datetime)
+    assert expires_at > dt.datetime.now(tz=dt.UTC)

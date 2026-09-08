@@ -56,6 +56,7 @@ from app.sync.head_fetch import (
     dedupe_rows,
     now,
     page_starts,
+    prefix_bx_ids,
     raise_if_token_expired,
     should_continue,
 )
@@ -75,10 +76,25 @@ __all__ = [
 log = get_logger(__name__)
 
 #: The window rescan is best-effort and must never become the visit. 10 batches of 20
-#: commands is 10 000 rows an hour, far above a real 72 h window; a portal that somehow
-#: exceeds it simply has its window truncated at the newest end and picks the rest up on
-#: the next hourly run, while the recheck budget covers anything older.
+#: commands is 10 000 rows an hour; a portal whose 72 h window is bigger than that has the
+#: pass truncated at the newest end and CONTINUES from there on the next hourly run
+#: (`_RESUME_FROM`), while the recheck budget covers anything older.
 MAX_RESCAN_BATCHES: Final[int] = 10
+
+#: Where a truncated pass stopped, per portal: the id its next pass starts from (§5.7).
+#:
+#: Without it the walk restarts at `rescan_from_id` every hour, so a portal with more rows
+#: in its window than one pass can read re-reads the same oldest 10 000 ids for ever and
+#: never reaches the newest end - where every late recording, vote, comment and transcript
+#: this pass exists for actually is. The continuation cannot be stored in `rescan_from_id`:
+#: §5.7 defines that as the `high_id` of ~72 h ago, `incremental._age_rescan_bound` owns it,
+#: and advancing it here would shrink the window so younger calls stopped being re-read at
+#: all. `portal_sync` has no column for a pass position, so the hint lives in the worker
+#: process; losing it on a restart costs one pass that starts at the floor again and
+#: nothing more - this pass moves no cursor and every row it reads the cursors already
+#: passed. Cleared as soon as a pass reaches the top of the window, so the next one sweeps
+#: from the floor again.
+_RESUME_FROM: Final[dict[int, int]] = {}
 
 #: §5.7 item 2, mirroring `calls_portal_recheck_idx` exactly. Younger than 72 h is already
 #: covered by the window rescan; older than 30 days is accepted as never-recorded.
@@ -225,13 +241,33 @@ async def run_id_window_rescan(
 
     Writes no `high_id` / `low_id`: this walks rows the cursors have already passed, and a
     cursor moved from here would skip everything the window does not cover.
+
+    A window bigger than one pass's budget (`max_batches` x `batch_pages` x 50 rows) is
+    walked across several hourly passes: the pass resumes above the last id the previous
+    one re-read (`_RESUME_FROM`) and starts over at the floor once it reaches the top.
     """
     if rescan_from_id is None or int(rescan_from_id) >= int(high_id):
         return _IDLE
 
     floor = int(rescan_from_id)
+    ceiling = int(high_id)
+    resume = _RESUME_FROM.get(fence.portal_id)
+    if resume is not None and not floor < resume <= ceiling:
+        # The window moved out from under the hint (the floor aged past it, or a reinstall
+        # reset the cursors): sweep from the persisted floor rather than from an id that
+        # belonged to another window.
+        del _RESUME_FROM[fence.portal_id]
+        resume = None
+    start_id = floor if resume is None else resume
+
     limit = clamp_pages(batch_pages)
     offset = 0
+    # The highest id this pass may claim to have re-read: `prefix_bx_ids` applies §5.2's
+    # contiguous-prefix rule, so a failed command in the middle is re-read next pass
+    # instead of being stepped over, and a page whose rows were all quarantined in an
+    # otherwise clean batch still advances (§5.5 - a rejected row may not pin anything).
+    reached: int | None = None
+    completed = False
     used = 0
     requests = 0
     rows_upserted = 0
@@ -245,7 +281,7 @@ async def run_id_window_rescan(
         used += 1
         outcome = await fetch_pages(
             client,
-            filter={">=ID": floor},
+            filter={">=ID": start_id},
             sort=SORT_FIELD,
             order=ORDER_ASC,
             starts=page_starts(limit, first=offset),
@@ -262,6 +298,9 @@ async def run_id_window_rescan(
             break
 
         rejected += len(outcome.rejected)
+        crossed = prefix_bx_ids(outcome)
+        if crossed:
+            reached = max(crossed) if reached is None else max(reached, max(crossed))
         added, quarantined_now = await commit_progress(
             fence, outcome.rows, rejected=outcome.rejected
         )
@@ -278,6 +317,7 @@ async def run_id_window_rescan(
             errors.extend(outcome.errors)
             break
         if not outcome.has_next:
+            completed = True
             break
         # ASC ordering means rows created during the pass append at the END of the
         # selection, so these offsets cannot drift under us between requests.
@@ -287,6 +327,15 @@ async def run_id_window_rescan(
             break
 
     if not blocked:
+        if completed or reached is None:
+            # The walk reached the top of the window (or learned nothing it may cross):
+            # the next pass starts a fresh sweep at the persisted floor.
+            _RESUME_FROM.pop(fence.portal_id, None)
+        else:
+            # Truncated by the batch budget, a per-command error or the pacer: the next
+            # hourly pass continues above the last id this one actually re-read, instead
+            # of spending its whole budget on the same oldest rows again (§5.7).
+            _RESUME_FROM[fence.portal_id] = reached + 1
         # Stamped even when the pass was truncated: the window is re-read every
         # RESCAN_INTERVAL_SEC anyway, and not stamping would make the next visit repeat it
         # immediately - once per sync interval instead of once per hour.
@@ -296,7 +345,10 @@ async def run_id_window_rescan(
         "rescan window",
         extra={
             "portal_id": fence.portal_id,
-            "from_id": floor,
+            "from_id": start_id,
+            "floor_id": floor,
+            "reached_id": reached,
+            "completed": completed,
             "batches": used,
             "rows": rows_upserted,
         },

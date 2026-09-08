@@ -99,6 +99,14 @@ _MIN_EXPIRES_IN: Final[int] = 1
 _MAX_EXPIRES_IN: Final[int] = 86_400
 _DEFAULT_EXPIRES_IN: Final[int] = 3_600
 
+#: A token is treated as already expired if the response gives us less than this, so a
+#: clock skew of a few seconds can never hand the worker a dead access token (§5.8).
+#: The same value, for the same reason, as `services/portals.py::_EXPIRY_FLOOR_SECONDS`:
+#: `token_expires_at` has exactly two writers (`store_portal_credential()` and
+#: `_refresh_locked()` below) and they must agree, or the one without the floor can park
+#: a portal's expiry in the past - see `TokenResponse.expires_at`.
+_EXPIRY_FLOOR_SECONDS: Final[int] = 30
+
 #: What the `rest_log` row records as the request (§6). The real parameters are never
 #: built into this dict: `client_secret` and `refresh_token` must not exist in a row that
 #: retention keeps for a week, and recording the *shape* is all the moderation trail
@@ -153,14 +161,37 @@ class TokenResponse:
 
     @property
     def expires_at(self) -> dt.datetime:
-        """Absolute expiry, preferring the server's own epoch over our clock.
+        """Absolute expiry, preferring the server's own epoch - but only a plausible one.
 
         `expires` is the authoritative value (it is the auth server's own view); the
         `expires_in` fallback exists because on-premise builds have been seen omitting it.
+
+        **This is the ONE validated conversion of a `TokenResponse` into
+        `portals.token_expires_at`, and both writers of that column must use it**
+        (`services/portals.py::_expires_at` applies the identical floor for the identical
+        reason and should delegate here). The floor is not defensive noise: §5.8 step 1
+        refreshes proactively whenever the stored expiry is within `_PROACTIVE_MARGIN_S`,
+        and `_refresh_locked` exchanges with `rate_limit=False`, so an expiry in the past
+        - a portal or container whose clock is wrong, an on-premise build sending
+        `expires` as a relative value, a field we mis-parsed - turns *every* worker phase
+        into an OAuth exchange. §4.1 rule 3 is explicit that refreshing on a schedule is
+        what gets the whole application blocked, for every tenant at once.
+
+        `fromtimestamp` is guarded because it raises on an out-of-range epoch, and this
+        property is read *after* `exchange_refresh_token` already rotated the single-use
+        refresh token: an exception here would discard the new pair and burn the chain.
         """
-        if self.expires is not None:
-            return dt.datetime.fromtimestamp(self.expires, tz=dt.UTC)
-        return dt.datetime.now(tz=dt.UTC) + dt.timedelta(seconds=self.expires_in)
+        now = dt.datetime.now(tz=dt.UTC)
+        if self.expires:
+            try:
+                absolute = dt.datetime.fromtimestamp(int(self.expires), tz=dt.UTC)
+            except (OverflowError, OSError, ValueError):
+                absolute = None
+            if absolute is not None and absolute > now + dt.timedelta(
+                seconds=_EXPIRY_FLOOR_SECONDS
+            ):
+                return absolute
+        return now + dt.timedelta(seconds=max(int(self.expires_in or 0), _EXPIRY_FLOOR_SECONDS))
 
 
 class OAuthRateLimited(Exception):
@@ -686,6 +717,9 @@ async def _refresh_locked(portal_id: int, *, seen_version: int) -> _Credential:
                     refresh_token_enc=encrypt(
                         tokens.refresh_token, member_id=row.member_id, column="refresh_token"
                     ),
+                    # The floored property, never a raw `expires`: this writer and
+                    # `store_portal_credential()` share one validation on purpose
+                    # (§5.8 step 1 refreshes on a near expiry, so a past one loops).
                     token_expires_at=tokens.expires_at,
                     token_refreshed_at=now,
                     # §4.4 step 4: re-learning this is how a renamed portal or a newly

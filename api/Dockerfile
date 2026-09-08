@@ -31,6 +31,13 @@ RUN pip install --no-cache-dir ".[dev]"
 COPY --chown=app:app web/messages/ ./i18n/messages/
 COPY --chown=app:app web/src/i18n/locales.json ./i18n/locales.json
 
+# The ingress snippet is copied in only so tests/test_routing.py can assert which
+# upstream each path resolves to. Caddy's `path` matcher is exact, and a single
+# stray token in it once sent the SPA's /settings page to the API, which answered
+# a raw JSON error inside the Bitrix24 iframe (a moderation rejection under §4.11).
+# The file is inert at runtime; the host Caddy is configured from the repo copy.
+COPY --chown=app:app docker/Caddyfile.snippet /docker/Caddyfile.snippet
+
 # ---- source layer -----------------------------------------------------------
 COPY --chown=app:app api/ .
 

@@ -381,16 +381,33 @@ def parse_filters(params: QueryParams, principal: Principal) -> CallFilters:
         except ValueError:
             raise FilterError("bad_line") from None
 
+    try:
+        start_utc = _midnight_utc(date_from, zone)
+        end_utc = _midnight_utc(date_to + dt.timedelta(days=1), zone)
+        # The equally long window immediately before this one, for the summary tiles'
+        # "vs previous period" line. Computed from local dates, so a period that contains a
+        # DST change is still compared against the same number of *days*, not of hours.
+        previous_start_utc = _midnight_utc(date_from - dt.timedelta(days=span), zone)
+    except (OverflowError, ValueError):
+        # The three bounds are DERIVED, and a well-formed date does not guarantee they
+        # exist: `_date` accepts the whole proleptic calendar, so `9999-12-31` has no next
+        # midnight, `0001-01-01` has no previous period, and local midnight of `0001-01-01`
+        # in a UTC+n zone falls in year 0. The arithmetic raised `OverflowError` straight
+        # out of this function and the routes catch only `FilterError` (dashboard.py,
+        # calls.py), so a typed year in the date picker became a bare 500 - the raw error
+        # §4.11's moderator table rejects an app for. `bad_period` is the code §8 and
+        # `FilterError` already reserve for "a period this server cannot honour"; refusing
+        # is the honest answer, because a range at the bottom of the calendar has no
+        # previous period to compare against and the tiles would be about nothing.
+        raise FilterError("bad_period") from None
+
     return CallFilters(
         preset=preset,
         date_from=date_from,
         date_to=date_to,
-        start_utc=_midnight_utc(date_from, zone),
-        end_utc=_midnight_utc(date_to + dt.timedelta(days=1), zone),
-        # The equally long window immediately before this one, for the summary tiles'
-        # "vs previous period" line. Computed from local dates, so a period that contains a
-        # DST change is still compared against the same number of *days*, not of hours.
-        previous_start_utc=_midnight_utc(date_from - dt.timedelta(days=span), zone),
+        start_utc=start_utc,
+        end_utc=end_utc,
+        previous_start_utc=previous_start_utc,
         tz_name=tz_name,
         employees=_ints(params, _EMPLOYEE_KEYS, "bad_employee"),
         directions=_ints(params, _DIRECTION_KEYS, "bad_direction"),

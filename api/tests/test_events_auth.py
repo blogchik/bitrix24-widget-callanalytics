@@ -58,10 +58,13 @@ from tests.fixtures.bitrix import (
     APP_KEY,
     CLIENT_ENDPOINT,
     DOMAIN,
+    FRESH_ACCESS,
+    FRESH_REFRESH,
     SEED_ACCESS,
     SEED_REFRESH,
     Err,
     FakeBitrix,
+    RecordedRequest,
     SeededPortal,
     delete_portal,
     new_member_id,
@@ -70,6 +73,7 @@ from tests.fixtures.bitrix import (
     portal_sync_snapshot,
     seed_portal,
     token_response,
+    user_current,
 )
 
 #: §4.9 is registered in the vendor cabinet as the "Event installation handler URL".
@@ -733,4 +737,329 @@ async def test_no_event_is_authenticated_with_the_portals_own_stored_tokens(
     assert SEED_REFRESH not in presented, (
         "the exchange used the stored refresh token, so it would succeed for any body "
         "naming this member_id - and it burns the portal's own refresh chain (§4.1)."
+    )
+
+
+# --- 8. the uninstall nothing can authenticate ------------------------------------------
+
+#: A portal administrator's own one-hour bearer, as it reaches the handler in
+#: `auth[access_token]`. Kept apart from `EVENT_ACCESS` because test 9 needs a body whose
+#: two `auth[...]` halves belong to *different* people.
+ADMIN_ACCESS: Final[str] = "adminaccess.3f8e1d7c5b9a2064e8f1c3a5d7b9e0f2"
+#: A regular employee's pair, the kind anyone can read out of `BX24.getAuth()`.
+EMPLOYEE_ACCESS: Final[str] = "employeeaccess.6a4c2e0f8d1b3957ae2c4068d1f3b5a7"
+EMPLOYEE_REFRESH: Final[str] = "employeerefresh.b7d5f3a1c9e70826d4b2f0a8c6e4d2b0"
+
+#: Who `user.current` answers with, so "whose credential got stored" is visible in the row.
+ADMIN_USER_ID: Final[int] = 42
+EMPLOYEE_USER_ID: Final[int] = 101
+
+
+@pytest.fixture()
+async def tokenless_portal(app_engine: AsyncEngine) -> AsyncIterator[SeededPortal]:
+    """An active tenant that holds NO `application_token`, with rows to lose.
+
+    Not an exotic state: §4.9 rule 5 exists precisely for "a portal installed through
+    `/install/` by a cabinet that sends no `APPLICATION_TOKEN` in the iframe POST", and
+    `store_portal_credential` writes the column only when the value is present. §11
+    assumption 8 also allows `ONAPPINSTALL` never to arrive for an app with an interface,
+    so the portal can stay in this state indefinitely.
+    """
+    seeded = await seed_portal(application_key=None)
+    await seed_calls(seeded.portal_id)
+    try:
+        yield seeded
+    finally:
+        await wipe_calls(seeded.portal_id)
+        await delete_portal(seeded.member_id)
+
+
+async def test_an_uninstall_is_refused_when_the_portal_has_no_stored_application_token(
+    client: httpx.AsyncClient, tokenless_portal: SeededPortal
+) -> None:
+    """§4.9 rule 2 has to answer when there is nothing to compare against.
+
+    The compare is conditioned on a stored token, and `ONAPPUNINSTALL` is the one event
+    that by design carries no credential at all - no access token, no refresh token. So on
+    a portal whose `application_token_enc` is NULL the body below proves *nothing*: its
+    only content is a `member_id`, which §4.1 declares public (every vendor installed on
+    that portal has it, and any employee can read it from `BX24.getAuth()`).
+
+    Obeying it costs the tenant everything the uninstall transition costs: both API tokens
+    NULLed, `purge_pending` armed, the cursors reset, and a worker that then deletes every
+    cached call. So the answer is 403, and the genuine uninstall of such a portal is picked
+    up by §5.8's inferred-uninstall sweep after `UNINSTALL_GRACE_DAYS` - the fallback §4.11
+    already names for "uninstalls with the events URL unavailable".
+    """
+    before = await portal_snapshot(tokenless_portal.member_id)
+    sync_before = await portal_sync_snapshot(tokenless_portal.portal_id)
+    assert before is not None and sync_before is not None
+    assert before["application_token_enc"] is None, (
+        "the fixture must produce the NULL-token state, or this test proves nothing"
+    )
+    calls_before = await count_calls(tokenless_portal.portal_id)
+    assert calls_before > 0
+
+    fake = FakeBitrix()
+    with patch_httpx(fake):
+        response = await post_event(
+            client,
+            event_form(
+                "ONAPPUNINSTALL",
+                member_id=tokenless_portal.member_id,
+                application_token=None,
+                data={"VERSION": "3", "CLEAN": "1"},
+            ),
+        )
+
+    assert response.status_code == 403, (
+        "an ONAPPUNINSTALL that presented nothing but the public `member_id` was obeyed. "
+        "Anyone who knows it can now wipe this tenant's cache (§4.9 rule 2)."
+    )
+    after = await portal_snapshot(tokenless_portal.member_id)
+    sync_after = await portal_sync_snapshot(tokenless_portal.portal_id)
+    assert after is not None and sync_after is not None
+    assert after["status"] == "active"
+    assert after["uninstalled_at"] is None
+    assert after["purge_pending"] is False, "and must not queue the tenant for purge"
+    assert after["purge_bodies"] is False
+    assert after["access_token_enc"] == before["access_token_enc"]
+    assert after["refresh_token_enc"] == before["refresh_token_enc"]
+    assert after["token_status"] == before["token_status"]
+    assert after["placements"] == before["placements"]
+    assert int(sync_after["sync_generation"]) == int(sync_before["sync_generation"]), (
+        "a generation bump alone breaks the tenant: any in-flight sync run is fenced off"
+    )
+    assert await count_calls(tokenless_portal.portal_id) == calls_before
+    assert "event_rejected" in await event_kinds(tokenless_portal.portal_id), (
+        "support needs the audit row: a refused uninstall leaves the database otherwise "
+        "unchanged, so `portal_events` is the only trace that someone tried."
+    )
+    assert fake.rest_count == 0 and fake.oauth_count == 0, (
+        "refusing must stay as cheap as obeying - an unauthenticated body may not spend a "
+        "round trip, or the refusal becomes the amplifier (§4.9 rule 3)."
+    )
+
+
+async def test_an_uninstall_for_an_already_uninstalled_tokenless_portal_is_still_a_no_op(
+    client: httpx.AsyncClient, strangers: list[str]
+) -> None:
+    """The control for the refusal above: rule 3's 200 no-op must survive it.
+
+    Bitrix24 retries webhooks, and a 4xx is what makes it retry. A portal that is already
+    `uninstalled` has nothing left to protect, so answering 403 there would only buy an
+    endless redelivery loop for a message whose effect is already in place.
+    """
+    gone = await seed_portal(application_key=None, status="uninstalled")
+    strangers.append(gone.member_id)
+
+    fake = FakeBitrix()
+    with patch_httpx(fake):
+        response = await post_event(
+            client,
+            event_form(
+                "ONAPPUNINSTALL",
+                member_id=gone.member_id,
+                application_token=None,
+                data={"VERSION": "3"},
+            ),
+        )
+
+    assert response.status_code == 200, (
+        "a duplicate uninstall of an already-uninstalled portal must stay a 200 no-op "
+        "(§4.9 rule 3); a 4xx makes Bitrix24 redeliver it forever."
+    )
+
+
+# --- 9. the credential that was never itself proven -------------------------------------
+
+
+def _admin_only(*admin_tokens: str) -> tuple[Any, Any]:
+    """Script `user.current` + `user.admin` so the answer depends on WHICH token asked.
+
+    The fake scripts per method name, and every entry may be a callable over the recorded
+    request - so this is how "is an administrator" becomes a property of a token rather
+    than of the test. Without it a handler that proves one token and stores another is
+    indistinguishable from one that proves the token it stores.
+    """
+    admins = frozenset(admin_tokens)
+
+    def current(record: RecordedRequest) -> dict[str, Any]:
+        is_admin = record.access_token in admins
+        return user_current(user_id=ADMIN_USER_ID if is_admin else EMPLOYEE_USER_ID)
+
+    def admin(record: RecordedRequest) -> bool:
+        return record.access_token in admins
+
+    return current, admin
+
+
+async def test_an_app_update_reseeds_only_a_credential_whose_own_admin_standing_was_proven(
+    client: httpx.AsyncClient, strangers: list[str]
+) -> None:
+    """§4.1: "...succeeded **with that token**", the half `open.py` spells out.
+
+    `ONAPPUPDATE` presents two independent strings - `auth[access_token]` and
+    `auth[refresh_token]` - and nothing in the protocol binds them to the same person. The
+    handler proves the first and stores what the *second* exchanges into, so unless the
+    exchanged pair is itself asked `user.admin`, a non-admin refresh chain paired with a
+    borrowed administrator bearer becomes the sync worker's credential: the portal keeps
+    working, and every dashboard on it silently shows that one employee's calls.
+
+    (a) is that mix, on a portal whose `token_status != 'ok'` - the only state in which
+    rule 4 re-seeds. (b) is the control, because "never re-seed" would pass (a) on its own
+    and would leave a portal with a dead credential no `ONAPPUPDATE` can repair.
+    """
+    # --- (a) an administrator's bearer, an employee's refresh chain --------------------
+    mixed = await seed_portal(token_status="reauth_required")
+    strangers.append(mixed.member_id)
+    before = await portal_snapshot(mixed.member_id)
+    assert before is not None
+
+    fake = FakeBitrix()
+    fake.on_oauth(
+        token_response(
+            member_id=mixed.member_id,
+            access_token=EMPLOYEE_ACCESS,
+            refresh_token=EMPLOYEE_REFRESH,
+            user_id=EMPLOYEE_USER_ID,
+        )
+    )
+    current, admin = _admin_only(ADMIN_ACCESS)
+    fake.on("user.current", current).on("user.admin", admin)
+
+    with patch_httpx(fake):
+        response = await post_event(
+            client,
+            event_form(
+                "ONAPPUPDATE",
+                member_id=mixed.member_id,
+                application_token=ATTACKER_KEY,
+                access_token=ADMIN_ACCESS,
+                refresh_token=EMPLOYEE_REFRESH,
+                data={"VERSION": "9"},
+            ),
+        )
+
+    assert EMPLOYEE_ACCESS in {
+        record.access_token for record in fake.of_kind("batch") + fake.of_kind("rest")
+    }, (
+        "the token the handler was about to STORE was never itself asked `user.admin`. "
+        "§4.1 admits only a credential that has answered that question for itself."
+    )
+    assert response.status_code == 403, (
+        "an event whose two auth halves belong to two different people was accepted "
+        "(§4.9 rule 4: anything less than both proofs is 403 + event_rejected)."
+    )
+    after = await portal_snapshot(mixed.member_id)
+    assert after is not None
+    stored_access = decrypt(
+        bytes.fromhex(str(after["access_token_enc"])),
+        member_id=mixed.member_id,
+        column="access_token",
+    )
+    assert stored_access == SEED_ACCESS, (
+        "the employee's access token is now the portal's sync credential: the worker will "
+        "cache only the calls that one user can see, with no error anywhere."
+    )
+    assert after["refresh_token_enc"] == before["refresh_token_enc"]
+    assert after["token_status"] == "reauth_required", (
+        "a credential that failed its own admin proof must not be marked healthy"
+    )
+    assert after["application_token_enc"] == before["application_token_enc"], (
+        "and the refused event must not leave the attacker holding the key to rule 2 - "
+        "the application token write happens on the same accepted-event path."
+    )
+    assert "event_rejected" in await event_kinds(mixed.portal_id)
+
+    # --- (b) the control: one administrator, both halves ------------------------------
+    genuine = await seed_portal(token_status="reauth_required")
+    strangers.append(genuine.member_id)
+
+    fake = FakeBitrix()
+    fake.on_oauth(
+        token_response(
+            member_id=genuine.member_id,
+            access_token=FRESH_ACCESS,
+            refresh_token=FRESH_REFRESH,
+            user_id=ADMIN_USER_ID,
+        )
+    )
+    current, admin = _admin_only(ADMIN_ACCESS, FRESH_ACCESS)
+    fake.on("user.current", current).on("user.admin", admin)
+
+    with patch_httpx(fake):
+        response = await post_event(
+            client,
+            event_form(
+                "ONAPPUPDATE",
+                member_id=genuine.member_id,
+                application_token=ROTATED_KEY,
+                access_token=ADMIN_ACCESS,
+                refresh_token=EVENT_REFRESH,
+                data={"VERSION": "9"},
+            ),
+        )
+
+    assert response.status_code == 200, (
+        "a genuine version update from an administrator must still repair a broken "
+        "credential (§4.9 rule 4); refusing it strands the portal for good."
+    )
+    repaired = await portal_snapshot(genuine.member_id)
+    assert repaired is not None
+    assert (
+        decrypt(
+            bytes.fromhex(str(repaired["access_token_enc"])),
+            member_id=genuine.member_id,
+            column="access_token",
+        )
+        == FRESH_ACCESS
+    )
+    assert repaired["token_status"] == "ok"
+    assert repaired["token_user_id"] == ADMIN_USER_ID
+
+
+async def test_an_unknown_portal_stores_only_the_exchanged_token_it_proved(
+    client: httpx.AsyncClient, strangers: list[str]
+) -> None:
+    """§4.9 rule 6 + §4.1, the same seam on the path that CREATES a tenant.
+
+    Here the whole portal row is conjured from the event, so the credential it starts life
+    with is the exchange's - and that is the one `user.admin` has to be asked about. The
+    body pairs an administrator's bearer with an employee's refresh chain again; the
+    difference is that a wrong answer creates a tenant whose sync credential belongs to a
+    regular employee from its very first backfill.
+    """
+    stranger = new_member_id()
+    strangers.append(stranger)
+
+    fake = FakeBitrix()
+    fake.on_oauth(
+        token_response(
+            member_id=stranger,
+            access_token=EMPLOYEE_ACCESS,
+            refresh_token=EMPLOYEE_REFRESH,
+            user_id=EMPLOYEE_USER_ID,
+        )
+    )
+    current, admin = _admin_only(ADMIN_ACCESS)
+    fake.on("user.current", current).on("user.admin", admin)
+
+    with patch_httpx(fake):
+        response = await post_event(
+            client,
+            event_form(
+                "ONAPPINSTALL",
+                member_id=stranger,
+                application_token=ATTACKER_KEY,
+                access_token=ADMIN_ACCESS,
+                refresh_token=EMPLOYEE_REFRESH,
+                data={"VERSION": "1"},
+            ),
+        )
+
+    assert response.status_code < 500
+    assert await portal_snapshot(stranger) is None, (
+        "a tenant was created around a credential that never answered `user.admin` for "
+        "itself (§4.1). Its worker would cache one employee's slice of the portal forever."
     )

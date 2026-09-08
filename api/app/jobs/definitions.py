@@ -68,6 +68,7 @@ from app.bitrix.errors import (
     TransportError,
     UnknownBitrixError,
     UserAccessError,
+    classify,
 )
 from app.bitrix.oauth import CredentialUnavailable, MemberIdMismatch, with_portal_token
 from app.bitrix.statistic import STATISTIC_METHOD
@@ -96,8 +97,8 @@ from app.sync.lease import (
     heartbeat,
     release_lease,
 )
+from app.sync.purge import outside_incomplete_cooldown, purge_portal_data
 from app.sync.purge import purge_crm_contexts as _purge_crm_context_rows
-from app.sync.purge import purge_portal_data
 from app.sync.purge import purge_rest_log as _purge_rest_log_rows
 from app.sync.rescan import run_id_window_rescan, run_record_recheck, run_refresh_requested
 
@@ -134,6 +135,10 @@ DAILY_SECONDS: Final[float] = 86_400.0
 #: §5.8: "after 3 consecutive connect/DNS/TLS failures perform one refresh under the
 #: single-flight lock purely to re-learn `client_endpoint`" - the portal was renamed.
 TRANSPORT_FAILURES_BEFORE_REFRESH: Final[int] = 3
+
+#: Highest rung `_previous_ladder_step` will read back. 2 s x 2**8 = 512 s is already
+#: past §5.6's 300 s ceiling, so counting further would only cost loop iterations.
+_MAX_LADDER_STEP: Final[int] = 8
 
 #: §5.8 terminal `token_status` values. Plain strings: `portals_token_status_chk` is
 #: the authority and `services/portals.py` validates every write against it.
@@ -258,7 +263,16 @@ class _Visit:
     last_rescan_at: dt.datetime | None
     last_recheck_at: dt.datetime | None
     last_appinfo_at: dt.datetime | None
+    #: `portals.token_admin_verified_at` - the worker's OWN clock for the daily
+    #: `user.admin` re-verification, deliberately not `portal_sync.last_appinfo_at`
+    #: (which the `/app/` handler also writes). See `_phase_daily_probe`.
+    token_admin_verified_at: dt.datetime | None
     last_error_code: str | None
+    #: `portal_sync.last_error_at` / `next_run_at` AS THE PREVIOUS VISIT LEFT THEM. Read
+    #: only by `_backoff_attempt`: their difference is the rung of §5.6's 503 ladder the
+    #: last visit climbed to, and `portal_sync` has no column that carries it.
+    last_error_at: dt.datetime | None
+    next_run_at: dt.datetime | None
     consecutive_failures: int
 
     #: Set by the operating-time guard; when present it replaces the "clean visit"
@@ -356,7 +370,10 @@ async def _open_visit(portal_id: int, correlation_id: uuid.UUID) -> _Visit | Non
         last_rescan_at=sync.last_rescan_at,
         last_recheck_at=sync.last_recheck_at,
         last_appinfo_at=sync.last_appinfo_at,
+        token_admin_verified_at=portal.token_admin_verified_at,
         last_error_code=sync.last_error_code,
+        last_error_at=sync.last_error_at,
+        next_run_at=sync.next_run_at,
         consecutive_failures=int(sync.consecutive_failures or 0),
     )
 
@@ -515,6 +532,9 @@ def _absorb(
         if terminal is not None:
             raise _TerminalStop(terminal, error)
         if isinstance(error, QueryLimitExceeded):
+            # Not counted here: this re-raise lands in `sync_portal`'s `except BitrixError`,
+            # which is the ONE place §5.6's ladder counts a 503 (counting in both would
+            # double the exponent for a per-command 503 and not for a whole-request one).
             raise error
         if isinstance(error, OperationTimeLimit):
             raise error
@@ -709,7 +729,19 @@ async def _phase_daily_probe(visit: _Visit) -> None:
     Re-verifying daily turns that silent narrowing into an explicit
     `no_stats_permission` state, a `sync_blocked` event and a settings-page banner.
     """
-    if not _due(visit.last_appinfo_at, DAILY_SECONDS):
+    # Two daily jobs live in this phase and they need two clocks. `last_appinfo_at`
+    # means "when did we last ask this portal about itself" and is ALSO written by the
+    # open handler (`handlers/open.py::_housekeeping`, §4.4 step 4) after an `app.info`
+    # made with the OPENER's token - which proves nothing about the stored credential.
+    # Gating the `user.admin` half on it let a portal that is opened once a day starve
+    # the only check that catches a demoted installer (§5.8 "Daily admin
+    # re-verification", architecture.md:260 "at write time and daily by the worker").
+    # So the admin half is due on the column only this phase and the credential writer
+    # ever set, `portals.token_admin_verified_at`, and the `app.info` half keeps its own.
+    if not (
+        _due(visit.token_admin_verified_at, DAILY_SECONDS)
+        or _due(visit.last_appinfo_at, DAILY_SECONDS)
+    ):
         return
 
     async def probe(client: BitrixClient) -> BatchResult:
@@ -770,6 +802,11 @@ async def _phase_daily_probe(visit: _Visit) -> None:
             )
         await fenced_update(session, visit.fence, {"last_appinfo_at": now})
     visit.last_appinfo_at = now
+    if "token_admin_verified_at" in portal_values:
+        # Only a proven `user.admin` advances the worker's own clock: an unreadable
+        # answer above leaves the re-verification due, so it is retried instead of
+        # being silently credited by the `app.info` half's timestamp.
+        visit.token_admin_verified_at = now
 
 
 #: §5.9's order, exactly: refresh_requested -> head_fetch -> incremental -> backfill ->
@@ -888,6 +925,58 @@ async def _apply_terminal(
     log.warning("sync: portal blocked", extra={"portal_id": visit.portal_id, "reason": kind})
 
 
+def _previous_ladder_step(visit: _Visit) -> int | None:
+    """Which rung of §5.6's 503 ladder the PREVIOUS visit ended on, or None.
+
+    §5.6's "exponential 2, 4, 8 ... 300 s" is an escalation ACROSS visits: a 503 always
+    ends the visit that saw it (`_absorb` re-raises it and `bitrix/client.py` never
+    retries), so a counter that lives only inside one visit can never leave the first
+    rung. The rung therefore has to be read back from the row the previous visit wrote,
+    and `portal_sync` has exactly two columns that carry it: `release_lease` writes
+    `last_error_at` and the parked `next_run_at` together, from the same 503, so their
+    difference IS the delay that was chosen. `last_error_code` is what makes the streak
+    consecutive - a clean visit NULLs it (`release_lease`), any other failure overwrites
+    it - which is the same evidence §5.8's transport-failure branch below uses.
+
+    Deliberately NOT derived from `throttle_hits` (a lifetime counter: a portal
+    throttled two hundred times over a month would open every visit at the 300 s
+    ceiling) nor from `consecutive_failures` (§5.6 rule 1: throttling is not failure).
+    """
+    parked, since = visit.next_run_at, visit.last_error_at
+    if visit.last_error_code is None or parked is None or since is None:
+        return None
+    if parked.tzinfo is None or since.tzinfo is None:
+        # `'infinity'` arrives from asyncpg as a NAIVE datetime.max (§5.4's park); it is
+        # never a 503 park, and subtracting it would raise instead of deciding.
+        return None
+    if not isinstance(classify(visit.last_error_code), QueryLimitExceeded):
+        return None
+
+    previous_delay = (parked - since).total_seconds()
+    step = 0
+    rung = throttle.BASE_BACKOFF_SECONDS
+    # The rung the previous delay is CLOSEST to, not the first one above it: the two
+    # timestamps are written milliseconds apart, so a 2 s park reads back as 1.995 s.
+    while step < _MAX_LADDER_STEP and rung * 1.5 < previous_delay:
+        rung *= 2.0
+        step += 1
+    return step
+
+
+def _backoff_attempt(visit: _Visit) -> int:
+    """The `attempt` exponent `throttle.on_query_limit` turns into the §5.6 delay.
+
+    Zero for anything that is not a 503 (the other branches ignore it), and otherwise
+    one rung above wherever the previous visit stopped - plus one more per extra 503
+    seen inside this visit.
+    """
+    if visit.query_limit_hits <= 0:
+        return 0
+    previous = _previous_ladder_step(visit)
+    climbed = 0 if previous is None else previous + 1
+    return climbed + visit.query_limit_hits - 1
+
+
 async def _close_visit(
     visit: _Visit, *, error: BitrixError | None, terminal: str | None, audited: bool
 ) -> None:
@@ -910,7 +999,7 @@ async def _close_visit(
     if visit.decision is not None:
         decision = visit.decision  # the operating-time guard already decided
     elif error is not None:
-        decision = throttle.on_error(visit.state, error, attempt=visit.query_limit_hits)
+        decision = throttle.on_error(visit.state, error, attempt=_backoff_attempt(visit))
     else:
         decision = throttle.on_clean_visit(visit.state, next_run_at=due)
 
@@ -994,6 +1083,12 @@ async def sync_portal(portal_id: int) -> None:
         except _TerminalStop as stop:
             terminal, error, audited = stop.token_status, stop.error, stop.audited
         except BitrixError as exc:
+            if isinstance(exc, QueryLimitExceeded):
+                # The single place a 503 is counted, and the reason §5.6's ladder can
+                # leave its 2 s floor at all: every 503 arrives here, whether it was the
+                # whole request (raised by `bitrix/client.py`) or one command of a
+                # halt=0 batch (re-raised by `_absorb`), and it always ends the visit.
+                visit.query_limit_hits += 1
             terminal = _terminal_for(visit, exc)
             error = exc
         except Exception as exc:
@@ -1061,8 +1156,17 @@ async def tick() -> None:
     async with control_txn() as session:
         pending = (
             await session.execute(
+                # §5.9 (b) is `SELECT id FROM portals WHERE purge_pending LIMIT 1`, and it
+                # assumed the tick "picks purge work on every visit". `sync/purge.py` paces
+                # a failed purge for INCOMPLETE_RETRY_SECONDS, so the selection has to see
+                # that pacing too: without the join the one purge slot is spent on a portal
+                # `purge_portal_data` will only skip, and every other uninstalled tenant
+                # waits out its cooldown - unbounded when opens keep renewing it, and their
+                # rows stay on disk (brief rule 7) while `lease.py` also refuses to sync
+                # them. LEFT join: a portal without a `portal_sync` row is still purgeable.
                 select(Portal.id)
-                .where(Portal.purge_pending.is_(True))
+                .outerjoin(PortalSync, PortalSync.portal_id == Portal.id)
+                .where(Portal.purge_pending.is_(True), outside_incomplete_cooldown())
                 .order_by(Portal.id)
                 .limit(1)
             )

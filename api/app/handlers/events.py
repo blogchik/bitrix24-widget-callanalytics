@@ -20,7 +20,10 @@ the order is load-bearing:
    `ONAPPUSERREADY` and `ONAPPUNINSTALL` alike, not just the uninstall the docs single
    out. `ONAPPUPDATE` is the one event that carries a *new* value by design (it is the
    rotation), so for it the compare is replaced - never dropped - by the strictly
-   stronger proof of rung 3, which is what refuses the forged rotation either way.
+   stronger proof of rung 3, which is what refuses the forged rotation either way. And
+   when NO token is stored the rung still has to answer: every other event can fall back
+   on rung 3, but `ONAPPUNINSTALL` carries no credential at all, so it is refused rather
+   than obeyed (see `_ladder`).
 3. **Elevated proof for anything that writes a credential or the application token**
    (§4.9 rules 4-6): `auth[access_token]` must pass `user.current` + `user.admin=true`
    at the **stored** `client_endpoint`, and `auth[refresh_token]` must exchange to the
@@ -558,10 +561,10 @@ async def _handle_update(
     and doing it here would race the purge job that is deleting the rows.
 
     The credential is re-seeded only when `token_status != 'ok'`, and then only through
-    `store_portal_credential()` with the `Identity` this ladder just proved - §4.1
-    allows no other writer. A healthy portal keeps its working credential: the event's
-    token pair belongs to whoever clicked "update", which is not necessarily the
-    installer whose rights the sync depends on.
+    `store_portal_credential()` with an `Identity` proved for the exchanged pair itself -
+    §4.1 allows no other writer and no other proof. A healthy portal keeps its working
+    credential: the event's token pair belongs to whoever clicked "update", which is not
+    necessarily the installer whose rights the sync depends on.
     """
     if portal.status == "uninstalled":
         _log.info(
@@ -577,6 +580,37 @@ async def _handle_update(
 
     version = _app_version(event)
     reseeded = portal.token_status != "ok"  # noqa: S105 - a state enum (§3), not a credential
+    if reseeded:
+        # §4.1 credential invariant: the admin proof is for the TOKEN BEING STORED, not
+        # for the one the event presented. `identity` above proves `auth[access_token]`;
+        # what `store_portal_credential` is about to write is the pair the exchange of
+        # `auth[refresh_token]` just minted, and nothing ties those two `auth[...]` fields
+        # to the same person - they are two independent strings the sender chose. A
+        # non-admin's refresh chain paired with a borrowed administrator bearer would
+        # otherwise become the worker's credential and silently cache a truncated slice of
+        # the portal's calls. `open.py::_maybe_reseed` (§4.4 step 6) and
+        # `api/portal.py::reauthorize` (§4.6) both re-prove the exchanged token for exactly
+        # this reason; the events ladder must not be the one door that admits an unproven
+        # credential. A genuine ONAPPUPDATE carries one administrator's own pair, so this
+        # costs it one extra batch on the repair path and nothing at all otherwise.
+        try:
+            identity = await verify_admin_token(
+                endpoint=tokens.client_endpoint,
+                access_token=tokens.access_token,
+                portal_id=portal.id,
+                member_id=portal.member_id,
+                correlation_id=correlation_id,
+            )
+        except (NotAnAdministrator, BitrixError) as exc:
+            _log.warning(
+                "events: exchanged credential failed its own admin proof",
+                extra={"portal_id": portal.id, "event": entry.event, "error": type(exc).__name__},
+            )
+            # §4.9 rule 4: "anything less -> 403 + event_rejected". Refusing the whole
+            # event, not just the re-seed, is what keeps the rotation of
+            # `application_token_enc` below out of a sender we could not fully prove.
+            return await _reject(entry, portal, "reseed_admin_proof_failed")
+
     async with control_txn() as session:
         if reseeded:
             # §4.9 rule 4: a portal whose credential is already broken is exactly the one
@@ -715,8 +749,9 @@ async def _handle_unknown_portal(
     Nothing about an unknown portal can be checked against stored state - there is no
     `application_token` to compare and no `client_endpoint` to call - so the exchange
     runs first: its response *tells us* which portal the credential belongs to and where
-    that portal's REST base is. Only then is the bearer proven an administrator, at that
-    endpoint, and only then may a row exist.
+    that portal's REST base is. Only then is the credential it returned - the one that
+    will be stored - proven an administrator's at that endpoint, and only then may a row
+    exist.
 
     The row is created through `store_portal_credential()` like every other install
     path. No placements are bound and no capabilities are probed: this is a recovery
@@ -756,9 +791,15 @@ async def _handle_unknown_portal(
         return await _reject(entry, None, "refresh_proof_failed")
 
     try:
+        # §4.1 credential invariant: `user.admin` is asked of the token that is about to
+        # be STORED - the one the exchange returned - not of `auth[access_token]`, which
+        # nothing binds to the same person and which is never written anywhere. Rule 6's
+        # "a `user.admin` proof at the returned `client_endpoint`" is satisfied either
+        # way, and only this way also satisfies §4.1 ("succeeded WITH THAT TOKEN"), as
+        # `open.py::_maybe_reseed` and `api/portal.py::reauthorize` already do.
         identity = await verify_admin_token(
             endpoint=tokens.client_endpoint,
-            access_token=event.access_token,
+            access_token=tokens.access_token,
             member_id=tokens.member_id,
             correlation_id=correlation_id,
         )
@@ -877,6 +918,32 @@ async def _ladder(
         and not await _application_token_matches(portal, event)
     ):
         return await _reject(entry, portal, "application_token_mismatch")
+
+    # ---- rule 2's other half: there is nothing to compare against --------------------
+    # §4.9 rule 2 is phrased "if `application_token_enc` is stored", and every event but
+    # one can fall through to a stronger proof when it is not: ONAPPINSTALL,
+    # ONAPPUSERREADY and ONAPPUPDATE all carry a token pair and are gated by the elevated
+    # proof of rules 4-6 (that is exactly what rule 5 requires before it seeds a token on
+    # a portal that has none). ONAPPUNINSTALL is the exception: by design it carries no
+    # credential whatsoever, so with no stored token NOTHING in the body proves anything
+    # - `member_id` is public (§4.1 trust model: every vendor installed on the portal and
+    # any employee via `BX24.getAuth()` can read it). Obeying it would let a stranger flip
+    # the tenant off and queue its cached calls for deletion, so an uninstall that cannot
+    # be verified is refused, not obeyed.
+    #
+    # The genuine uninstall of such a portal is not lost: Bitrix24 revokes API access at
+    # uninstall, the token chain dies, and §5.8's `sweep_inferred_uninstalls` applies the
+    # transition after `UNINSTALL_GRACE_DAYS` with `portal_events(uninstall_inferred)` -
+    # the path §4.11 already names for "uninstalls with the events URL unavailable". An
+    # already-uninstalled or unknown portal keeps rule 3's 200 no-op: there is nothing
+    # left to protect there and a 4xx would only make Bitrix24 retry it forever.
+    if (
+        name == _UNINSTALL
+        and portal is not None
+        and portal.status != "uninstalled"
+        and not portal.application_token_enc
+    ):
+        return await _reject(entry, portal, "no_application_token")
 
     # ---- rules 3-7 -------------------------------------------------------------------
     if name == _UNINSTALL:

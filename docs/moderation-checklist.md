@@ -23,6 +23,7 @@ when no error was logged.
 | 12 | Install on an on-premise portal | any | Identical UI. REST goes to the portal's own `client_endpoint`; `PROTOCOL=0` is accepted. If the build lacks `voximplant.statistic.get`, the explicit "method missing" state appears instead of a broken widget | ☐ |
 | 13 | Open with no portal row (simulate a restored database) | `POST /app/` | Administrator: self-heals and lands on the dashboard. Employee: "not installed yet" | ☐ |
 | 14 | POST garbage to `/install/`, `/app/`, `/settings/`, `/events/` | any | A translated "bad request" page with a request id, HTTP 400. Never a traceback | ☐ |
+| 14a | Open `https://b24.texnobus.uz/settings` in a plain browser tab | GET | The settings page from the SPA, not JSON. A bare `GET` on a handler path (`/settings/`, `/app/`, `/install/`, `/events/`) instead renders the translated state page, never `{"detail":...}` | ☐ |
 | 15 | Resize the browser and switch CRM tabs | any | The frame resizes to its content; no inner scrollbar and no clipped table | ☐ |
 | 16 | Play a recording | dashboard or CRM tab | Until the §9 spike is answered, a "has recording" icon and an "open in Bitrix24" link — deliberate, not broken | ☐ |
 

@@ -41,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.config import settings
 from app.db.session import tenant_txn
+from app.i18n import LOCALES, t
 from app.main import create_app
 from app.security.session_token import issue_session
 from tests.fixtures.bitrix import SeededPortal, delete_portal, seed_portal
@@ -666,3 +667,133 @@ async def test_a_backwards_or_unparsable_period_is_a_machine_code_too(
         "a misspelt result facet must be refused, not applied - applied, it matches nothing "
         "and the page reads as an empty period."
     )
+
+
+# --- the ends of the calendar ----------------------------------------------------------
+
+
+async def test_a_period_at_the_ends_of_the_calendar_is_a_machine_code_not_a_crash(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """§4.11: a probe gets a translated 400, never a bare 500.
+
+    `parse_filters` does not aggregate over the dates it was given: it derives three UTC
+    instants from them - local midnight of `date_from`, the midnight *after* `date_to`, and
+    the start of the equally long window before `date_from` for the "vs previous period"
+    line. `date.fromisoformat` accepts the whole proleptic calendar, so at either end one of
+    those instants does not exist: `9999-12-31` has no next day, `0001-01-01` has no
+    previous period, and local midnight of `0001-01-01` in a UTC+5 zone is in year 0.
+
+    Each of those raised `OverflowError` out of `parse_filters`, and the routes catch only
+    `FilterError`, so `GET /dashboard` and `GET /calls` answered `500 Internal Server
+    Error`. §4.11's moderator table ("probes endpoints with garbage -> translated bad
+    request, HTTP 400") and `FilterError`'s own contract both say the answer is a machine
+    code; the SPA can translate `bad_period`, and it cannot translate a traceback.
+
+    The last case is the control: one day past the arithmetic's reach must still be
+    answered, so the refusal cannot be a general fear of old dates.
+    """
+    token = session_for(portal)
+    utc_token = session_for(portal, timezone=UTC_TZ)
+
+    edges: tuple[tuple[str, str, str], ...] = (
+        # `date_to + 1 day` steps past date.max.
+        ("9999-12-31", "9999-12-31", token),
+        # `date_from - span days` steps before date.min.
+        ("0001-01-01", "0001-01-01", utc_token),
+        ("0001-01-02", "0001-01-03", utc_token),
+        # The dates themselves are representable; local midnight in Tashkent (UTC+5) is
+        # not, so a guard on the date arithmetic alone would still hand back a 500.
+        ("0001-01-02", "0001-01-02", token),
+    )
+    for start, end, edge_token in edges:
+        params = {"period": "custom", "from": start, "to": end}
+        edge_headers = {"Authorization": f"Bearer {edge_token}"}
+        for path in (DASHBOARD, "/api/v1/calls"):
+            answer = await client.get(path, params=params, headers=edge_headers)
+            assert answer.status_code == 400, (
+                f"{path} for {start}..{end} answered {answer.status_code}, not a refusal. A "
+                "period the server cannot compute the bounds of is a bad request, and a 500 "
+                f"is the raw error §4.11 rejects an app for. Body: {answer.text}"
+            )
+            assert answer.json()["code"] == "bad_period", (
+                f"{path} refused {start}..{end} without the machine code the SPA translates: "
+                f"{answer.text}"
+            )
+
+    inside = await get_dashboard(client, token, start=date(1, 1, 4), end=date(1, 1, 4))
+    assert inside.status_code == 200, (
+        "a period whose three bounds are all representable must still be answered; the fix "
+        f"must refuse the calendar's edge, not old dates in general. Got {inside.text}"
+    )
+
+
+# --- the calls that belong to nobody ----------------------------------------------------
+
+
+async def test_calls_with_no_portal_user_are_their_own_bucket_never_employee_zero(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """§3 allows `portal_user_id` NULL, so "nobody" must not be spelt as a person.
+
+    Bitrix24 returns statistic rows with no `PORTAL_USER_ID` (an unrouted inbound call),
+    and `bitrix/statistic.py` degrades an unparsable value to NULL rather than dropping the
+    call - the axes have to add up. `stats.py` therefore emits a bucket with
+    `employee_id: null` and `unassigned: true`, deliberately distinct from a real employee.
+
+    Zero is the id that proves it: it is a legal `portal_user_id` (`_number(..., 0, ...)`)
+    and it is what a consumer invents when it coerces a null id with `?? 0`. The two must
+    arrive as two buckets, each carrying its own total, with the no-employee one identified
+    by a flag rather than by an id that names somebody. Asserted on the raw JSON as well,
+    because "distinguishable in Python" is not the same claim as "distinguishable on the
+    wire", and the chart reads the wire.
+    """
+    await seed_the_known_set(portal.portal_id)
+    noon = datetime(DAY.year, DAY.month, DAY.day, 6, 0, tzinfo=UTC)
+    for offset, user_id in ((90, None), (91, None), (92, 0), (93, 0)):
+        await seed_call(portal.portal_id, offset, started=noon, user_id=user_id)
+
+    answer = await get_dashboard(client, session_for(portal), start=DAY, end=DAY)
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+
+    totals = employee_totals(body)
+    assert totals == {USER_A: 5, USER_B: 3, 0: 2, None: 2}, (
+        "the no-employee rows and the calls of employee #0 must be two buckets. Folding "
+        f"them together attributes real calls to a person who did not make them: {totals}"
+    )
+    assert sum(totals.values()) == TOTAL + 4, "the per-employee axis must re-add to the total"
+
+    buckets = {row.get("employee_id"): row for row in all_employees(body)}
+    unassigned = buckets[None]
+    assert unassigned["unassigned"] is True and unassigned["other"] is False, (
+        "the no-employee bucket must be flagged, not left to be guessed from a missing "
+        f"name: {unassigned}"
+    )
+    assert unassigned["employee_id"] is None and unassigned["bx_user_id"] is None, (
+        f"the no-employee bucket must not be given an id: {unassigned}"
+    )
+    assert buckets[0]["unassigned"] is False, (
+        f"employee #0 is a real portal user and must not be flagged as unassigned: {buckets[0]}"
+    )
+
+    # The chart reads `per_employee`, not `per_employee_all`: with four buckets it is the
+    # same rows, and the flag has to survive the colour cap too.
+    series = {row.get("employee_id"): row for row in body["per_employee"]}
+    assert series[None]["unassigned"] is True and series[0]["unassigned"] is False
+
+
+    # §8 keeps one catalogue for the SPA and the API's own pages, so the label the chart
+    # draws over this bucket is assertable from here - and it is the half of the seam a
+    # payload test cannot reach: `unassigned` is only worth emitting if something reads it
+    # and says "no employee" instead of inventing "User #0".
+    for locale in LOCALES:
+        label = t(locale, "app.dashboard.employees.unassigned")
+        assert label != "app.dashboard.employees.unassigned" and label.strip(), (
+            f"locale {locale!r} has no name for the no-employee bucket, so the only string "
+            "left for it is the one that names an employee by id"
+        )
+        assert label != t(locale, "app.dashboard.filter.unknownEmployee", id=0), (
+            f"locale {locale!r} labels calls that belong to nobody exactly as it labels the "
+            "calls of portal user #0 - a real id, and the value a `?? 0` coercion produces"
+        )

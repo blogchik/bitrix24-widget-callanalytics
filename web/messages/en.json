@@ -53,7 +53,8 @@
       "employees": {
         "other": "Other",
         "otherHint": "“Other” groups every employee beyond the top {count}.",
-        "title": "By employee"
+        "title": "By employee",
+        "unassigned": "No employee"
       },
       "empty": {
         "body": "Change the period or the filters to see calls.",

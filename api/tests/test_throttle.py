@@ -30,12 +30,15 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import UTC, datetime, timedelta
 from types import ModuleType
 from typing import Any, Final
+from urllib.parse import parse_qsl
 
+import httpx
 import pytest
 
 from app.bitrix.errors import (
@@ -405,3 +408,164 @@ def test_ten_ordinary_failures_pause_the_portal_for_six_hours(error: BitrixError
     early = decide_error(error, state(consecutive_failures=0), NOW)
     assert field_of(early, "consecutive_failures") == 1
     assert delay_of(early, NOW) < 3600, "the first failure must not cost the portal an hour"
+
+
+# ------------------------------------------------------ the ladder, through the runner
+#
+# The decisions above are pure, but WHICH rung of §5.6's ladder a 503 lands on is a fact
+# about the portal across visits, not inside one: a 503 always ends the visit that saw it
+# (`jobs/definitions.py::_absorb` re-raises it, `bitrix/client.py` never retries), so a
+# ladder driven from a per-visit counter alone can never leave its first rung. The test
+# below therefore drives the real runner against a portal that only ever answers 503.
+
+
+class _AlwaysThrottled:
+    """A Bitrix24 whose REST endpoint answers every call with the 503 of §5.6.
+
+    Both shapes the limit arrives in are covered, because they reach the runner by
+    different routes and only one of them passes through `_absorb`:
+
+    * `"envelope"` - HTTP 503 for the whole request, raised by `bitrix/client.py`;
+    * `"per_command"` - HTTP 200 with `result_error` on every sub-command of the halt=0
+      batch, which `sync/fetch.py` reports as a value and `_absorb` re-raises.
+
+    No `Retry-After` in either: that header short-circuits the ladder
+    (`throttle._retry_after`), and the ladder is exactly what is under test.
+    """
+
+    _CMD_RE: Final = re.compile(r"^cmd\[(?P<key>[^\]]+)\]$")
+
+    def __init__(self, member_id: str, *, shape: str = "envelope") -> None:
+        self.member_id = member_id
+        self.shape = shape
+        self.rest_calls = 0
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self._handle)
+
+    async def _handle(self, request: httpx.Request) -> httpx.Response:
+        if "/oauth/token" in request.url.path:
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "throttled-access",
+                    "refresh_token": "throttled-refresh",
+                    "expires_in": 3600,
+                    "client_endpoint": "https://portal.bitrix24.test/rest/",
+                    "server_endpoint": "https://oauth.bitrix.info/rest/",
+                    "member_id": self.member_id,
+                    "user_id": 100,
+                    "status": "L",
+                    "scope": "crm,telephony,placement,user_brief",
+                },
+            )
+        self.rest_calls += 1
+        blocked = {
+            "error": "QUERY_LIMIT_EXCEEDED",
+            "error_description": "Too many requests.",
+        }
+        if self.shape == "envelope":
+            return httpx.Response(503, json=blocked)
+
+        body = request.content.decode() if request.content else ""
+        keys = [
+            found.group("key")
+            for key, _value in parse_qsl(body, keep_blank_values=True)
+            if (found := self._CMD_RE.match(key))
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "result": {
+                    "result": {},
+                    "result_error": dict.fromkeys(keys, blocked),
+                    "result_time": {},
+                    "result_next": {},
+                    "result_total": {},
+                }
+            },
+        )
+
+
+async def _park_and_lease(portal_id: int) -> None:
+    """Let the parked time pass, then lease the portal exactly as the tick would.
+
+    Both timestamps are shifted by the SAME amount, because that is what waiting does:
+    moving `next_run_at` alone would rewrite the very back-off this test is measuring.
+    An hour rather than a second so this portal sorts to the front of `acquire_leases`'
+    `ORDER BY next_run_at LIMIT n` even when the shared database holds other tenants.
+    """
+    from sqlalchemy import text
+
+    from app.db.session import control_txn
+    from app.sync.lease import WORKER_ID, acquire_leases
+
+    async with control_txn() as session:
+        await session.execute(
+            text(
+                "UPDATE portal_sync SET "
+                "  last_error_at = last_error_at - (next_run_at - (now() - interval '1 hour')), "
+                "  next_run_at = now() - interval '1 hour', "
+                "  lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE portal_id = :pid"
+            ),
+            {"pid": portal_id},
+        )
+    leased = [f for f in await acquire_leases(8, WORKER_ID) if f.portal_id == portal_id]
+    assert leased, "the portal was not due for a lease; the visit would be a no-op"
+
+
+async def _sync_row(portal_id: int) -> Mapping[str, Any]:
+    from sqlalchemy import text
+
+    from app.db.session import control_txn
+
+    async with control_txn() as session:
+        row = (
+            await session.execute(
+                text("SELECT * FROM portal_sync WHERE portal_id = :pid"), {"pid": portal_id}
+            )
+        ).mappings().one()
+    return dict(row)
+
+
+@pytest.mark.parametrize("shape", ["envelope", "per_command"], ids=["http-503", "result_error"])
+async def test_consecutive_503s_climb_the_backoff_ladder_instead_of_parking_at_the_floor(
+    app_engine: Any, shape: str
+) -> None:
+    """§5.6 - "exponential 2, 4, 8 … 300 s", measured on the row the visit leaves behind.
+
+    Every tenant of this deployment shares one source IP and the bucket drains at 2 req/s
+    for the whole account, so a portal that retries a 503 at the 2 s floor for ever is an
+    outage for every other portal this worker serves - at exactly the moment the bucket
+    is empty. Throttling must still stay out of the failure counters (§5.6 rule 1).
+    """
+    from app.jobs.definitions import sync_portal
+    from tests.fixtures.bitrix import delete_portal, patch_httpx, seed_portal
+
+    seeded = await seed_portal(backfill_status="pending", high_id=0, low_id=None)
+    fake = _AlwaysThrottled(seeded.member_id, shape=shape)
+    delays: list[float] = []
+    rows: list[Mapping[str, Any]] = []
+    try:
+        with patch_httpx(fake):  # type: ignore[arg-type]
+            for _ in range(4):
+                await _park_and_lease(seeded.portal_id)
+                await sync_portal(seeded.portal_id)
+                row = await _sync_row(seeded.portal_id)
+                rows.append(row)
+                delays.append((row["next_run_at"] - row["last_error_at"]).total_seconds())
+    finally:
+        await delete_portal(seeded.member_id)
+
+    assert fake.rest_calls >= 4, "every visit must have actually reached the 503"
+    assert delays[0] == pytest.approx(2.0, abs=0.5), (
+        f"the first 503 parks the portal for the 2 s floor, not {delays[0]:.1f} s"
+    )
+    assert delays == pytest.approx([2.0, 4.0, 8.0, 16.0], abs=0.6), (
+        f"§5.6's 2, 4, 8 … 300 s ladder never escalated: {[round(d, 1) for d in delays]}"
+    )
+    assert [int(row["throttle_hits"]) for row in rows] == [1, 2, 3, 4]
+    assert all(int(row["consecutive_failures"]) == 0 for row in rows), (
+        "§5.6 rule 1: throttling is not failure - it must never approach the 6 h pause"
+    )

@@ -614,3 +614,102 @@ async def test_a_crm_tab_without_a_numeric_id_is_a_bad_request(
     assert response.status_code == 400
     assert fake.rest_count == 0
     assert_state(response, "bad_request")
+
+
+# --- 7. the open must not starve the worker's daily `user.admin` --------------------
+
+
+async def portal_row(portal_id: int) -> dict[str, Any]:
+    async with control_txn() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT p.token_admin_verified_at, s.last_appinfo_at "
+                    "FROM portals p JOIN portal_sync s ON s.portal_id = p.id "
+                    "WHERE p.id = :pid"
+                ),
+                {"pid": portal_id},
+            )
+        ).mappings().one()
+    return dict(row)
+
+
+async def test_a_daily_admin_open_still_leaves_the_worker_its_user_admin_reverification(
+    client: httpx.AsyncClient, cleanup: list[str]
+) -> None:
+    """§5.8 "Daily admin re-verification", and why it must not share a clock with §4.4.
+
+    The worker re-runs `user.admin` on the STORED credential once a day because that is
+    the only thing that notices the installer being demoted or dismissed: the token keeps
+    answering HTTP 200 and `voximplant.statistic.get` quietly narrows to that one
+    person's calls - nothing fails, nothing is logged, and the dashboard just shows less
+    than the truth (architecture.md:260, :685).
+
+    The `/app/` open also runs `app.info` once a day (§4.4 step 4) and stamps
+    `portal_sync.last_appinfo_at`. That call is made with the *opener's* token and proves
+    nothing about the stored credential, so it must not be able to satisfy the worker's
+    gate. On a portal opened during working hours it otherwise does, every day.
+    """
+    from app.jobs.definitions import sync_portal
+    from app.sync.lease import WORKER_ID, acquire_leases
+
+    seeded = await seed_portal(status="active", token_status="ok")
+    cleanup.append(seeded.member_id)
+    async with control_txn() as session:
+        # A portal that has been installed for a while: `installed_flag` is true, so the
+        # open's `app.info` is the once-a-day one, and both daily jobs are due.
+        await session.execute(
+            text(
+                "UPDATE portals SET installed_flag = true, "
+                "token_admin_verified_at = now() - interval '25 hours' WHERE id = :pid"
+            ),
+            {"pid": seeded.portal_id},
+        )
+        await session.execute(
+            text(
+                "UPDATE portal_sync SET last_appinfo_at = now() - interval '25 hours', "
+                "next_run_at = now() - interval '1 second' WHERE portal_id = :pid"
+            ),
+            {"pid": seeded.portal_id},
+        )
+    before = await portal_row(seeded.portal_id)
+
+    fake = FakeBitrix()
+    with patch_httpx(fake):
+        response = await open_app(client, install_form(member_id=seeded.member_id))
+        handoff_token(response)  # a real, successful admin open
+
+        opened = await portal_row(seeded.portal_id)
+        assert opened["last_appinfo_at"] > before["last_appinfo_at"], (
+            "this test is only meaningful if the open really ran `app.info` and stamped "
+            "the shared column (§4.4 step 4)"
+        )
+        assert opened["token_admin_verified_at"] == before["token_admin_verified_at"], (
+            "an open proves nothing about the stored credential"
+        )
+
+        leased = [f for f in await acquire_leases(8, WORKER_ID) if f.portal_id == seeded.portal_id]
+        assert leased, "the portal was not due for a lease; the visit would be a no-op"
+        fake.reset()  # from here on, only what the WORKER did
+        await sync_portal(seeded.portal_id)
+
+    admin_probes = [
+        record
+        for record in fake.requests
+        if any("user.admin" in command for command in record.commands.values())
+        or (record.rest_method or "").lower() == "user.admin"
+    ]
+    assert admin_probes, (
+        "the visit ran no `user.admin` at all: the open's `app.info` timestamp satisfied "
+        "the worker's daily gate, so a demoted installer would never be noticed (§5.8)"
+    )
+    assert admin_probes[0].access_token == seeded.access, (
+        "the re-verification must use the STORED credential - that is the token whose "
+        "admin standing decides what the cache contains"
+    )
+
+    after = await portal_row(seeded.portal_id)
+    assert after["token_admin_verified_at"] > before["token_admin_verified_at"], (
+        "a successful re-verification records itself; `/portal/sync-status` shows this "
+        "value and a frozen one is exactly the silent failure §5.8 exists to prevent"
+    )

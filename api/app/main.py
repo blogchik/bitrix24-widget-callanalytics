@@ -19,9 +19,9 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Final
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
@@ -160,7 +160,75 @@ def create_app() -> FastAPI:
     app.include_router(events_router)  # POST /events/ (§4.9)
     app.include_router(api_router)  # /api/v1/*, all behind get_principal
 
+    _add_handler_get_pages(app)
+
     return app
+
+
+#: The four Bitrix24-facing handler URLs (§4.3, §4.4, §4.5, §4.9) — exactly the paths
+#: registered in the vendor cabinet, trailing slash included.
+_HANDLER_PATHS: Final[tuple[str, ...]] = ("/install/", "/app/", "/settings/", "/events/")
+
+#: The one sentence that tells a person what to do here. It lives in the shared
+#: catalogue (§8) like every other string; `has_message` guards the lookup so a stripped
+#: bundle renders the state page without a dotted key on it.
+_OPEN_FROM_BITRIX24: Final[str] = "common.openFromBitrix24"
+
+
+def _add_handler_get_pages(app: FastAPI) -> None:
+    """`GET` on a handler URL renders a state page instead of Starlette's 405 (§4.11).
+
+    The four handler paths are POST-only: Bitrix24 form-posts the iframe there. But they
+    are also ordinary URLs that a human opens in a browser — a moderator walking
+    `docs/moderation-checklist.md` step 8, an administrator who pasted the cabinet URL —
+    and without a GET route the answer is Starlette's default `{"detail":"Method Not
+    Allowed"}`: raw, untranslated JSON rendered inside the Bitrix24 iframe, which §4.11
+    counts as a moderation rejection just as a blank frame does.
+
+    So the page every other unusable request gets is rendered here, framed and
+    translated from the `DOMAIN` / `PROTOCOL` / `LANG` that Bitrix24 repeats on the
+    handler URL (§4.4 step 8) — `render_state` re-validates all three. `bad_request` is
+    the §4.11 kind for "opened with parameters we cannot use", which is what a GET is.
+
+    This is a safety net and not a route the product uses. In particular it is NOT how
+    the admin Settings page is served: `/settings` (no trailing slash) is the SPA page
+    on `web:3000` and only `/settings/` belongs to this app — see the routing comment in
+    `docker/Caddyfile.snippet`. If a browser ever reaches this page for a Settings open,
+    the ingress has regressed; the user then sees a page rather than raw JSON, and
+    `api/tests/test_routing.py` is what stops that regression from shipping.
+    """
+    # Imported here, next to their only use, in the same spirit as the routers above:
+    # `_Hints` is the install handler's reader for the display-only URL parameters and
+    # must have exactly one definition (see the note on the imports in handlers/open.py).
+    from app.handlers.install import _Hints
+    from app.handlers.render import render_state
+    from app.i18n import has_message, resolve_locale, t
+
+    async def handler_get(request: Request) -> Response:
+        hints = _Hints.from_request(request)
+        locale = resolve_locale(hints.lang)
+        extra = (
+            {"hint": t(locale, _OPEN_FROM_BITRIX24)}
+            if has_message(_OPEN_FROM_BITRIX24)
+            else None
+        )
+        response = render_state(
+            request,
+            "bad_request",
+            lang=hints.lang,
+            domain=hints.domain,
+            protocol_https=hints.protocol_https,
+            # A rendered page under an honest status: the endpoint really does accept
+            # only POST, and RFC 9110 requires `Allow` on a 405. Browsers render the
+            # body of a 405 exactly as they render a 200, so the frame shows the page.
+            status_code=405,
+            extra=extra,
+        )
+        response.headers["Allow"] = "POST"
+        return response
+
+    for path in _HANDLER_PATHS:
+        app.add_api_route(path, handler_get, methods=["GET"], include_in_schema=False)
 
 
 # Module-level instance so the container can run the conventional

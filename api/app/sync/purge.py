@@ -21,7 +21,11 @@ with three rules that together make silence impossible:
    whose first `DELETE` affected 0 rows aborts as `purge_incomplete` - never as
    "already empty";
 3. a **final count**, under the same context, that must be 0 before `purge_pending`
-   is cleared.
+   is cleared - with exactly one exception, spelled out at the check itself: a portal
+   that is ACTIVE again is the "reinstall during cleanup" §4.4 step 3 blesses, and the
+   rows its live `/app/` opens write after the deletes belong to the new install. Rules
+   1 and 2 still stand there; only the re-verification yields, because otherwise a live
+   tenant can never finish a purge and `lease.py` never lets it sync.
 
 Chunking is by `ctid` and 10 000 rows (§5.9): `ctid` works identically for the
 surrogate-key table and the two composite-key ones, RLS applies to the sub-select as
@@ -49,7 +53,9 @@ from app.services.portals import record_event
 
 __all__ = [
     "CHUNK_ROWS",
+    "INCOMPLETE_RETRY_SECONDS",
     "PurgeOutcome",
+    "outside_incomplete_cooldown",
     "purge_crm_contexts",
     "purge_portal_data",
     "purge_rest_log",
@@ -101,6 +107,11 @@ class PurgeOutcome:
     incomplete: bool = False
     #: True when this visit did nothing because a recent visit already failed.
     skipped: bool = False
+    #: True when the final counts were non-zero on a portal that is ACTIVE again: the
+    #: tenant reinstalled during the cleanup (§4.4 step 3) and its live /app/ opens wrote
+    #: rows after the deletes. Not a failure - see `purge_portal_data` - but recorded so
+    #: `purge_done` never claims an emptiness it did not observe.
+    live_rows_after_reinstall: bool = False
     #: Bodies of `rest_log` rows blanked by `purge_bodies` (§5.9, data[CLEAN]=1).
     bodies_redacted: int = 0
 
@@ -163,8 +174,41 @@ async def _count(table: Table, portal_id: int) -> int:
         )
 
 
+def _cooldown_cutoff() -> dt.datetime:
+    """A `purge_incomplete` older than this no longer holds a portal back."""
+    return dt.datetime.now(dt.UTC) - dt.timedelta(seconds=INCOMPLETE_RETRY_SECONDS)
+
+
+def outside_incomplete_cooldown() -> ColumnElement[bool]:
+    """`_recently_failed` as a WHERE clause over `portal_sync`, for §5.9's tick.
+
+    WHY the cooldown has to exist as a predicate and not only as a check inside the
+    job: §5.9 (b) gives the tick ONE purge slot per visit and picks the portal with
+    `SELECT id FROM portals WHERE purge_pending LIMIT 1`. A selection that cannot see
+    the cooldown spends that slot on a portal `purge_portal_data` will only skip, so
+    every other uninstalled tenant waits out this portal's full hour - and unbounded
+    when the hour keeps being renewed (a reinstalled portal whose /app/ opens keep
+    re-arming it). Selection and cooldown must be the same rule, evaluated in the same
+    statement; that is what makes "picks purge work on every visit" true again.
+
+    The caller must join `portal_sync`; a portal without one (or without an error)
+    is never in cooldown, hence the NULL arms.
+    """
+    return or_(
+        PortalSync.last_error_code.is_(None),
+        PortalSync.last_error_code != _PURGE_INCOMPLETE,
+        PortalSync.last_error_at.is_(None),
+        PortalSync.last_error_at <= _cooldown_cutoff(),
+    )
+
+
 async def _recently_failed(portal_id: int) -> bool:
-    """True while a `purge_incomplete` from the last hour should still be left alone."""
+    """True while a `purge_incomplete` from the last hour should still be left alone.
+
+    Kept as a defensive backstop now that `outside_incomplete_cooldown()` filters the
+    tick's selection: `run_now("purge_portal", ...)` and any future dispatcher reach
+    `purge_portal_data` directly, and the pacing must hold for them too.
+    """
     async with control_txn() as session:
         row = (
             await session.execute(
@@ -175,8 +219,16 @@ async def _recently_failed(portal_id: int) -> bool:
         ).one_or_none()
     if row is None or row.last_error_code != _PURGE_INCOMPLETE or row.last_error_at is None:
         return False
-    age = dt.datetime.now(dt.UTC) - row.last_error_at
-    return bool(age.total_seconds() < INCOMPLETE_RETRY_SECONDS)
+    return bool(row.last_error_at > _cooldown_cutoff())
+
+
+async def _portal_is_active(portal_id: int) -> bool:
+    """Has the tenant come back? §4.4 step 3's "reinstall during cleanup"."""
+    async with control_txn() as session:
+        status = (
+            await session.execute(select(Portal.status).where(Portal.id == portal_id))
+        ).scalar_one_or_none()
+    return status == "active"
 
 
 async def purge_portal_data(portal_id: int, *, force: bool = False) -> PurgeOutcome:
@@ -254,8 +306,35 @@ async def purge_portal_data(portal_id: int, *, force: bool = False) -> PurgeOutc
             incomplete = True
 
     final_counts = {table.name: await _count(table, portal_id) for table in _TENANT_TABLES}
+    live_rows_after_reinstall = False
     if any(final_counts.values()):
-        incomplete = True
+        # RECONCILING §5.9 rule 3 WITH §4.4 step 3. Rule 3 ("a final count must be 0")
+        # exists to catch a delete that silently did nothing - it assumes nobody else is
+        # writing, which is true for an *uninstalled* tenant. But §4.4 step 3 explicitly
+        # blesses `purge_pending=true` on an ACTIVE portal ("reinstall during cleanup ->
+        # continue"), and that portal's /app/ opens write `employees` (upsert_viewer) and
+        # `crm_contexts` under tenant context with no purge check. A row that lands
+        # between a table's last 0-row DELETE and this count is the NEW install's data,
+        # not a purge that failed - and calling it a failure is expensive: `purge_pending`
+        # stays set, so `lease.py` refuses to lease the portal and the tenant does not
+        # sync at all (empty dashboard, nothing errors), while every later open re-arms
+        # the same hour. The purge would never converge against a live tenant.
+        #
+        # The evidence that the purge did its job is unaffected: rule 2 (pre-count > 0
+        # with a 0-row first DELETE) and the chunk-limit guard above both set `incomplete`
+        # on their own, and each delete loop only ended after a chunk came back empty
+        # under this tenant's context. Only the re-verification is relaxed, and only while
+        # the tenant is demonstrably back and writing. An uninstalled portal keeps the
+        # strict rule, because for it a non-zero count has no legitimate author.
+        live_rows_after_reinstall = await _portal_is_active(portal_id)
+        if live_rows_after_reinstall:
+            log.warning(
+                "purge: rows written by a reinstalled tenant after the deletes; "
+                "the pre-uninstall rows are gone, finishing (§4.4 step 3)",
+                extra={"portal_id": portal_id, "final_counts": final_counts},
+            )
+        else:
+            incomplete = True
 
     bodies_redacted = 0
     if purge_bodies and not incomplete:
@@ -269,6 +348,7 @@ async def purge_portal_data(portal_id: int, *, force: bool = False) -> PurgeOutc
         deleted=deleted,
         final_counts=final_counts,
         incomplete=incomplete,
+        live_rows_after_reinstall=live_rows_after_reinstall,
         bodies_redacted=bodies_redacted,
     )
     await _finish(outcome)
@@ -282,6 +362,7 @@ async def _finish(outcome: PurgeOutcome) -> None:
         "deleted": outcome.deleted,
         "final_counts": outcome.final_counts,
         "bodies_redacted": outcome.bodies_redacted,
+        "live_rows_after_reinstall": outcome.live_rows_after_reinstall,
     }
     async with control_txn() as session:
         if outcome.incomplete:

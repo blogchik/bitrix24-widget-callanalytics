@@ -86,12 +86,18 @@ Two branches, and the difference between them is the whole workflow.
 | Branch | What it is | What may push to it |
 | --- | --- | --- |
 | `dev` | Where the work happens. The default branch: a clone lands here and a new pull request targets it. | Anyone with write access, directly. It cannot be force-pushed or deleted. |
-| `main` | The deployment branch. What is on it is what is in production, or about to be. | Nothing directly. A pull request from `dev`, with every CI check green and a linear history. |
+| `main` | The deployment branch. What is on it is what is in production, or about to be. | Nothing directly. A pull request from `dev`, with every CI check green. |
 
 A change therefore travels: `dev` — pull request — CI — `main` — images published — a
 human approves the deployment — the host pulls. Nothing skips a step, and the last two
 are separate on purpose: publishing an image is cheap and reversible, and putting it in
 front of other companies' telephony data is neither.
+
+A promotion is merged with a **merge commit**, not squashed and not rebased. Both of
+those rewrite commit shas, and a sha is the unit of deployment here: `deploy <sha>` and
+`rollback` name commits, and `/var/lib/callanalytics/current` records one. A history where
+the sha that was deployed cannot be checked out is a history that cannot answer the only
+question that matters during an incident.
 
 ### What CI checks
 

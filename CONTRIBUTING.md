@@ -20,7 +20,8 @@ open an issue, a pull request or a discussion for it.
 
 `dev` is the default branch and where all work happens. `main` is the deployment branch:
 merging into it publishes container images and offers them to the production host, so it
-is protected — pull request required, linear history, every CI check green.
+is protected — pull request required, every CI check green, conversations resolved, no
+force push.
 
 Branch from `dev`, open the pull request against `dev`. Promoting `dev` to `main` is a
 separate, deliberate pull request that a maintainer opens when a batch is ready to ship.

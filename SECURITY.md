@@ -253,8 +253,9 @@ Worth knowing, because "can you make the deployment do something it should not" 
 question about a real attack surface, and the answer is bounded deliberately.
 
 - **`main` is the only branch that deploys, and nothing pushes to it directly.** It is a
-  protected branch: pull request required, linear history required, every CI check green,
-  no force push, no deletion.
+  protected branch: pull request required, every CI check green, conversations resolved,
+  no force push, no deletion. Promotions are merged rather than squashed or rebased, so
+  every deployed sha remains a commit you can check out and read.
 - **Images are built on the GitHub runner, never on the host.** The production box is
   shared with five unrelated projects; a build there costs both its cores. The host only
   pulls a tag.

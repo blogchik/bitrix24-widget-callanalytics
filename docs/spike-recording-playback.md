@@ -1,8 +1,10 @@
 # Recording playback spike
 
-**Status: not yet run — needs a real Bitrix24 portal with recorded calls.**
-`RECORDING_MODE` stays `off` until this document carries a result, and the call table
-ships a "has recording" icon with an "open in Bitrix24" link instead of a player.
+**Status: run 2026-09-08 against a real portal. Partially answered.**
+The REST and network half is settled and recorded under [Results](#results). Two questions
+remain open: playback from inside the Bitrix24 iframe in a real browser, and the behaviour of
+a portal using **built-in** Bitrix24 telephony, for which this portal supplied no data.
+`RECORDING_MODE` stays `off` until the browser half is walked.
 
 This is the protocol of `docs/architecture.md` §9, turned into a runnable checklist.
 Fill in the Results section as you go and record raw output, not conclusions.
@@ -139,5 +141,96 @@ Expect `insufficient_scope`. Record the exact error.
 
 ## Results
 
-_Not yet run. Record the date, the portal, the browser versions, and the raw output of
-every step above._
+Run 2026-09-08 on the first real portal (`member_id` 9aa34dc6…, licence `kz_pro100`), from the
+production deployment, using the app's own admin-proven token. 7 275 calls cached, 3 209 with a
+recording.
+
+### The finding that changes the design
+
+**The recordings are not on a `*.bitrix24.*` host at all.** Every one of the 3 209 lives on the
+telephony provider:
+
+| Line | Calls | With a recording | Recording host |
+| --- | --- | --- | --- |
+| Телефония Сипуни (`rest_app`) | 7 266 | 3 209 | `sipuni.com` |
+| Built-in Bitrix24 telephony | 9 | 0 | — |
+
+The URL is `https://sipuni.com/api/crm/record?id=<17>&hash=<32>&user=<6>`. §9 was written around
+the assumption that the audio sits on the customer's own Bitrix24 domain and that the viewer's
+portal session is what unlocks it. For this portal, and for any portal running an external
+provider, that assumption is simply wrong — and `REST_APP_ID` already tells us which case we are in.
+
+### Step 1 — what is in the URL
+
+No Bitrix24 credential. The parameters are `id`, `hash` and `user`; nothing matching
+`auth|token|sig|key|secret`. So the specific danger §9 guarded against — handing a portal access
+token to every viewer — does not arise for this provider.
+
+What is there instead is a **32-character `hash` that is the only gate**. A request with the hash
+mutated returns 500; a request with the correct hash returns the audio to anyone, from anywhere,
+with no session and no cookie. The URL is a bearer capability with no expiry we can observe.
+
+Two consequences follow, and both matter more than the original worry:
+
+1. **Bitrix24's "Call recording: listen" permission is not enforced on this path at all.**
+   Sipuni has never heard of it. §4.7 and §9 both assume that using the viewer's own token makes
+   Bitrix24 enforce that right; against an external provider there is no Bitrix24 request in the
+   chain to enforce anything. Whatever we ship, *our* `scope_filter` is the only access control.
+2. **The stored `call_record_url` is a live credential.** The parser strips `auth`, `token`, `sig`
+   and `access_token`; `hash` is not in that list, and must not be, because stripping it would
+   make the URL useless for the proxy. So `calls.call_record_url` is a table of permanent
+   listen-links. The design already forbids returning it to the browser and redacts it in logs;
+   that rule is now load-bearing rather than precautionary.
+
+### Step 2 — can a browser play it directly
+
+Probed from the production server, which has no relationship to the portal and carried no
+Bitrix24 session:
+
+```
+HEAD                  -> 200
+  content-type:  audio/mpeg
+  content-length: 504000
+  accept-ranges: bytes
+  cache-control: no-cache
+GET Range: bytes=0-1023 -> 206
+  content-range: bytes 0-1023/504000
+HEAD with a mutated hash -> 500
+```
+
+Correct media type, byte ranges honoured, so seeking works. No `Access-Control-Allow-Origin`
+header, which does not block a plain `<audio src>` (media elements load cross-origin without CORS
+unless the page needs to read the samples). **Technically option 1 would play.**
+
+### Step 4 — the scope wall
+
+`disk.file.get` with the portal token returns `insufficient_scope`, as expected without the
+`disk` scope. Confirmed, and moot for this provider: the audio never touches Bitrix24 Disk.
+
+### Decision
+
+**`RECORDING_MODE=proxy`** for external-provider portals, and the reason is not capability but
+containment.
+
+Option 1 works technically and costs us no bandwidth, but it puts a permanent, unauthenticated
+listen-link into the browser, where it survives in devtools, history, a copied link and a shared
+screenshot. Since the provider enforces nothing, that link is the whole security boundary for a
+customer's recorded phone calls. The proxy keeps it server-side and makes our own `scope_filter`
+the gate — which, per the finding above, is the only gate that exists on this path anyway.
+
+`redirect` is refused for the same reason, notwithstanding that the URL carries no Bitrix24 token:
+redirecting hands the browser the same permanent capability.
+
+### Still open
+
+1. **Playback inside the Bitrix24 iframe, in a real browser.** Everything above was measured with
+   an HTTP client. Chrome, Firefox and Safari each need one pass through the real portal, and
+   Safari's third-party rules are the likely source of any surprise. This is the reason
+   `RECORDING_MODE` stays `off`.
+2. **Built-in Bitrix24 telephony.** This portal's nine built-in calls have no recordings, so the
+   original §9 question — is the Bitrix24 record URL credential-bearing, and does it need a portal
+   session — is still unanswered. A portal on built-in telephony has to answer it.
+3. **Whether `RECORDING_MODE` should be per-provider rather than per-deployment.** `REST_APP_ID` is
+   already stored per call, so the app can tell the two cases apart at playback time. If the
+   built-in case turns out to need a different mechanism, one global switch will not do. That is a
+   design change, not a configuration change, and should be decided once question 2 is answered.

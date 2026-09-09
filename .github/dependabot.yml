@@ -42,6 +42,16 @@ updates:
         update-types: ['version-update:semver-major']
       - dependency-name: react-dom
         update-types: ['version-update:semver-major']
+      # Added after the first weekly batch arrived. Grouped with the other tooling, a
+      # Tailwind or TypeScript major produces one pull request that can never be merged
+      # as it stands and is re-opened every Monday. Tailwind 4 replaces the JavaScript
+      # config with a CSS-first one and moves the PostCSS plugin, which would silently
+      # restyle a UI that is measured at four viewport widths; TypeScript 7 is the native
+      # port. Each is worth adopting, each on its own, deliberately.
+      - dependency-name: tailwindcss
+        update-types: ['version-update:semver-major']
+      - dependency-name: typescript
+        update-types: ['version-update:semver-major']
 
   # --- the API -----------------------------------------------------------------------
   # `pyproject.toml` already carries deliberate upper bounds ("a surprise major of
@@ -78,6 +88,17 @@ updates:
       timezone: Asia/Tashkent
     commit-message:
       prefix: 'chore(deps)'
+    ignore:
+      # Dependabot offers the newest tag; these images track an LTS line instead, which
+      # is a different thing and one it cannot see. It proposed `node:26-alpine` while
+      # `node:lts-alpine` was still 24, and `python:3.14-slim`, on which `asyncpg` has no
+      # wheel - so pip falls back to compiling and the slim image has no compiler.
+      # Minor and patch updates of the pinned line are still wanted; the major is a
+      # decision about which support window we are on.
+      - dependency-name: node
+        update-types: ['version-update:semver-major']
+      - dependency-name: python
+        update-types: ['version-update:semver-major']
 
   # --- the workflows themselves ------------------------------------------------------
   # Every action in .github/workflows is pinned to a commit sha, which is the right thing

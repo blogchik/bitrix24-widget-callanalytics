@@ -163,7 +163,11 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          # The same major `web/Dockerfile` pins, and that is the whole requirement.
+          # When they differed, npm 10 and npm 11 disagreed about one lockfile entry, so
+          # a Dependabot pull request that npm 11 accepted failed `npm ci` here for a
+          # reason that had nothing to do with the dependency it was bumping.
+          node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -186,6 +190,16 @@ jobs:
         # `overrides` entry with a comment - see the postcss entry in package.json -
         # not a lowered threshold.
         run: npm audit --audit-level=high
+
+      - name: Build the image that actually ships
+        # The steps above run on the bare runner, which is fast and is what gives a
+        # TypeScript error back in a minute. But it means nothing here was building
+        # `web/Dockerfile`, and a base-image change is invisible to every check above:
+        # a pull request moving `FROM node:22-alpine` to a Node major that does not
+        # exist yet would have gone green. CD would have caught it, on `main`, after
+        # the merge.
+        working-directory: .
+        run: docker build -t callanalytics-web:ci ./web
 
   # ---------------------------------------------------------------------------------
   # Blocks a pull request that ADDS a vulnerable or badly-licensed dependency, which is

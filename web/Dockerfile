@@ -4,7 +4,7 @@
 # because `next dev` needs the full node_modules the runner deliberately omits.
 
 # ---------------------------------------------------------------- deps
-FROM node:22-alpine AS deps
+FROM node:24-alpine AS deps
 WORKDIR /app
 # Copy manifests only, so a source edit does not re-resolve the dependency tree.
 COPY package.json package-lock.json* ./
@@ -13,7 +13,7 @@ COPY package.json package-lock.json* ./
 RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
 # ---------------------------------------------------------------- build
-FROM node:22-alpine AS build
+FROM node:24-alpine AS build
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY --from=deps /app/node_modules ./node_modules
@@ -22,7 +22,7 @@ COPY . .
 RUN mkdir -p public && npm run build
 
 # ---------------------------------------------------------------- runner
-FROM node:22-alpine AS runner
+FROM node:24-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \

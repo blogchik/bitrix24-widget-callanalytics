@@ -167,6 +167,14 @@ it as the break-glass path — but it is no longer how anything normally ships.
 | [docs/spike-recording-playback.md](docs/spike-recording-playback.md) | The playback protocol, ready to run on a real portal |
 | [docs/deployment.md](docs/deployment.md) | First deploy, upgrade, rollback, backups, and the operator's reference |
 
+## Licence
+
+MIT — see [LICENSE](LICENSE). Use it, fork it, run your own copy; the only thing asked is
+that the notice travels with it.
+
+The Bitrix24 Marketplace listing for `texnobus.callanalytics` is a separate matter: the
+licence covers this source, not the published app or the instance at `b24.texnobus.uz`.
+
 ## Configuration
 
 Every setting is an environment variable and every one is documented in `.env.example`.

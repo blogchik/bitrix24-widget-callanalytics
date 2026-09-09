@@ -179,20 +179,63 @@ jobs:
         # recognise is refused. There is no shell at the other end of this.
         run: ssh -o BatchMode=yes -o ConnectTimeout=15 "$USER@$HOST" "deploy $SHA"
 
+      - name: Confirm the host is serving the commit we just shipped
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          SHA: ${{ needs.publish.outputs.sha }}
+        # `deploy` already verified health from inside the network. This asserts the
+        # thing it cannot: that what came up is the tag we asked for, and not the tag
+        # that happened to be there when a pull silently failed.
+        run: |
+          set -euo pipefail
+          state=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$USER@$HOST" "status")
+          printf '%s\n' "$state"
+          case "$state" in
+            *"$SHA"*) echo "host is on $SHA" ;;
+            *) echo "::error::the host is not running $SHA"; exit 1 ;;
+          esac
+
       - name: Smoke-test the public URL
         # From outside, through Cloudflare and the tunnel, because that is the path a
         # portal takes. `/settings` is the one worth keeping: routing it to the API
         # instead of the SPA returned raw JSON inside the iframe once, and a moderator
         # would have seen it before we did.
+        #
+        # Every check captures the response and matches it with `case`, with no pipe
+        # anywhere. `curl ... | grep -q` looks obvious and is a trap: `grep -q` exits the
+        # moment it matches, the pipe closes under curl, curl dies with exit 23 ("failed
+        # writing body"), and `pipefail` makes that the exit code of the whole step. The
+        # first run of this pipeline failed exactly that way against a perfectly healthy
+        # deployment, and then tried to roll it back.
         run: |
           set -euo pipefail
-          curl -fsS --max-time 20 https://b24.texnobus.uz/healthz | grep -q '"status":"ok"'
-          code=$(curl -fsS --max-time 20 -o /dev/null -w '%{http_code}' https://b24.texnobus.uz/)
-          [ "$code" = "200" ]
-          curl -fsSI --max-time 20 https://b24.texnobus.uz/ | grep -qi '^x-frame-options' \
-            && { echo 'X-Frame-Options is back; every portal iframe is now broken'; exit 1; } || true
-          curl -fsS --max-time 20 "https://b24.texnobus.uz/settings?DOMAIN=x.bitrix24.kz&PROTOCOL=1" \
-            | head -c 200 | grep -q '<!DOCTYPE html>'
+          base=https://b24.texnobus.uz
+
+          health=$(curl -fsS --max-time 20 "$base/healthz")
+          case "$health" in
+            *'"status":"ok"'*) ;;
+            *) echo "::error::/healthz answered: $health"; exit 1 ;;
+          esac
+
+          code=$(curl -fsS --max-time 20 -o /dev/null -w '%{http_code}' "$base/")
+          [ "$code" = "200" ] || { echo "::error::the SPA answered $code"; exit 1; }
+
+          headers=$(curl -fsSI --max-time 20 "$base/")
+          case "$headers" in
+            *[Xx]-[Ff]rame-[Oo]ptions*)
+              echo '::error::X-Frame-Options is back; every portal iframe is now broken'
+              exit 1 ;;
+          esac
+
+          # The path a moderator walks. It must reach the SPA and return HTML; routing it
+          # to the API returns JSON, which renders as a raw error inside the iframe.
+          settings=$(curl -fsS --max-time 20 "$base/settings?DOMAIN=x.bitrix24.kz&PROTOCOL=1")
+          case "$settings" in
+            '<!DOCTYPE html>'*) ;;
+            *) echo "::error::/settings did not return HTML: ${settings:0:120}"; exit 1 ;;
+          esac
+
           echo 'smoke test passed'
 
       - name: Roll back
@@ -202,10 +245,22 @@ jobs:
           USER: ${{ secrets.DEPLOY_USER }}
         # Images are tagged, so this is a tag change and needs no build: it is the one
         # recovery here that costs no CPU and no disk on a host shared with five other
-        # projects. Losing the rollback too is a page, not a retry.
+        # projects.
+        #
+        # A rollback that itself fails must not look like a rollback that worked. The
+        # host refuses to roll back to a tag that is not in the registry rather than
+        # half-applying one, so the previous release is still running - but nobody should
+        # have to read the log to find that out.
         run: |
-          ssh -o BatchMode=yes -o ConnectTimeout=15 "$USER@$HOST" "rollback"
-          echo '::error::deployment failed and was rolled back to the previous image tag'
+          if ssh -o BatchMode=yes -o ConnectTimeout=15 "$USER@$HOST" "rollback"; then
+            echo '::error::deployment failed and was rolled back to the previous image tag'
+          else
+            echo '::error::deployment failed AND the rollback did not run. The host refused'
+            echo '::error::it rather than half-applying it, so the previous release should'
+            echo '::error::still be serving - but verify by hand before doing anything else:'
+            echo '::error::  ssh <host> status   and   curl https://b24.texnobus.uz/healthz'
+            exit 1
+          fi
 
       - name: What is running now
         if: always()

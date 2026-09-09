@@ -3,7 +3,7 @@ name = "callanalytics-api"
 version = "0.1.0"
 description = "Call Analytics for Bitrix24 - FastAPI backend and sync worker"
 requires-python = ">=3.12"
-license = { text = "Proprietary" }
+license = { text = "MIT" }
 
 # Upper bounds are deliberate: this app is pinned to one Bitrix24 contract and a
 # surprise major of SQLAlchemy, pydantic or httpx must be an explicit decision.

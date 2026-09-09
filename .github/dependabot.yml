@@ -52,6 +52,12 @@ updates:
         update-types: ['version-update:semver-major']
       - dependency-name: typescript
         update-types: ['version-update:semver-major']
+      # `@types/node`'s major IS a Node major. It has to match the runtime in
+      # `web/Dockerfile`, not lead it: types describing Node 26 on a Node 24 runtime let
+      # `tsc` accept calls to APIs that will not be there. It moves when the base image
+      # moves, in the same commit.
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
 
   # --- the API -----------------------------------------------------------------------
   # `pyproject.toml` already carries deliberate upper bounds ("a surprise major of

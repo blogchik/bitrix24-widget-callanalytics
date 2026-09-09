@@ -104,12 +104,15 @@ question that matters during an incident.
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml), four jobs in parallel so a
 TypeScript error and a failing migration are not the same red X:
 
-- **Invariants** — the message catalogues carry the same keys *and* the same ICU
-  placeholders in every language ([`tools/check-i18n.mjs`](tools/check-i18n.mjs)), and the
-  production compose render publishes no port, mounts no source tree over an image,
-  carries a real `IMAGE_TAG` and still splits `api` from `web`
-  ([`tools/check-compose.sh`](tools/check-compose.sh)). Both of those were being done by
-  eye, and both had already been got wrong once.
+- **Invariants** — three checks that were being done by eye, each of which had already
+  been got wrong once:
+  [`check-i18n.mjs`](tools/check-i18n.mjs) (the catalogues carry the same keys *and* the
+  same ICU placeholders in every language),
+  [`check-compose.sh`](tools/check-compose.sh) (the production render publishes no port,
+  mounts no source tree over an image, carries a real `IMAGE_TAG`, and still splits `api`
+  from `web`), and
+  [`check-actions.sh`](tools/check-actions.sh) (every action is pinned to a commit sha and
+  none runs on a Node version GitHub has deprecated).
 - **API** — builds the image, applies the migrations, asserts the three tenancy
   properties they must produce against the database they actually produced, runs the
   migrations *down to base and back up* because `downgrade()` is the rollback path and is

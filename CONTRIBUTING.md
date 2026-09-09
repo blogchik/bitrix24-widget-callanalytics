@@ -48,6 +48,7 @@ docker compose run --rm api sh -c "ruff check . && mypy app"
 cd web && npx tsc --noEmit && npm run build && npm audit --audit-level=high
 node tools/check-i18n.mjs                            # catalogues agree
 ./tools/check-compose.sh                             # production render is still sane
+GH_TOKEN=$(gh auth token) ./tools/check-actions.sh   # actions pinned, runtimes current
 ```
 
 For anything visual, also run the audit at four viewport widths —

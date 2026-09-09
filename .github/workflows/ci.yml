@@ -41,8 +41,12 @@ jobs:
     steps:
       # v7, not v4: actions/checkout@v4 declares `using: node20`, and GitHub-hosted
       # runners now force those actions onto Node 24 while warning that Node 20 is
-      # deprecated. Pinned by commit SHA rather than by tag - a tag is mutable, and an
-      # action is code this workflow executes with the repository checked out.
+      # deprecated. Every action used anywhere in this repository is on a major that
+      # declares `node24` for the same reason - `tools/check-actions.sh` asserts it.
+      #
+      # Pinned by commit SHA rather than by tag: a tag is mutable, and an action is code
+      # this workflow executes with the repository checked out. The trailing comment is
+      # what makes the sha readable, and Dependabot rewrites both together.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Message catalogues agree
@@ -59,6 +63,16 @@ jobs:
         # Publishes nothing, no source tree mounted over an image, images actually
         # carry IMAGE_TAG, and the ingress still splits api from web.
         run: ./tools/check-compose.sh
+
+      - name: Actions are pinned, and none is on a deprecated runtime
+        # Turns two warnings into a failing check while they are still warnings. A
+        # floating `@v4` is a mutable reference to code that runs with this repository
+        # checked out - and, in the deploy pipeline, alongside a key that can restart
+        # production. A `using: node20` action is currently shimmed onto Node 24 by the
+        # runner; when that shim goes, the pipeline is what discovers it.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./tools/check-actions.sh
 
   # ---------------------------------------------------------------------------------
   # The API: migrations, the tenancy invariants they must produce, the suite, and the

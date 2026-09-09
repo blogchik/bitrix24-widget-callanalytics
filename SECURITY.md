@@ -238,8 +238,11 @@ So you know what is covered before you spend time on it:
   findings are reported to code scanning rather than to a log nobody reads.
 - **Secret scanning with push protection is on**, so a token in a commit is rejected at
   `git push` rather than discovered afterwards.
-- **Every action is pinned to a commit sha**, not to a tag. A tag is mutable and an action
-  is code that runs with this repository checked out.
+- **Every action is pinned to a commit sha**, not to a tag, and CI fails if one is not.
+  A tag is mutable, and an action is code that runs with this repository checked out — in
+  the deploy pipeline, alongside a key that can restart production. The same check fails
+  an action running on a Node runtime GitHub has deprecated, so the pipeline is not what
+  discovers that the runner stopped shimming it.
 - **A log trail designed to be safe**: request query strings and `Location` response headers
   are dropped from the proxy's access log, the session JWT travels only in a URL fragment,
   and `/api/v1/session/exchange` and `/api/v1/portal/reauthorize` bodies are excluded from

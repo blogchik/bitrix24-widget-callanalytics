@@ -1,0 +1,83 @@
+# Bring `main` back into `dev` after every promotion.
+#
+# ## Why this has to exist
+#
+# `main` requires its status checks with `strict: true` - GitHub's "require branches to be
+# up to date before merging". So `dev` must contain every commit on `main` before it can
+# be merged into it.
+#
+# Merging a promotion creates a merge commit ON `main` that `dev` does not have. Its diff
+# against its second parent - `dev` - is empty; it carries no content at all. But it is a
+# commit, and `strict` counts commits. So the moment one promotion lands, the next one is
+# blocked with "This branch is out-of-date with the base branch", and stays blocked until
+# somebody presses Update branch. Forever, on a branch model where `main` cannot contain
+# anything `dev` lacks.
+#
+# ## Why not simply turn `strict` off
+#
+# Because it guards one case that is real: a hotfix pushed straight to `main`. Branch
+# protection there does not enforce against administrators, deliberately, so that a
+# production emergency is not gated behind a pull request. If that ever happens, `main`
+# holds content `dev` does not, and `strict` is what stops the next promotion from
+# silently reverting it.
+#
+# This workflow keeps that guarantee and removes the busywork: the ordinary case (a merge
+# commit and nothing else) is merged back automatically, and the case worth a human - a
+# back-merge that conflicts, which means `main` and `dev` really have diverged - fails
+# loudly instead of being clicked past.
+
+name: Sync dev
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: sync-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  back-merge:
+    name: Merge main into dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Both branches and their full history: a merge needs the merge base, and a
+          # shallow clone does not have one.
+          ref: dev
+          fetch-depth: 0
+
+      - name: Merge and push
+        env:
+          # The default token. A push it makes does not trigger further workflows, which
+          # is what stops this from re-triggering itself.
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo 'dev already contains main; nothing to do.'
+            exit 0
+          fi
+
+          if ! git merge --no-ff origin/main -m 'Merge main into dev (automatic back-merge after a promotion)'; then
+            git merge --abort || true
+            echo '::error::main and dev have genuinely diverged and the back-merge conflicts.'
+            echo '::error::That means content reached main without going through dev - most'
+            echo '::error::likely a hotfix pushed directly. Resolve it by hand:'
+            echo '::error::  git checkout dev && git merge origin/main'
+            exit 1
+          fi
+
+          git push origin HEAD:dev
+          echo "dev is now up to date with main ($(git rev-parse --short origin/main))."

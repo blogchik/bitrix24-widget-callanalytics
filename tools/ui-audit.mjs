@@ -147,7 +147,24 @@ for (const vp of VIEWPORTS) {
           el.parentElement?.closest(
             'button, a, select, input, textarea, [role="button"], [role="option"], [role="tab"]',
           ) === null);
-      if (tappable && (r.width < floor || r.height < floor)) {
+
+      // WCAG 2.5.8 exempts a target that sits INSIDE a sentence, and it is right to: a
+      // link in the middle of a paragraph cannot be 44px tall without breaking the line
+      // spacing of the text around it. The exemption is narrow - the link has to be
+      // inline AND its block must carry text that is not the link - so a link alone in
+      // its own line is still measured, because that one is navigation and someone will
+      // aim at it.
+      const inlineInProse =
+        el.tagName === 'A' &&
+        style.display.startsWith('inline') &&
+        (() => {
+          const block = el.closest('p, li, td, dd, blockquote, figcaption');
+          if (!block) return false;
+          const all = (block.textContent || '').trim();
+          const mine = (el.textContent || '').trim();
+          return all.length > mine.length + 1;
+        })();
+      if (tappable && !inlineInProse && (r.width < floor || r.height < floor)) {
         out.smallTargets.push(`${describe(el)} [${Math.round(r.width)}×${Math.round(r.height)}]`);
       }
     }

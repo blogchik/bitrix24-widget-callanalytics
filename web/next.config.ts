@@ -21,6 +21,16 @@ const nextConfig: NextConfig = {
   // `false`, not the `{appIsrStatus, buildActivity}` pair this used to be: Next 15.2
   // collapsed those two flags into one boolean and warns on the old shape.
   devIndicators: false,
+
+  async redirects() {
+    return [
+      // The Marketplace listing, an email and a customer's bookmark will not agree on
+      // which side of the Atlantic spells it which way, and a 404 on the licence link
+      // of a listing under moderation is an expensive way to find that out.
+      { source: '/license', destination: '/licence', permanent: true },
+      { source: '/privacy-policy', destination: '/privacy', permanent: true },
+    ];
+  },
 };
 
 export default withNextIntl(nextConfig);

@@ -21,10 +21,10 @@ export const metadata: Metadata = {
   description:
     'Условия использования приложения «Аналитика звонков» для Битрикс24 (texnobus.callanalytics).',
   robots: { index: true, follow: true },
-  alternates: { canonical: 'https://b24.texnobus.uz/licence' },
+  alternates: { canonical: 'https://b24.texnobus.uz/license' },
 };
 
-export default function LicencePage() {
+export default function LicensePage() {
   return (
     <LegalDocument
       title="Лицензионное соглашение"

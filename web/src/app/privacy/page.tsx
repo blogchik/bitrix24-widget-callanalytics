@@ -33,7 +33,7 @@ export default function PrivacyPage() {
           Редакция от 9 сентября 2026 г.
         </>
       }
-      sibling={{ href: '/licence', label: 'Лицензионное соглашение' }}
+      sibling={{ href: '/license', label: 'Лицензионное соглашение' }}
     >
       <h2>1. Кто обрабатывает данные</h2>
       <p>

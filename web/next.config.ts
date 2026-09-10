@@ -24,10 +24,9 @@ const nextConfig: NextConfig = {
 
   async redirects() {
     return [
-      // The Marketplace listing, an email and a customer's bookmark will not agree on
-      // which side of the Atlantic spells it which way, and a 404 on the licence link
-      // of a listing under moderation is an expensive way to find that out.
-      { source: '/license', destination: '/licence', permanent: true },
+      // The licence agreement has one address, /license, and no alias: the owner does not
+      // want a second spelling of it in circulation. Only the privacy policy keeps its
+      // longer form redirecting, because that one is a wording, not a spelling.
       { source: '/privacy-policy', destination: '/privacy', permanent: true },
     ];
   },

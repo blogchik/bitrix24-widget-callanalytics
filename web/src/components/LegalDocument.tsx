@@ -55,8 +55,8 @@ export function LegalDocument({ title, subtitle, sibling, children }: LegalDocum
             <a href={sibling.href}>{sibling.label}</a>
           </p>
           <p className="ca-legal-sig">
-            Джабборов Абдурозик · <a href="mailto:support@texnobus.uz">support@texnobus.uz</a> ·
-            b24.texnobus.uz
+            Jabborov Abduroziq Narimon o'g'li ·{' '}
+            <a href="mailto:support@texnobus.uz">support@texnobus.uz</a> · b24.texnobus.uz
           </p>
         </footer>
       </article>

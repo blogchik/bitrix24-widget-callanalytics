@@ -327,6 +327,7 @@ async def _employee_names(
                 Employee.name,
                 Employee.last_name,
                 Employee.second_name,
+                Employee.phone_inner,
                 Employee.active,
                 Employee.found,
             ).where(Employee.portal_id == portal_id, Employee.bx_user_id.in_(user_ids))
@@ -336,6 +337,10 @@ async def _employee_names(
         int(row.bx_user_id): {
             "id": int(row.bx_user_id),
             "name": _display_name(row),
+            # §7: the internal extension, beside the name wherever a name is shown. Sent
+            # as its own field rather than folded into `name` - the SPA renders it in a
+            # de-emphasised span, and a caller that wants the bare name still has one.
+            "phone_inner": row.phone_inner,
             "active": bool(row.active),
             "found": bool(row.found),
         }

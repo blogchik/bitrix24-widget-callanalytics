@@ -3,49 +3,73 @@
  *
  * The code -> label maps come from the verified field semantics in
  * `docs/bitrix24-api-research.md`: `CALL_TYPE` is `1 outgoing, 2 incoming,
- * 3 incoming with redirection, 4 callback, 5 informational`, and `CALL_FAILED_CODE` is
- * a *string* whose documented values include `603-S` and `OTHER`. Neither map holds a
- * sentence: they return catalogue keys (§8), so every label stays translatable and the
- * one message source keeps its monopoly on user-visible text.
+ * 3 incoming with redirection, 4 callback, 5 informational`. The app shows two of those,
+ * because a portal asks "did it come in or go out", not "by which mechanism": a
+ * redirected call still came in, and a callback is the system dialling out. `5` answers
+ * neither question and is left ungrouped rather than filed under a direction it does not
+ * have - the cell renders a dash and the raw code stays in its title.
+ *
+ * No map here holds a sentence: they return catalogue keys (§8), so every label stays
+ * translatable and the one message source keeps its monopoly on user-visible text.
  */
 
 /** Namespace prefix for `CALL_TYPE` labels in `messages/<locale>.json`. */
 const DIRECTION_PREFIX = 'call.direction.';
 
-/** Namespace prefix for `CALL_FAILED_CODE` labels. */
-const RESULT_PREFIX = 'call.result.';
+/** The `CALL_TYPE` codes behind each direction (`services/stats.py::_DIRECTIONS`). */
+const DIRECTIONS: Readonly<Record<string, ReadonlySet<string>>> = {
+  incoming: new Set(['2', '3']),
+  outgoing: new Set(['1', '4']),
+};
 
-/** Documented `CALL_TYPE` values; anything else is rendered as "unknown". */
-const DIRECTIONS: ReadonlySet<string> = new Set(['1', '2', '3', '4', '5']);
+/** The two directions, in the order the filter offers them. */
+export const DIRECTION_GROUPS = ['incoming', 'outgoing'] as const;
 
-/** Documented `CALL_FAILED_CODE` values (research doc, "(a) CALL_FAILED_CODE values"). */
-const RESULT_CODES: ReadonlySet<string> = new Set([
-  '200',
-  '304',
-  '402',
-  '403',
-  '404',
-  '423',
-  '480',
-  '484',
-  '486',
-  '503',
-  '603',
-  '603-S',
-  'OTHER',
-]);
+export type DirectionGroup = (typeof DIRECTION_GROUPS)[number];
 
-/** Catalogue key for a `CALL_TYPE`. */
-export function directionKey(callType: number | string | null | undefined): string {
+/**
+ * A `CALL_TYPE` as one of the two directions, or `null` for a code that is neither.
+ *
+ * `null` is a real answer and not a gap: `5` (informational) is not a conversation with
+ * a customer, and an unknown future code has no direction we can honestly claim. Both
+ * render as a dash with the raw code in the cell's title.
+ */
+export function directionOf(
+  callType: number | string | null | undefined,
+): DirectionGroup | null {
   const value = callType === null || callType === undefined ? '' : String(callType).trim();
-  return DIRECTION_PREFIX + (DIRECTIONS.has(value) ? value : 'unknown');
+  if (!value) {
+    return null;
+  }
+  return DIRECTION_GROUPS.find((group) => DIRECTIONS[group]?.has(value)) ?? null;
 }
 
-/** Catalogue key for a `CALL_FAILED_CODE`. Codes are strings: `603-S` is real. */
-export function resultKey(failedCode: string | number | null | undefined): string {
-  const value = failedCode === null || failedCode === undefined ? '' : String(failedCode).trim();
-  const upper = value.toUpperCase();
-  return RESULT_PREFIX + (RESULT_CODES.has(upper) ? upper : 'unknown');
+/** Catalogue key for a direction (§8). */
+export function directionKey(group: DirectionGroup): string {
+  return DIRECTION_PREFIX + group;
+}
+
+/**
+ * An employee's name with their internal extension after it (§7).
+ *
+ * One function because the parenthesis rule is a display decision that three views share
+ * - the filter, the call table and the comparison chart - and three copies of it is three
+ * places for it to drift. An extension longer than {@link EXTENSION_MAX_CHARS} is dropped
+ * rather than shown: `UF_PHONE_INNER` is free text and a portal that stores a whole phone
+ * number in it would widen every row that carries one.
+ */
+export const EXTENSION_MAX_CHARS = 8;
+
+export function withExtension(
+  name: string | null | undefined,
+  extension: string | null | undefined,
+): string | null {
+  const label = (name ?? '').trim();
+  if (!label) {
+    return null;
+  }
+  const trimmed = (extension ?? '').trim();
+  return trimmed && trimmed.length <= EXTENSION_MAX_CHARS ? `${label} (${trimmed})` : label;
 }
 
 /** `200` is the only success code; everything else is a failure of some kind. */

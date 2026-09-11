@@ -30,8 +30,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { ApiError, apiFetch } from './api';
 import { getAuth, refreshAuth } from './bx24';
-import { crmEntityPath, directionKey, resultKey } from './format';
-import type { ResultGroup } from './viz';
+import { crmEntityPath, directionKey, directionOf, withExtension } from './format';
+import { seriesLabelKey, type ResultGroup } from './viz';
 
 // ---------------------------------------------------------------------------------
 // Row and page shapes (mirroring `api/app/api/calls.py`)
@@ -41,6 +41,8 @@ import type { ResultGroup } from './viz';
 export interface CallEmployee {
   id: number;
   name?: string | null;
+  /** §7: the internal extension, rendered in parentheses after the name. */
+  phone_inner?: string | null;
   /** §7: dismissed users still own historical calls; the table badges them. */
   active?: boolean | null;
   found?: boolean | null;
@@ -73,7 +75,7 @@ export interface CallRow {
   portal_number?: string | null;
   crm?: CallCrm | null;
   duration?: number | null;
-  /** §3's generated column: `answered` | `missed` | `not_connected`. */
+  /** The collapsed outcome: `answered` | `no_answer` (`services/stats.py`). */
   result_group?: string | null;
   /** The raw `CALL_FAILED_CODE`: `200`, `486`, `603-S`, `OTHER`, or something new. */
   failed_code?: string | null;
@@ -594,17 +596,22 @@ export function recordingFallbackPath(call: CallRow): string {
 // Display helpers
 // ---------------------------------------------------------------------------------
 
-/** §3's `result_group`, re-derived client-side if a projection ever omits it. */
+/**
+ * The call's outcome as one of the two groups, re-derived if a projection omits it.
+ *
+ * The server sends the collapsed value; the fallback reads `CALL_FAILED_CODE` the same
+ * way §3's generated column does. Note which side the default is on: anything that is
+ * not a `200` is "no answer", so a code no build has produced yet lands with the
+ * outcomes rather than in a third state the charts have no band for.
+ */
 export function resultGroupOf(call: CallRow): ResultGroup {
   const given = (call.result_group ?? '').trim();
-  if (given === 'answered' || given === 'missed' || given === 'not_connected') {
+  if (given === 'answered' || given === 'no_answer') {
     return given;
   }
-  const code = (call.failed_code ?? '').trim();
-  if (code === '200') {
-    return 'answered';
-  }
-  return code === '304' ? 'missed' : 'not_connected';
+  // Anything else - §3's stored `missed` / `not_connected` from an older cached response,
+  // or no group at all - is decided by the raw code, exactly as the generated column does.
+  return (call.failed_code ?? '').trim() === '200' ? 'answered' : 'no_answer';
 }
 
 /** A label and its tooltip. */
@@ -615,33 +622,34 @@ export interface Described {
 }
 
 /**
- * `CALL_FAILED_CODE` -> what the cell shows and what its tooltip says.
+ * The outcome as the cell shows it: one of the two words, with the raw code as its title.
  *
- * §3 stores the code raw and enumerates nothing, so there are exactly three cases and
- * none of them is an empty cell:
- *
- *  * a code we have a word for -> the word, with the code in the tooltip;
- *  * a code we do not (a `603-S` from a new build, a provider's own string) -> **the code
- *    itself**, with "undefined result" in the tooltip;
- *  * no code at all -> the "undefined result" word, and no tooltip.
+ * The cell used to name the `CALL_FAILED_CODE` itself - "Busy", "Declined", "Invalid
+ * number" - and that vocabulary is gone from the label, not from the row: `title` still
+ * carries the code, so the distinction is one hover away for anyone who needs it while
+ * the column reads as the same two words as the filter above it and the chart beside it.
  */
 export function describeResult(call: CallRow, translate: Copy): Described {
   const raw = (call.failed_code ?? '').trim();
-  const unknownWord = translate('call.result.unknown');
-  if (!raw) {
-    return { label: unknownWord };
-  }
-  const key = resultKey(raw);
-  if (key === 'call.result.unknown') {
-    return { label: raw, title: unknownWord };
-  }
-  return { label: translate(key), title: raw };
+  return {
+    label: translate(seriesLabelKey(resultGroupOf(call))),
+    title: raw || undefined,
+  };
 }
 
-/** `CALL_TYPE` -> the translated word, with the raw value in the tooltip. */
-export function describeDirection(call: CallRow, translate: Copy): Described {
+/**
+ * `CALL_TYPE` -> one of the two directions, or `null` when it is neither.
+ *
+ * `null` reaches the cell as a dash. An informational call (`5`) is not a conversation
+ * with a customer and a code no build has produced yet has no direction we can claim, so
+ * neither is filed under one - the raw value stays in the title either way.
+ */
+export function describeDirection(call: CallRow, translate: Copy): Described | null {
   const raw = call.call_type === null || call.call_type === undefined ? '' : String(call.call_type);
-  return { label: translate(directionKey(call.call_type)), title: raw || undefined };
+  const group = directionOf(call.call_type);
+  return group === null
+    ? null
+    : { label: translate(directionKey(group)), title: raw || undefined };
 }
 
 /** The employee cell: a cached name, or "User #id" for a placeholder / missing id (§7). */
@@ -652,7 +660,9 @@ export function describeEmployee(call: CallRow, translate: Copy): Described | nu
     // predicate excludes it for the same reason - so an empty cell is the honest answer.
     return null;
   }
-  const name = (call.employee?.name ?? '').trim();
+  // §7: the extension goes beside the name wherever the name is shown, through the one
+  // helper the filter and the comparison chart also use.
+  const name = withExtension(call.employee?.name, call.employee?.phone_inner);
   if (!name) {
     return { label: translate('app.calls.table.employeeUnknown', { id }), title: `#${id}` };
   }
@@ -787,7 +797,7 @@ function interpolate(template: string, values?: Record<string, string | number>)
  * The one translate entry point these views use.
  *
  * It is `useTranslations()` with a seatbelt: a key the catalogue already carries is
- * translated exactly as anywhere else in the app (`call.result.*`, `crm.entity.*`,
+ * translated exactly as anywhere else in the app (`call.direction.*`, `crm.entity.*`,
  * `app.sync.*` all come out of the catalogue), and a key that has not been translated yet
  * renders its English default from {@link NEW_MESSAGE_KEYS} instead of the dotted path
  * next-intl would otherwise print into the frame.

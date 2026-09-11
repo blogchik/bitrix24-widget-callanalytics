@@ -36,9 +36,13 @@ the aggregate (a handful of rows, by primary key) rather than into it, so the sc
 stays on the covering `calls_portal_start_idx` of §3.
 
 **What the columns mean** (§3, §5): `result_group` and `has_record` are GENERATED columns
-- the single server-side definition of answered / missed / not connected and of "has a
-recording". This module never re-derives either from `call_failed_code` or
-`record_file_id`; a second definition is how a filter and a summary card start disagreeing.
+- the single server-side definition of the call outcome and of "has a recording". This
+module never re-derives either from `call_failed_code` or `record_file_id`; a second
+definition is how a filter and a summary card start disagreeing. What it does do, once,
+is COLLAPSE the outcome: §3 generates three values and the app speaks two (`answered` /
+`no_answer`), because "missed" and "not connected" are one answer to the question a call
+list is read to answer. `_ANSWERED_STORED` is the only place the stored vocabulary is
+named, so the filter and the aggregation collapse it identically.
 `rest_app_id` NULL means built-in telephony (§3), which is why the line facet carries an
 explicit `builtin` entry instead of dropping NULLs.
 
@@ -81,12 +85,36 @@ __all__ = [
 
 _log = get_logger(__name__)
 
-#: The three values §3 generates into `calls.result_group`. Spelled out because the SPA
-#: switches on them and the chart specification assigns each one a fixed colour.
+#: The two outcomes the whole app speaks: the call was answered, or it was not.
+#:
+#: §3's generated `result_group` still stores three values and stays the raw storage - it
+#: is derived from `call_failed_code` by the database and nothing here re-derives it. What
+#: collapses is the VOCABULARY: `missed` (304) and `not_connected` (everything else) are
+#: one answer to the only question a sales manager asks of a call list, and splitting them
+#: put a third series on every chart that nobody read. The fine detail is not lost - the
+#: raw `call_failed_code` is still on every row and the table shows it as the cell's title.
+#:
+#: This is deliberately the single place the collapse happens: `facet_predicates` filters
+#: through it and `load_dashboard` counts through it, so the filter and the chart cannot
+#: disagree about what "no answer" means.
 _ANSWERED: Final[str] = "answered"
-_MISSED: Final[str] = "missed"
-_NOT_CONNECTED: Final[str] = "not_connected"
-_RESULT_GROUPS: Final[tuple[str, ...]] = (_ANSWERED, _MISSED, _NOT_CONNECTED)
+_NO_ANSWER: Final[str] = "no_answer"
+_RESULT_GROUPS: Final[tuple[str, ...]] = (_ANSWERED, _NO_ANSWER)
+
+#: The raw value §3 generates for an answered call (`CALL_FAILED_CODE = '200'`). Every
+#: other generated value means "no answer", which is why the predicate below is `!=` and
+#: not a second `IN` list that a new §3 value could silently fall out of.
+_ANSWERED_STORED: Final[str] = "answered"
+
+#: `CALL_TYPE` (research note (a)): 1 outgoing, 2 incoming, 3 incoming with redirection,
+#: 4 callback, 5 informational. The portal cares about two of those: a redirected call is
+#: still a call that came in, and a callback is the system dialling out. 5 belongs to
+#: neither and is deliberately not forced into one - it matches no direction filter and
+#: the table renders it with a dash, which is the honest answer for "this is not a
+#: conversation with a customer".
+_INCOMING: Final[str] = "incoming"
+_OUTGOING: Final[str] = "outgoing"
+_DIRECTIONS: Final[dict[str, tuple[int, ...]]] = {_INCOMING: (2, 3), _OUTGOING: (1, 4)}
 
 #: Presets and the number of local days each covers, counting today (§10 step 5:
 #: "today / 7 / 30 days / custom range"). The SPA resolves its own presets into `from`/`to`
@@ -199,7 +227,7 @@ class CallFilters:
     previous_start_utc: dt.datetime
     tz_name: str
     employees: tuple[int, ...]
-    directions: tuple[int, ...]
+    directions: tuple[str, ...]
     results: tuple[str, ...]
     lines: tuple[int, ...]
     builtin_line: bool
@@ -224,9 +252,19 @@ class CallFilters:
         if self.employees:
             terms.append(Call.portal_user_id.in_(self.employees))
         if self.directions:
-            terms.append(Call.call_type.in_(self.directions))
-        if self.results:
-            terms.append(Call.result_group.in_(self.results))
+            # Each name is a set of raw `CALL_TYPE` codes (§3 stores the code, never a
+            # word), so two selected directions OR into one IN list rather than two terms.
+            codes = sorted({code for name in self.directions for code in _DIRECTIONS[name]})
+            terms.append(Call.call_type.in_(codes))
+        if self.results and set(self.results) != set(_RESULT_GROUPS):
+            # Both groups selected is no predicate at all, and saying so here keeps the
+            # SQL free of a tautology. `no_answer` is the complement of `answered`, not a
+            # list: a §3 value nobody has thought of yet is an outcome that was not an
+            # answer, and must fall on that side rather than out of the result entirely.
+            if _ANSWERED in self.results:
+                terms.append(Call.result_group == _ANSWERED_STORED)
+            else:
+                terms.append(Call.result_group != _ANSWERED_STORED)
         if self.lines or self.builtin_line:
             line_terms: list[ColumnElement[bool]] = []
             if self.lines:
@@ -324,8 +362,10 @@ def parse_filters(params: QueryParams, principal: Principal) -> CallFilters:
       The SPA resolves its own presets into dates in the viewer's zone, so this is the
       convenience path, not the main one;
     * `employee` / `employee_id` - `portal_user_id`, repeatable;
-    * `direction` - raw `call_type`, repeatable (§3 keeps the code raw; the SPA maps it);
-    * `result` - `answered` | `missed` | `not_connected`, repeatable;
+    * `direction` - `incoming` | `outgoing`, repeatable. Names rather than raw
+      `CALL_TYPE` codes: which code counts as incoming is a reading of Bitrix24's
+      semantics and belongs here, beside the research note, not in the query string;
+    * `result` - `answered` | `no_answer`, repeatable;
     * `line` / `line_id` - `rest_app_id`, or `builtin` (or `0`) for built-in telephony.
 
     "Today" is the *viewer's* today, taken from `datetime.now(zone)`: a request at 23:30 in
@@ -370,6 +410,14 @@ def parse_filters(params: QueryParams, principal: Principal) -> CallFilters:
         if value not in _RESULT_GROUPS:
             raise FilterError("bad_result")
 
+    # Directions are names now, not raw `CALL_TYPE` codes. The codes stay in `_DIRECTIONS`
+    # and never cross the wire: which code counts as incoming is a decision about Bitrix24
+    # semantics, and it belongs on this side with the research note that supports it.
+    directions = tuple(sorted(set(_values(params, _DIRECTION_KEYS))))
+    for value in directions:
+        if value not in _DIRECTIONS:
+            raise FilterError("bad_direction")
+
     lines: list[int] = []
     builtin_line = False
     for raw in _values(params, _LINE_KEYS):
@@ -410,7 +458,7 @@ def parse_filters(params: QueryParams, principal: Principal) -> CallFilters:
         previous_start_utc=previous_start_utc,
         tz_name=tz_name,
         employees=_ints(params, _EMPLOYEE_KEYS, "bad_employee"),
-        directions=_ints(params, _DIRECTION_KEYS, "bad_direction"),
+        directions=directions,
         results=results,
         lines=tuple(sorted(set(lines))),
         builtin_line=builtin_line,
@@ -443,8 +491,7 @@ def _totals(row: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "total": total,
         "answered": answered,
-        "missed": int(row[_MISSED]) if row else 0,
-        "not_connected": int(row[_NOT_CONNECTED]) if row else 0,
+        "no_answer": int(row[_NO_ANSWER]) if row else 0,
         "with_recording": int(row["with_record"]) if row else 0,
         "answered_rate": _rate(answered, total),
         # Three spellings of one number: `talk_seconds` is what the summary tiles read,
@@ -534,7 +581,7 @@ async def load_dashboard(principal: Principal, filters: CallFilters) -> dict[str
         .subquery("scoped")
     )
 
-    answered = scoped.c.result_group == _ANSWERED
+    answered = scoped.c.result_group == _ANSWERED_STORED
     aggregate = (
         select(
             func.grouping(scoped.c.day).label("g_day"),
@@ -547,8 +594,10 @@ async def load_dashboard(principal: Principal, filters: CallFilters) -> dict[str
             scoped.c.bx_user_id,
             func.count().label("total"),
             func.count().filter(answered).label(_ANSWERED),
-            func.count().filter(scoped.c.result_group == _MISSED).label(_MISSED),
-            func.count().filter(scoped.c.result_group == _NOT_CONNECTED).label(_NOT_CONNECTED),
+            # The complement, counted rather than summed from two labels: a §3 value this
+            # code has never seen still lands here instead of vanishing from both series
+            # and leaving a stack that does not add up to `total`.
+            func.count().filter(~answered).label(_NO_ANSWER),
             func.count().filter(scoped.c.has_record).label("with_record"),
             # §10 step 5: talk time is `call_duration` over ANSWERED calls only. The FILTER
             # is that definition; `_totals()` carries it into the response.
@@ -571,6 +620,7 @@ async def load_dashboard(principal: Principal, filters: CallFilters) -> dict[str
         aggregate,
         Employee.name.label("emp_name"),
         Employee.last_name.label("emp_last_name"),
+        Employee.phone_inner.label("emp_phone_inner"),
         Employee.active.label("emp_active"),
     ).select_from(
         aggregate.outerjoin(
@@ -631,6 +681,8 @@ async def load_dashboard(principal: Principal, filters: CallFilters) -> dict[str
             "employee_id": row["bx_user_id"],
             "bx_user_id": row["bx_user_id"],
             "name": _display_name(row["emp_name"], row["emp_last_name"]),
+            # §7: shown beside the name on the comparison chart, exactly as in the filter.
+            "phone_inner": row["emp_phone_inner"],
             "active": True if row["emp_active"] is None else bool(row["emp_active"]),
             "other": False,
             # A statistic row with no `PORTAL_USER_ID` (§3 allows NULL) is nobody's call.
@@ -664,14 +716,15 @@ async def load_dashboard(principal: Principal, filters: CallFilters) -> dict[str
                 "employee_id": None,
                 "bx_user_id": None,
                 "name": None,
+                # "Other" is an aggregate of several people; no one extension describes it.
+                "phone_inner": None,
                 "active": True,
                 "other": True,
                 "unassigned": False,
                 "members": len(remainder),
                 "total": other_total,
                 "answered": other_answered,
-                "missed": _sum(remainder, _MISSED),
-                "not_connected": _sum(remainder, _NOT_CONNECTED),
+                "no_answer": _sum(remainder, _NO_ANSWER),
                 "with_recording": _sum(remainder, "with_recording"),
                 "answered_rate": _rate(other_answered, other_total),
                 "talk_seconds": other_talk,

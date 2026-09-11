@@ -115,8 +115,7 @@
       },
       "series": {
         "answered": "Answered",
-        "missed": "Missed",
-        "not_connected": "Not connected"
+        "no_answer": "No answer"
       },
       "summary": {
         "answeredOf": "{answered} of {total} answered",
@@ -124,7 +123,7 @@
         "avgTalk": "Average talk time",
         "down": "down",
         "flat": "no change",
-        "missed": "Missed",
+        "noAnswer": "No answer",
         "noPrevious": "No data for the previous period",
         "points": "{value} pts",
         "talkTotal": "{duration} in total",
@@ -221,28 +220,8 @@
   },
   "call": {
     "direction": {
-      "1": "Outgoing",
-      "2": "Incoming",
-      "3": "Incoming with redirection",
-      "4": "Callback",
-      "5": "Informational",
-      "unknown": "Unknown"
-    },
-    "result": {
-      "200": "Answered",
-      "304": "Missed",
-      "402": "Insufficient funds",
-      "403": "Forbidden",
-      "404": "Invalid number",
-      "423": "Blocked",
-      "480": "Temporarily unavailable",
-      "484": "Unavailable",
-      "486": "Busy",
-      "503": "Unavailable",
-      "603": "Declined",
-      "603-S": "Cancelled",
-      "OTHER": "Undefined",
-      "unknown": "Undefined"
+      "incoming": "Incoming",
+      "outgoing": "Outgoing"
     }
   },
   "common": {

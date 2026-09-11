@@ -82,8 +82,11 @@ CALLS: Final[tuple[tuple[int, tuple[int, int], str, int, int], ...]] = (
 
 TOTAL: Final[int] = 8
 ANSWERED: Final[int] = 4
-MISSED: Final[int] = 2
-NOT_CONNECTED: Final[int] = 2
+#: The complement, and it is written as one number rather than as "missed plus not
+#: connected" on purpose: the app collapses §3's three generated values into two, and a
+#: test that added the two halves back together would pass even if the collapse dropped a
+#: §3 outcome neither half names.
+NO_ANSWER: Final[int] = 4
 #: §10 step 5 / `stats._talk`: talk time is `call_duration` over ANSWERED calls only.
 TALK_TOTAL: Final[int] = 600
 TALK_AVERAGE: Final[int] = 150
@@ -338,8 +341,11 @@ async def test_the_summary_counts_the_seeded_calls_exactly(
 
     assert summary["total"] == TOTAL
     assert summary["answered"] == ANSWERED
-    assert summary["missed"] == MISSED
-    assert summary["not_connected"] == NOT_CONNECTED
+    assert summary["no_answer"] == NO_ANSWER
+    assert summary["answered"] + summary["no_answer"] == summary["total"], (
+        "the two groups must partition the period. If they do not, a stacked bar is "
+        "shorter than the count beside it and nothing in the UI explains the gap."
+    )
     assert summary["with_recording"] == 0
     assert summary["answered_rate"] == 0.5, (
         f"answered_rate is {summary['answered_rate']!r}; four answered out of eight is 0.5"
@@ -554,7 +560,7 @@ async def test_an_own_principal_is_counted_over_its_own_calls_only(
         "USER_B owns three of the eight seeded calls; anything else means `scope_filter` "
         "was not applied to the aggregation (§4.7)."
     )
-    assert summary["answered"] == 2 and summary["not_connected"] == 1
+    assert summary["answered"] == 2 and summary["no_answer"] == 1
     assert talk_total(summary) == 420, "USER_B's two answered calls are 180 + 240"
     assert employee_totals(body) == {USER_B: 3}, (
         "the per-employee breakdown leaked colleagues to an 'own' viewer"

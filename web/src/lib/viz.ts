@@ -30,8 +30,15 @@
 
 // --- series (call outcome) ------------------------------------------------------------
 
-/** `calls.result_group` (§3): the single server-side mapping the whole UI shares. */
-export const RESULT_GROUPS = ['answered', 'missed', 'not_connected'] as const;
+/**
+ * The two call outcomes the whole UI shares (`services/stats.py::_RESULT_GROUPS`).
+ *
+ * §3 still generates three values into `calls.result_group`; the server collapses them
+ * once, so nothing on this side has to know that "missed" and "not connected" were ever
+ * separate series. The reason they are not is that they answered no question a call list
+ * is read to answer, while costing every chart a third stacked band.
+ */
+export const RESULT_GROUPS = ['answered', 'no_answer'] as const;
 
 export type ResultGroup = (typeof RESULT_GROUPS)[number];
 
@@ -43,22 +50,30 @@ export type ResultGroup = (typeof RESULT_GROUPS)[number];
 export const SERIES_ORDER: readonly ResultGroup[] = RESULT_GROUPS;
 
 /** Validated light-mode series hues. */
+/*
+ * Both hexes are specification values carried over unchanged from the three-series
+ * palette, where they were validated together against colour-vision deficiency and
+ * against the light and dark surfaces of `globals.css`. `no_answer` inherits the hue that
+ * was `missed`, which is the outcome it mostly describes. No new colour is introduced -
+ * a palette entry is a measurement here, not a preference.
+ */
 export const SERIES_LIGHT: Readonly<Record<ResultGroup, string>> = {
   answered: '#2a78d6',
-  missed: '#eb6834',
-  not_connected: '#1baf7a',
+  no_answer: '#eb6834',
 };
 
 /** Validated dark-mode series hues (all checks pass in both modes). */
 export const SERIES_DARK: Readonly<Record<ResultGroup, string>> = {
   answered: '#3987e5',
-  missed: '#d95926',
-  not_connected: '#199e70',
+  no_answer: '#d95926',
 };
 
 /** The paint a mark of `group` wears. Theme-resolved by CSS, not by JavaScript. */
 export function seriesVar(group: ResultGroup): string {
-  return `var(--ca-viz-${group === 'not_connected' ? 'notconnected' : group})`;
+  // `no_answer` -> `noanswer`: a CSS custom property may carry an underscore, but every
+  // other token in `globals.css` is unbroken lowercase and one exception would be the
+  // one people typo.
+  return `var(--ca-viz-${group === 'no_answer' ? 'noanswer' : group})`;
 }
 
 /** Catalogue key for a series label (§8). Legends are never the only identity cue. */
@@ -161,8 +176,7 @@ function rampBlock(order: readonly string[]): string {
 export const VIZ_CSS: string = `
 :root{
 --ca-viz-answered:${SERIES_LIGHT.answered};
---ca-viz-missed:${SERIES_LIGHT.missed};
---ca-viz-notconnected:${SERIES_LIGHT.not_connected};
+--ca-viz-noanswer:${SERIES_LIGHT.no_answer};
 --ca-viz-bar:${BAR_LIGHT};
 --ca-viz-ink:${CHROME_LIGHT.ink};
 --ca-viz-ink-2:${CHROME_LIGHT.ink2};
@@ -178,8 +192,7 @@ ${rampBlock(RAMP)}
 @media (prefers-color-scheme: dark){
 :root{
 --ca-viz-answered:${SERIES_DARK.answered};
---ca-viz-missed:${SERIES_DARK.missed};
---ca-viz-notconnected:${SERIES_DARK.not_connected};
+--ca-viz-noanswer:${SERIES_DARK.no_answer};
 --ca-viz-bar:${BAR_DARK};
 --ca-viz-ink:${CHROME_DARK.ink};
 --ca-viz-ink-2:${CHROME_DARK.ink2};

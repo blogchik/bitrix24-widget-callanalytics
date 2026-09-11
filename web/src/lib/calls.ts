@@ -131,6 +131,14 @@ export interface CallsQuery {
   result?: FilterValue;
   /** `rest_app_id`, or the literal `builtin`. */
   line?: FilterValue;
+  /**
+   * A substring of the counterparty number.
+   *
+   * Matched on digits alone at both ends (`api/app/api/calls.py::_table_facets`), so what
+   * the table renders - regrouped with spaces by {@link formatPhone} - can be pasted back
+   * in and still match the row it came from.
+   */
+  search?: string | null;
 }
 
 /** §2: "GET /calls (50/page)". Fixed server-side; the client only counts with it. */
@@ -233,6 +241,12 @@ export function callsSearchParams(query: CallsQuery, page: number = 1): URLSearc
   pushAll(params, 'direction', query.direction);
   pushAll(params, 'result', query.result);
   pushAll(params, 'line', query.line);
+  // `search` of the three spellings the server accepts (`search` / `q` / `phone`): one
+  // name on the wire is one string to find when a request has to be explained.
+  const search = (query.search ?? '').trim();
+  if (search) {
+    params.set('search', search);
+  }
   if (page > 1) {
     params.set('page', String(page));
   }
@@ -289,8 +303,9 @@ export function normalisePage(raw: unknown, requestedPage: number): CallsPage {
   return {
     rows,
     page: num(body.page) ?? requestedPage,
-    // `has_more` rather than a total: §4.7's read path refuses to COUNT half a million
-    // rows on every filter change, and the table only needs to know about a next page.
+    // `has_more` rather than the `total` the server also sends: this table pages by
+    // appending and never draws a numbered pager, so a count it would not render is a
+    // count it does not need to carry through four types to get here.
     hasMore: typeof body.has_more === 'boolean' ? body.has_more : rows.length >= PAGE_SIZE,
     recordingMode: str(body.recording_mode),
     period: periodOf(body.period),

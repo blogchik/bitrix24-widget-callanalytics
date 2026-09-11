@@ -138,12 +138,15 @@ export interface PageShellProps {
   /** Full-width notice above the content ("you see your own calls only"). */
   banner?: ReactNode;
   /**
-   * Let the column grow past the reading width, for a page that is one wide table.
+   * Let the column grow past the reading width, for the data pages.
    *
-   * The 1280px cap is sized for prose and tiles. The by-hour grid is twenty-six columns
-   * and wants about 1430px, so under that cap it scrolled sideways on a 1920px screen
-   * that had seven hundred spare pixels on either side of it - a scrollbar the display
-   * never needed, put there by the layout rather than by the data.
+   * The 1280px cap is sized for prose. It is the wrong measure for a page whose content
+   * is a grid: the by-hour table is twenty-six columns and wants about 1430px, so under
+   * that cap it scrolled sideways on a 1920px screen with seven hundred spare pixels on
+   * either side of it - a scrollbar the display never needed, put there by the layout
+   * rather than by the data. The dashboard is the same kind of page and reads the same
+   * way, so the two left-menu pages share the measure; only the narrow CRM tab and the
+   * text pages keep the reading width.
    */
   wide?: boolean;
   /**

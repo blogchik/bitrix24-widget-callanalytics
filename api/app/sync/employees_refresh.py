@@ -65,6 +65,7 @@ NOT_FOUND_RETRY_HOURS: Final[int] = 24
 #: §3 column widths. An over-long value would abort the whole statement, so it is cut.
 _NAME_MAX: Final[int] = 255
 _URL_MAX: Final[int] = 2048
+_EXT_MAX: Final[int] = 32
 
 #: Rows per INSERT ... ON CONFLICT statement; keeps one statement's parameter count sane.
 _WRITE_CHUNK: Final[int] = 500
@@ -151,6 +152,7 @@ async def _store(
                         "second_name": statement.excluded.second_name,
                         "work_position": statement.excluded.work_position,
                         "photo_url": statement.excluded.photo_url,
+                        "phone_inner": statement.excluded.phone_inner,
                         "active": statement.excluded.active,
                         "departments": statement.excluded.departments,
                         "found": statement.excluded.found,
@@ -218,6 +220,7 @@ async def run_employees_refresh(
             "second_name": _trim(record.get("second_name")),
             "work_position": _trim(record.get("work_position")),
             "photo_url": _trim(record.get("photo_url"), _URL_MAX),
+            "phone_inner": _trim(record.get("phone_inner"), _EXT_MAX),
             # Stored, never used to filter the request (§7): dismissed employees own
             # historical calls and the UI greys them with a "dismissed" badge.
             "active": bool(record.get("active", True)),

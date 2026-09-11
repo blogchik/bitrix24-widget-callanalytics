@@ -337,6 +337,10 @@ class Employee(Base):
     departments: Mapped[list[int]] = mapped_column(
         postgresql.ARRAY(Integer), nullable=False, server_default=text("'{}'")
     )
+    # UF_PHONE_INNER: the internal extension, shown beside the name in the employee
+    # filter. Free text at Bitrix24, so no CHECK and a width that tolerates a portal
+    # storing a whole number in it.
+    phone_inner: Mapped[str | None] = mapped_column(String(32))
     # NULL = placeholder inserted by the call upsert for an unseen PORTAL_USER_ID;
     # the refresh job takes NULLs first (§7).
     fetched_at: Mapped[dt.datetime | None] = mapped_column(_TS)

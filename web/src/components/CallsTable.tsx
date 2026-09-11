@@ -52,7 +52,9 @@ import { useLocale } from 'next-intl';
 import {
   Fragment,
   useCallback,
+  useEffect,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
   type ReactNode,
@@ -60,6 +62,7 @@ import {
 
 import { ErrorState } from '@/components/AppFrame';
 import InlinePlayer from '@/components/InlinePlayer';
+import { Input } from '@/components/ui';
 import { openPath } from '@/lib/bx24';
 import {
   describeDirection,
@@ -95,6 +98,15 @@ const NARROW_QUERY = '(max-width: 767px)';
 /** One row of the table, whatever it contains. Defeats ragged heights by decree. */
 const ROW_HEIGHT = 48;
 
+/**
+ * How long to wait after a keystroke before asking the server for a different list.
+ *
+ * Long enough that a typed number is one request rather than twelve, short enough that
+ * the table still feels like it is answering the input. The same shape as the dashboard's
+ * `FIT_DEBOUNCE_MS` and `AppFrame`'s resize debounce, for the same reason.
+ */
+const SEARCH_DEBOUNCE_MS = 350;
+
 const CSS = `
 .ca-calls {
   --ca-calls-px: 16px;
@@ -109,10 +121,33 @@ const CSS = `
 .ca-calls-head {
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
+  /* flex-end, not baseline: the search field is a label stacked on a control, so its
+     first baseline is the label's, and a baseline row would hang the input below the
+     heading instead of beside it. The title and the count keep their own baseline
+     relationship inside .ca-calls-headline. */
+  align-items: flex-end;
   justify-content: space-between;
   gap: 8px 12px;
   padding: 14px var(--ca-calls-px) 10px;
+}
+.ca-calls-headline {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+.ca-calls-search {
+  flex: 0 1 260px;
+}
+@media (max-width: 767px) {
+  /* Below md the head is two rows. A 260px field beside a heading at 375px is a field
+     nobody can read a number back out of. */
+  .ca-calls-search {
+    flex-basis: 100%;
+  }
 }
 .ca-calls-title {
   margin: 0;
@@ -386,6 +421,14 @@ export interface CallsTableProps {
   /** `false` while the page has nothing to ask about yet. */
   enabled?: boolean;
   /**
+   * The number search in the section header.
+   *
+   * Off on a CRM tab: §4.8 has already matched that card's own entity, so the control
+   * could only ever return every row or none - the same argument §4.7 makes for hiding
+   * the employee filter from an `own` viewer rather than offering it with one option.
+   */
+  showSearch?: boolean;
+  /**
    * Page-level takeover of a failed first page.
    *
    * The CRM tab uses it to render §4.11's `crm_no_access` state instead of an empty
@@ -415,7 +458,11 @@ function useNarrow(): boolean {
   );
 }
 
-/** The table. The page owns the period and the filters; this owns the paging. */
+/**
+ * The table. The page owns the period and the filters; this owns the paging - and the
+ * number search, which is deliberately not part of the page's filter model so that it
+ * narrows the list without ever reaching the charts above it.
+ */
 export function CallsTable({
   query,
   timezone = null,
@@ -423,6 +470,7 @@ export function CallsTable({
   showEmployee = true,
   importing = false,
   enabled = true,
+  showSearch = true,
   renderError,
 }: CallsTableProps) {
   const c = useCopy();
@@ -431,8 +479,39 @@ export function CallsTable({
 
   const [expanded, setExpanded] = useState<number | null>(null);
 
+  /*
+   * The number search lives here and not in the page, and that placement is the feature.
+   *
+   * `useDashboard` in `app/dashboard/page.tsx` is handed the page's filter model; it
+   * cannot see this state, so "the search narrows the list and not the charts" is a fact
+   * about where the value is stored rather than a rule somebody has to remember. It is
+   * also what makes the control work unchanged on both mounts.
+   *
+   * Two values, not one: `search` is what the field shows on every keystroke, `applied`
+   * is what the query is built from. Feeding the raw value straight in would change
+   * `callsQueryKey` on every character, and `useCalls` resets to page one and aborts the
+   * request in flight on every key change (which is exactly right once per number, and
+   * twelve times too often per keystroke).
+   */
+  const [search, setSearch] = useState('');
+  const [applied, setApplied] = useState('');
+  const searchTimer = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    window.clearTimeout(searchTimer.current);
+    searchTimer.current = window.setTimeout(
+      () => setApplied(search.trim()),
+      SEARCH_DEBOUNCE_MS,
+    );
+    return () => window.clearTimeout(searchTimer.current);
+  }, [search]);
+
+  const effectiveQuery = useMemo(
+    () => (applied ? { ...query, search: applied } : query),
+    [query, applied],
+  );
+
   const { items, error, loading, loadingMore, hasMore, recordingMode, loadMore, reload } =
-    useCalls(query, enabled);
+    useCalls(effectiveQuery, enabled);
 
   const toggleRow = useCallback((id: number) => {
     // One player at a time: two recordings playing over each other is never what the
@@ -478,10 +557,35 @@ export function CallsTable({
       <style href={STYLE_ID} precedence="default" dangerouslySetInnerHTML={{ __html: CSS }} />
 
       <div className="ca-calls-head">
-        <h2 className="ca-calls-title">{title ?? c('app.calls.table.title')}</h2>
-        <span className="ca-calls-count">
-          {c('app.calls.table.shown', { shown: formatCount(items.length, locale) })}
-        </span>
+        <div className="ca-calls-headline">
+          <h2 className="ca-calls-title">{title ?? c('app.calls.table.title')}</h2>
+          <span className="ca-calls-count">
+            {c('app.calls.table.shown', { shown: formatCount(items.length, locale) })}
+          </span>
+        </div>
+        {showSearch ? (
+          <Input
+            className="ca-calls-search"
+            label={c('app.calls.table.search')}
+            placeholder={c('app.calls.table.searchPlaceholder')}
+            value={search}
+            onValueChange={setSearch}
+            clearable
+            clearLabel={c('app.calls.table.searchClear')}
+            leadingIcon={<SearchGlyph />}
+            // `_SEARCH_MAX` in `api/app/api/calls.py`. Capping here rather than letting the
+            // server answer `bad_search` is not cosmetic: a failed first page replaces this
+            // whole section with an ErrorState, which would take away the very input the
+            // reader was typing into.
+            maxLength={64}
+            disabled={!enabled}
+            // Not `type="search"` (WebKit draws a second, native clear button beside ours)
+            // and not `inputMode="tel"` (the fallback branch matches SIP addresses, and an
+            // iOS keypad cannot type one). Plain text, without a saved-number autofill.
+            autoComplete="off"
+            inputClassName="ca-viz-num"
+          />
+        ) : null}
       </div>
 
       {narrow ? (
@@ -561,7 +665,16 @@ export function CallsTable({
 
       {!loading && items.length === 0 ? (
         <p className="ca-empty">
-          {importing ? c('app.calls.table.emptyImporting') : c('app.calls.table.empty')}
+          {/* The search explanation wins over the other two. The dashboard only renders
+              this section when the period has calls in it, so "there are no calls in this
+              period" is a sentence that is *false* whenever a search matched none of
+              them - and §4.11 counts a state that misdescribes itself as a failure even
+              when nothing errored. */}
+          {applied
+            ? c('app.calls.table.searchEmpty')
+            : importing
+              ? c('app.calls.table.emptyImporting')
+              : c('app.calls.table.empty')}
         </p>
       ) : null}
 
@@ -889,6 +1002,25 @@ function DescendingGlyph() {
       focusable="false"
     >
       <path d="M5 8L1.5 3.5h7z" />
+    </svg>
+  );
+}
+
+function SearchGlyph() {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 12 12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.4"
+      strokeLinecap="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <circle cx="5" cy="5" r="3.4" />
+      <path d="M7.6 7.6L10.5 10.5" />
     </svg>
   );
 }

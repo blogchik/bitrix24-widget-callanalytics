@@ -166,6 +166,10 @@ export default function CrmPage() {
     >
       <CallsTable
         query={query}
+        // §4.8 has already narrowed this list to the calls of this one card, so a number
+        // search here could only ever return all of them or none - and it would cost the
+        // header 260px inside a slider that is short to begin with.
+        showSearch={false}
         timezone={data.timezone}
         // Every row here belongs to whoever handled the call, and on a customer card
         // that is exactly the column a salesperson looks for first.

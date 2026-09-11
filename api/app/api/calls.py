@@ -39,7 +39,7 @@ from typing import Any, Final
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import Select, func, select, update
+from sqlalchemy import Select, String, func, select, update
 from sqlalchemy.sql.elements import ColumnElement
 from starlette.datastructures import QueryParams
 
@@ -118,6 +118,10 @@ _SEARCH_MAX: Final[int] = 64
 #: search is a typo, not a query language, and `_` is a wildcard nobody expects.
 _LIKE_ESCAPE: Final[str] = "\\"
 
+#: The character class `_digits` and Postgres must agree on. Two normalisations built from
+#: different alphabets is how a needle stops matching the haystack it came from.
+_NON_DIGITS: Final[str] = "[^0-9]"
+
 
 # --- paging, the table facets and the CRM clause -------------------------------------
 
@@ -150,6 +154,17 @@ def _first(params: QueryParams, names: tuple[str, ...]) -> str:
     return ""
 
 
+def _digits(value: str) -> str:
+    """ASCII digits only - exactly the set `regexp_replace(..., '[^0-9]', ...)` keeps.
+
+    `str.isdigit()` alone is also true for Arabic-Indic and superscript digits, which
+    Postgres would strip from the column; a needle built from them would therefore match
+    nothing while looking like a number to the person who typed it. The `isascii()` guard
+    is the same one `bitrix/users.py` applies to an incoming id, for the same reason.
+    """
+    return "".join(ch for ch in value if ch.isascii() and ch.isdigit())
+
+
 def _table_facets(params: QueryParams) -> tuple[list[ColumnElement[bool]], dict[str, Any]]:
     """The two table-only predicates, plus an echo of what they were (§8 machine codes).
 
@@ -158,11 +173,20 @@ def _table_facets(params: QueryParams) -> tuple[list[ColumnElement[bool]], dict[
     recheck job (§5.7). Re-deriving it here as `record_file_id IS NOT NULL OR ...` would
     be exactly the second definition the generated column exists to prevent.
 
-    The search is a case-insensitive substring of `phone_number`: substring rather than
-    prefix because the digits people remember are the local part while the column holds
-    the E.164 form. Unindexed on purpose - it runs inside a period already narrowed by
-    `calls_portal_start_idx`, and §3 adds no trigram index for a filter that has not yet
-    been asked for.
+    The search is a substring of `phone_number`, matched on **digits alone** - both sides
+    normalised, which is the only version of this filter that answers what people actually
+    type. §3 stores the number exactly as Bitrix24 delivered it (usually `+998901234567`)
+    while the table renders it regrouped with spaces (`format.ts::formatPhone`), so a
+    reader copying a number out of the row they are looking at and pasting it back into
+    the search would never match it under a raw comparison. Substring rather than prefix
+    for the same kind of reason: the digits people remember are the local part.
+
+    Unindexed on purpose - it runs inside a period already narrowed by
+    `calls_portal_start_idx`. A generated `phone_digits` column with a `pg_trgm` index was
+    weighed and declined: it is a migration, a Postgres extension and a backfill for a
+    filter whose range is capped at `MAX_PERIOD_DAYS` anyway. If a large portal ever makes
+    this slow, the cheaper lever is to skip the COUNT while a search is active - the SPA
+    pages by appending and never reads `total`.
     """
     terms: list[ColumnElement[bool]] = []
     echo: dict[str, Any] = {"has_record": None, "search": None}
@@ -182,12 +206,30 @@ def _table_facets(params: QueryParams) -> tuple[list[ColumnElement[bool]], dict[
     if search:
         if len(search) > _SEARCH_MAX:
             raise FilterError("bad_search", max_length=_SEARCH_MAX)
-        pattern = (
-            search.replace(_LIKE_ESCAPE, _LIKE_ESCAPE + _LIKE_ESCAPE)
-            .replace("%", _LIKE_ESCAPE + "%")
-            .replace("_", _LIKE_ESCAPE + "_")
-        )
-        terms.append(Call.phone_number.ilike(f"%{pattern}%", escape=_LIKE_ESCAPE))
+        digits = _digits(search)
+        if digits:
+            # `LIKE`, not `ILIKE`: digits have no case, and folding both sides would be
+            # work that can never change an answer. No `escape=` either - `digits` is
+            # `[0-9]*` by construction, so `%`, `_` and the escape character itself cannot
+            # reach the pattern, and writing one would imply a threat removed a line above.
+            # `type_` keeps this a `ColumnElement[str]` under mypy strict rather than Any.
+            normalised = func.regexp_replace(
+                Call.phone_number, _NON_DIGITS, "", "g", type_=String()
+            )
+            terms.append(normalised.like(f"%{digits}%"))
+        else:
+            # A SIP address or an alias ("sip:reception@office.local"), which §3 stores raw
+            # and `formatPhone` shows verbatim. This branch is not a courtesy: normalising
+            # such a needle yields "", and `LIKE '%%'` would match every row that has a
+            # number while dropping every row that has none - neither "no filter" nor "no
+            # rows", which is the one outcome worse than either.
+            pattern = (
+                search.replace(_LIKE_ESCAPE, _LIKE_ESCAPE + _LIKE_ESCAPE)
+                .replace("%", _LIKE_ESCAPE + "%")
+                .replace("_", _LIKE_ESCAPE + "_")
+            )
+            terms.append(Call.phone_number.ilike(f"%{pattern}%", escape=_LIKE_ESCAPE))
+        # The raw input, not the digits: the SPA re-renders what was typed.
         echo["search"] = search
 
     return terms, echo

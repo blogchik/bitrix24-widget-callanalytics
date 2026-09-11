@@ -29,8 +29,10 @@ import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.bitrix.identity import Identity
 from app.bitrix.statistic import parse_rows
 from app.db.session import control_txn, tenant_txn
+from app.services.employees import upsert_viewer
 from app.sync.lease import WORKER_ID, Fence, acquire_leases
 from app.sync.upsert import upsert_calls
 from tests.conftest import TENANT_TABLES
@@ -290,6 +292,61 @@ async def test_placeholders_appear_for_unseen_users_without_clobbering_cached_on
     assert employees[777]["fetched_at"] is None
     assert employees[888]["name"] == "Cached"
     assert employees[888]["fetched_at"] is not None, "a cached employee was reset to a placeholder"
+
+
+async def test_the_viewer_upsert_leaves_what_only_the_refresher_can_know(
+    leased: tuple[SeededPortal, Fence],
+) -> None:
+    """§7 writer (b): `/app/` writes the viewer from `user.current`, and stops there.
+
+    Three columns are deliberately absent from that write, and all three for one reason:
+    `user.current` is not documented to report them, and a field it omits would be written
+    as NULL over the value `employees_refresh` learned from `user.get`. `active` would
+    resurrect a dismissed employee, `departments` would erase the department list, and
+    `phone_inner` would take the extension out of the employee filter - on every single
+    app open, for the one person most likely to notice: the viewer themselves.
+
+    The failure this pins is not a crash. Adding the missing keys to `upsert_viewer` looks
+    like completing an unfinished function, and everything keeps working except that three
+    columns quietly empty themselves in production.
+    """
+    portal, _ = leased
+    async with tenant_txn(portal.portal_id) as session:
+        await session.execute(
+            text(
+                """
+                INSERT INTO employees (portal_id, bx_user_id, name, last_name, phone_inner,
+                                       active, departments, found, fetched_at)
+                VALUES (:pid, 100, 'Ada', 'Admin', '101', false, '{7}', true, now())
+                """
+            ),
+            {"pid": portal.portal_id},
+        )
+
+    await upsert_viewer(
+        portal.portal_id,
+        Identity(
+            user_id=100,
+            is_admin=True,
+            timezone="Asia/Tashkent",
+            name="Ada",
+            last_name="Admin",
+            second_name=None,
+            work_position="Head of Sales",
+            photo_url=None,
+        ),
+    )
+
+    row = (await employee_rows(portal.portal_id))[100]
+    assert row["work_position"] == "Head of Sales", (
+        "the columns `user.current` does report must still be refreshed on open"
+    )
+    assert row["phone_inner"] == "101", (
+        "the viewer upsert erased the internal extension. `user.current` does not report "
+        "UF_PHONE_INNER, so writing it here empties the employee filter one open at a time."
+    )
+    assert row["active"] is False, "a dismissed employee was resurrected by an app open"
+    assert list(row["departments"]) == [7], "the department list was erased by an app open"
 
 
 async def test_refresh_requested_is_cleared_by_the_upsert(

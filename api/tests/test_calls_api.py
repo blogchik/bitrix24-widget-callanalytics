@@ -254,18 +254,23 @@ async def store_context(
         )
 
 
-async def seed_employee(portal_id: int, user_id: int, name: str) -> None:
+async def seed_employee(
+    portal_id: int, user_id: int, name: str, phone_inner: str | None = None
+) -> None:
+    """One cached employee. `phone_inner=None` is the ordinary case, not a degenerate one:
+    a portal that sets no extensions, and any row not refreshed since §7 grew the column.
+    """
     async with tenant_txn(portal_id) as session:
         await session.execute(
             text(
                 """
-                INSERT INTO employees (portal_id, bx_user_id, name, last_name, active, found,
-                                       fetched_at)
-                VALUES (:pid, :uid, :name, 'Operator', true, true, now())
+                INSERT INTO employees (portal_id, bx_user_id, name, last_name, phone_inner,
+                                       active, found, fetched_at)
+                VALUES (:pid, :uid, :name, 'Operator', :ext, true, true, now())
                 ON CONFLICT (portal_id, bx_user_id) DO NOTHING
                 """
             ),
-            {"pid": portal_id, "uid": user_id, "name": name},
+            {"pid": portal_id, "uid": user_id, "name": name, "ext": phone_inner},
         )
 
 
@@ -566,6 +571,284 @@ async def test_a_denied_principal_is_refused_the_table_outright(
     assert response.json() == {"code": "no_stats_permission"}
 
 
+# --- the number search -----------------------------------------------------------------
+
+
+#: Five counterparties, each written the way some portal really writes one. The point of
+#: the set is that two of them are the SAME number under different typography and two of
+#: them are not numbers at all - which is the whole problem the facet has to solve.
+SEARCH_ROWS: Final[tuple[dict[str, Any], ...]] = (
+    {"bx_id": 1, "phone": "+998901234567"},
+    {"bx_id": 2, "phone": "998 90 123 45 67"},
+    {"bx_id": 3, "phone": "+7 (495) 765-43-21"},
+    {"bx_id": 4, "phone": "sip:reception@office.local"},
+    {"bx_id": 5, "phone": None},
+)
+
+
+async def seed_search_rows(portal_id: int) -> dict[int, int]:
+    day = datetime(BASE_DAY.year, BASE_DAY.month, BASE_DAY.day, 9, 0, tzinfo=UTC)
+    return await seed_calls(
+        portal_id,
+        [
+            {**row, "started": day + timedelta(minutes=index), "code": "200"}
+            for index, row in enumerate(SEARCH_ROWS)
+        ],
+    )
+
+
+async def test_the_number_search_matches_on_digits_however_the_number_was_typed(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """The reason the facet exists: typography must not decide whether a row matches.
+
+    §3 stores `PHONE_NUMBER` exactly as Bitrix24 delivered it and normalises nothing, so a
+    portal can hold `+998901234567` and `998 90 123 45 67` for the same person. The table
+    then renders both regrouped with spaces (`format.ts::formatPhone`), which makes the
+    single most likely search anybody performs a number copied out of the row in front of
+    them - and under a raw substring comparison that search matches nothing at all.
+
+    Both directions are asserted separately on purpose. Normalising only the needle passes
+    the first assertion and fails the second; normalising only the column passes the second
+    and fails the first. Only doing both passes both.
+    """
+    identifiers = await seed_search_rows(portal.portal_id)
+    token = session_for(portal)
+    days = period(BASE_DAY, BASE_DAY)
+
+    async def returned(**filters: Any) -> set[int]:
+        response = await get_calls(client, token, **days, **filters)
+        assert response.status_code == 200, response.text
+        return set(ids_of(response.json()))
+
+    def expect(*bx_ids: int) -> set[int]:
+        return {identifiers[bx_id] for bx_id in bx_ids}
+
+    assert await returned() == expect(1, 2, 3, 4, 5), (
+        "without a search the facet must be absent entirely, not applied as an empty one"
+    )
+    assert await returned(search="9012345") == expect(1, 2), (
+        "separators in the COLUMN must not hide a row: these two rows are the same number, "
+        "one of them written with spaces."
+    )
+    assert await returned(search="+998 90 123 45 67") == expect(1, 2), (
+        "separators in the NEEDLE must not hide a row either - this is the number exactly "
+        "as the table renders it, which is what a reader copies and pastes back in."
+    )
+    assert await returned(search="4957654321") == expect(3), (
+        "a different number must not be dragged in by the normalisation"
+    )
+    assert await returned(search="765") == expect(3), (
+        "a few digits from the middle must match: the whole number is never required."
+    )
+    assert await returned(search="55555") == set(), (
+        "a number nobody was called on returns nothing, not everything"
+    )
+    for needle in ("9012345", "765", "sip"):
+        assert identifiers[5] not in await returned(search=needle), (
+            "a call with no counterparty number cannot match a number. NULL must drop out "
+            "of the predicate rather than be coalesced into an empty string, which would "
+            "match every substring search ever made."
+        )
+
+
+async def test_a_non_numeric_search_finds_a_sip_address_and_never_widens_the_result(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """The fallback branch, and the two ways this facet can silently stop being a filter.
+
+    A needle with no digits cannot be digit-normalised - the normalisation yields the empty
+    string, and matching on it would return every row that has a number while dropping
+    every row that has none. That is neither "no filter" nor "no rows" but a third answer
+    that looks plausible in a table and is wrong in both directions. So a non-numeric
+    needle keeps the escaped ILIKE, which also keeps SIP addresses and aliases findable:
+    §3 stores them raw and `formatPhone` shows them verbatim, so they are rows a reader
+    can see on screen and will therefore search for.
+
+    The wildcard assertions are the other half. `%` and `_` are LIKE syntax, and a portal
+    where typing `%` returned the entire table would have a search box that is a way to
+    remove the filter it appears to be applying.
+    """
+    identifiers = await seed_search_rows(portal.portal_id)
+    token = session_for(portal)
+    days = period(BASE_DAY, BASE_DAY)
+
+    async def returned(**filters: Any) -> set[int]:
+        response = await get_calls(client, token, **days, **filters)
+        assert response.status_code == 200, response.text
+        return set(ids_of(response.json()))
+
+    assert await returned(search="reception") == {identifiers[4]}, (
+        "a SIP address is a counterparty the table renders, so it must be searchable"
+    )
+    assert await returned(search="RECEPTION") == {identifiers[4]}, (
+        "the non-numeric branch stays case-insensitive"
+    )
+    assert await returned(search="%") == set(), (
+        "a bare LIKE wildcard must be escaped into a literal. Unescaped it matches every "
+        "row that has a number and silently drops every row that has none."
+    )
+    assert await returned(search="_") == set(), (
+        "the single-character wildcard has to be escaped for the same reason"
+    )
+    assert await returned(search="   ") == set(identifiers.values()), (
+        "whitespace is trimmed away by `_first`, so it is no filter at all - not an empty "
+        "needle that matches everything carrying a number."
+    )
+
+
+async def test_the_search_ands_with_the_other_facets_and_pages_its_own_result(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """Two properties the facet shares with every other one, and one it does not.
+
+    Shared: it must AND with the rest (a search combined with an employee cannot return
+    more rows than the search alone), and `total` must describe the *filtered* set - a
+    table that pages a search while counting the period would promise the reader eight
+    hundred results and then run out after two.
+
+    Not shared: this is the only facet the charts never see, which is also why `total` has
+    never been exercised against a facet anywhere else in this file.
+    """
+    day = datetime(BASE_DAY.year, BASE_DAY.month, BASE_DAY.day, 9, 0, tzinfo=UTC)
+    matching = PAGE_SIZE + 10
+    identifiers = await seed_calls(
+        portal.portal_id,
+        [
+            {
+                "bx_id": index,
+                "started": day + timedelta(minutes=index),
+                "code": "200",
+                "user_id": USER_A if index % 2 else USER_B,
+                # Every matching row shares the run 5551; none of the others can contain it.
+                "phone": f"+99855510{index:04d}",
+            }
+            for index in range(1, matching + 1)
+        ]
+        + [
+            {
+                "bx_id": 900 + index,
+                "started": day + timedelta(minutes=index),
+                "code": "200",
+                "phone": f"+99877720{index:04d}",
+            }
+            for index in range(1, 6)
+        ],
+    )
+    token = session_for(portal)
+    days = period(BASE_DAY, BASE_DAY)
+    wanted = {identifiers[index] for index in range(1, matching + 1)}
+
+    first = await get_calls(client, token, **days, search="5551")
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert body["total"] == matching, (
+        "`total` must count the searched set. Counting the unfiltered period would make "
+        "the pager describe a different table than the one on the screen."
+    )
+    assert body["has_more"] is True
+    assert len(ids_of(body)) == PAGE_SIZE
+
+    second = await get_calls(client, token, **days, search="5551", page=2)
+    assert second.status_code == 200, second.text
+    assert second.json()["has_more"] is False
+
+    walked = ids_of(body) + ids_of(second.json())
+    assert len(walked) == len(set(walked)) == matching, (
+        "the pages of a searched result must partition it: no row twice, none missing"
+    )
+    assert set(walked) == wanted, (
+        "a row that does not carry the digits leaked into one of the pages"
+    )
+
+    narrowed = await get_calls(client, token, **days, search="5551", employee=USER_B)
+    assert narrowed.status_code == 200, narrowed.text
+    assert set(ids_of(narrowed.json())) <= wanted, (
+        "the search must AND with the employee facet. If they OR, every added filter "
+        "WIDENS the result - the bug `test_each_filter_narrows_...` pins for the others."
+    )
+    assert narrowed.json()["total"] < matching
+
+
+async def test_the_search_is_echoed_back_raw_and_an_over_long_one_is_a_machine_code(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """What the SPA gets back, and the one way this facet is allowed to fail.
+
+    The echo carries what was *typed*, not the digits it was reduced to: the input is still
+    on the screen above the table, and a server answering `9012345` to a search for
+    `+998 90 123 45 67` would be describing a query the reader never made.
+
+    The length cap is answered as `bad_search` with the limit attached (§8: machine codes,
+    never sentences) so the SPA can state the limit instead of discovering it. The client
+    caps its field at the same number, which is what keeps this path unreachable in
+    practice - but an unreachable path that answers with a 500 is still a moderation
+    finding, and this endpoint replaces the whole table with an error card on a failed
+    first page.
+    """
+    await seed_search_rows(portal.portal_id)
+    token = session_for(portal)
+    days = period(BASE_DAY, BASE_DAY)
+
+    typed = "+998 90 123 45 67"
+    response = await get_calls(client, token, **days, search=typed)
+    assert response.status_code == 200, response.text
+    assert response.json()["table_filters"]["search"] == typed, (
+        "the echo must be the raw needle, so the SPA can re-render what was typed"
+    )
+
+    unfiltered = await get_calls(client, token, **days)
+    assert unfiltered.json()["table_filters"]["search"] is None
+
+    at_limit = await get_calls(client, token, **days, search="9" * 64)
+    assert at_limit.status_code == 200, "64 characters is the limit, not one past it"
+
+    too_long = await get_calls(client, token, **days, search="9" * 65)
+    assert too_long.status_code == 400, too_long.text
+    assert too_long.json() == {"code": "bad_search", "max_length": 64}, (
+        "§8: a machine code plus the limit, never a translated sentence"
+    )
+
+
+async def test_an_own_viewer_cannot_use_the_search_to_reach_a_colleagues_call(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """The search is a facet, not a way around `scope_filter` (§4.7).
+
+    `_filtered` layers the table facets onto `calls_repo.base_select`, so the scope is
+    already on the statement before the search narrows it. It is written down because the
+    one refactor that would break it - building the search into a statement of its own -
+    would still return perfectly plausible rows, and the rows would be somebody else's.
+    """
+    day = datetime(BASE_DAY.year, BASE_DAY.month, BASE_DAY.day, 9, 0, tzinfo=UTC)
+    identifiers = await seed_calls(
+        portal.portal_id,
+        [
+            {"bx_id": 1, "started": day, "user_id": USER_A, "phone": "+998901110000"},
+            {
+                "bx_id": 2,
+                "started": day + timedelta(minutes=1),
+                "user_id": USER_B,
+                "phone": "+998902220000",
+            },
+        ],
+    )
+    days = period(BASE_DAY, BASE_DAY)
+    own = session_for(portal, user_id=USER_A, access="own", is_admin=False)
+
+    response = await get_calls(client, own, **days, search="2220000")
+    assert response.status_code == 200, response.text
+    assert ids_of(response.json()) == [], (
+        "an `own` viewer searched for a number only a colleague's call carries and was "
+        "shown it. The scope predicate must be applied before the facet, not beside it."
+    )
+
+    mine = await get_calls(client, own, **days, search="1110000")
+    assert ids_of(mine.json()) == [identifiers[1]], (
+        "the same viewer must still find their own call by the same means"
+    )
+
+
 # --- the CRM tab -----------------------------------------------------------------------
 
 
@@ -750,6 +1033,104 @@ async def test_a_missing_context_is_409_and_not_the_whole_portal(
 
     assert response.status_code == 409
     assert response.json() == {"code": "context_missing"}
+
+
+# --- the filter facets -----------------------------------------------------------------
+
+
+FILTERS_PATH: Final[str] = "/api/v1/filters"
+
+
+async def get_filters(client: httpx.AsyncClient, token: str) -> httpx.Response:
+    response = await client.get(FILTERS_PATH, headers={"Authorization": f"Bearer {token}"})
+    assert_no_record_url(response)
+    return response
+
+
+async def test_the_employee_facet_carries_each_persons_internal_extension(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """§7: the filter names people, and in a portal with two Ivanovs a name is not an id.
+
+    The extension is the number the rest of the business already uses to mean one of them,
+    so `/filters` has to carry it or the SPA has nothing to put in the parentheses. NULL is
+    asserted alongside a real value because it is the ordinary case twice over - a portal
+    that sets no extensions, and any row not yet refreshed since the column existed - and
+    the filter must render those as no parentheses rather than as empty ones.
+
+    This is also the first test of this endpoint at all, which is why it checks the shape
+    of the payload and not only the new field.
+    """
+    await seed_employee(portal.portal_id, USER_A, "Ada", phone_inner="101")
+    await seed_employee(portal.portal_id, USER_B, "Ben")
+
+    response = await get_filters(client, session_for(portal))
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    by_id = {int(row["id"]): row for row in body["employees"]}
+    assert set(by_id) == {USER_A, USER_B}
+    assert by_id[USER_A]["phone_inner"] == "101"
+    assert by_id[USER_B]["phone_inner"] is None, (
+        "an employee with no extension must answer with NULL, not with an empty string: "
+        "the SPA decides between a name and a name plus parentheses on exactly that."
+    )
+    assert by_id[USER_A]["name"] == "Ada Operator", (
+        "the display name stays what it was; the extension is a field beside it, not part "
+        "of it - the dashboard's employee chart reads the same name and wants no number."
+    )
+
+
+async def test_an_own_viewer_gets_only_themselves_in_the_employee_facet(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """§4.7: the scope collapse is derived from `scope_filter`, not re-implemented.
+
+    An `own` principal has nobody else to filter by, so the facet is one entry - their own,
+    extension included - and `employee_filter_enabled` is false, which is how the SPA knows
+    to hide the control rather than offer it with a single pointless option. Listing a
+    colleague here would leak the portal's staff list to someone Bitrix24 has already
+    refused the portal's statistics.
+    """
+    await seed_employee(portal.portal_id, USER_A, "Ada", phone_inner="101")
+    await seed_employee(portal.portal_id, USER_B, "Ben", phone_inner="102")
+
+    token = session_for(portal, user_id=USER_A, access="own", is_admin=False)
+    response = await get_filters(client, token)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["employee_filter_enabled"] is False
+    assert [int(row["id"]) for row in body["employees"]] == [USER_A], (
+        "an `own` viewer was shown a colleague in the employee facet"
+    )
+    assert body["employees"][0]["phone_inner"] == "101"
+
+
+async def test_one_portals_employee_facet_never_shows_anothers(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """`employees` carries FORCED RLS (§3), and this endpoint reads it directly.
+
+    `load_filter_facets` is the one read of `employees` that does not go through
+    `calls_repo`, so the tenant predicate on it is worth pinning on its own: a query that
+    forgot `tenant_txn` here would return the other portal's staff without erroring.
+    """
+    other = await seed_portal()
+    try:
+        await seed_employee(portal.portal_id, USER_A, "Ada", phone_inner="101")
+        await seed_employee(other.portal_id, USER_B, "Ben", phone_inner="102")
+
+        mine = await get_filters(client, session_for(portal))
+        assert mine.status_code == 200, mine.text
+        assert [int(row["id"]) for row in mine.json()["employees"]] == [USER_A]
+
+        theirs = await get_filters(client, session_for(other))
+        assert theirs.status_code == 200, theirs.text
+        assert [int(row["id"]) for row in theirs.json()["employees"]] == [USER_B]
+    finally:
+        await wipe(other.portal_id)
+        await delete_portal(other.member_id)
 
 
 # --- the recording URL, once more, deliberately ----------------------------------------

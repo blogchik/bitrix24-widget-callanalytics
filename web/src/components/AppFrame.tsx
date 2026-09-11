@@ -110,6 +110,15 @@ export interface PageShellProps {
   chips?: ReactNode;
   /** Full-width notice above the content ("you see your own calls only"). */
   banner?: ReactNode;
+  /**
+   * Links between the pages of this placement, under the header.
+   *
+   * Only the left-menu placement has more than one page to move between, so the CRM tab
+   * and the settings page pass nothing and render exactly as before. It is a slot rather
+   * than a fixed list because this shell is also what the state and error pages use, and
+   * those must never offer a link to a page the reader cannot open.
+   */
+  nav?: ReactNode;
   children: ReactNode;
 }
 
@@ -130,7 +139,7 @@ export interface PageShellProps {
  * Everything is a multiple of 4, and vertical steps come in one pair (16 on a phone,
  * 20-32 from `sm` up) so the page has a single rhythm instead of one per component.
  */
-export function PageShell({ title, subtitle, chips, banner, children }: PageShellProps) {
+export function PageShell({ title, subtitle, chips, banner, nav, children }: PageShellProps) {
   return (
     <div className={`${SHELL_WIDTH} px-4 py-6 sm:px-6 lg:px-8 lg:py-8`}>
       <header className="mb-4 flex flex-wrap items-start justify-between gap-3 sm:mb-6">
@@ -140,6 +149,7 @@ export function PageShell({ title, subtitle, chips, banner, children }: PageShel
         </div>
         {chips ? <div className="flex flex-wrap items-center gap-2">{chips}</div> : null}
       </header>
+      {nav ? <div className="mb-4 sm:mb-5">{nav}</div> : null}
       {banner ? <div className="ca-banner mb-4 sm:mb-6">{banner}</div> : null}
       <div className="flex flex-col gap-4 sm:gap-5">{children}</div>
     </div>
@@ -224,6 +234,28 @@ export function ErrorState({ error, onRetry }: { error: unknown; onRetry?: () =>
         ) : undefined
       }
     />
+  );
+}
+
+/**
+ * The error that arrived while a previous answer is still on screen.
+ *
+ * Distinct from {@link ErrorState}, which replaces the page: §4.11 asks for a view that
+ * never goes blank, so a refetch that failed says so in a band above data that is merely
+ * stale rather than throwing away numbers the reader can still use. It lives here for the
+ * same reason the states above do - two hand-rolled copies is how one of them ends up
+ * saying something different about the same failure.
+ */
+export function StaleNotice({ error, onRetry }: { error: unknown; onRetry: () => void }) {
+  const t = useTranslations();
+  const { bodyKey } = presentError(error);
+  return (
+    <div className="ca-banner flex flex-wrap items-center gap-x-4 gap-y-2" role="status">
+      <span className="flex-1">{t(bodyKey)}</span>
+      <button type="button" className="ca-button ca-button-quiet" onClick={onRetry}>
+        {t('app.retry')}
+      </button>
+    </div>
   );
 }
 

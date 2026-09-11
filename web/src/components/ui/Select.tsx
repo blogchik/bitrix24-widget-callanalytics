@@ -34,7 +34,6 @@
 
 import {
   useCallback,
-  useEffect,
   useId,
   useLayoutEffect,
   useRef,
@@ -45,6 +44,7 @@ import {
 import { createPortal } from 'react-dom';
 
 import { Field, type FieldControl } from './Field';
+import { PANEL_MAX_H, usePopover } from './usePopover';
 
 /** One row of the listbox. */
 export interface SelectOption {
@@ -85,34 +85,9 @@ export interface SelectProps {
   onOpenChange?: (open: boolean) => void;
 }
 
-/** Gap between trigger and panel, in px. */
-const PANEL_GAP = 6;
-
-/** Keep-away from the viewport edge, in px. */
-const VIEWPORT_EDGE = 8;
-
-/** The panel never grows past this, in px, however many employees a portal has. */
-const PANEL_MAX_H = 320;
-
-/** Below this the panel is not worth flipping for; it scrolls instead. */
-const PANEL_MIN_H = 96;
-
 /** A typed run is one word: this long a pause starts a new one. */
 const TYPEAHEAD_RESET_MS = 700;
 
-/** Belt and braces: if `animationend` never arrives, the exiting panel still unmounts. */
-const EXIT_FALLBACK_MS = 600;
-
-type Phase = 'closed' | 'open' | 'closing';
-
-interface PanelPosition {
-  top: number;
-  left: number;
-  /** The panel is at least as wide as the trigger, and may grow for a long label. */
-  minWidth: number;
-  maxHeight: number;
-  placement: 'bottom' | 'top';
-}
 
 export function Select({
   label,
@@ -132,27 +107,36 @@ export function Select({
   const listId = `${base}list`;
   const optionId = (index: number) => `${base}o${index}`;
 
-  const [phase, setPhase] = useState<Phase>('closed');
   const [activeIndex, setActiveIndex] = useState(-1);
-  const [position, setPosition] = useState<PanelPosition | null>(null);
 
-  const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const panelRef = useRef<HTMLUListElement | null>(null);
   const optionRefs = useRef<Array<HTMLLIElement | null>>([]);
   const typeahead = useRef<{ buffer: string; at: number }>({ buffer: '', at: 0 });
 
-  const open = phase === 'open';
+  // Where the panel goes and when it closes: shared with `MultiSelect`, because every
+  // branch of it is a measurement against the Bitrix24 slider rather than generic popup
+  // logic, and two copies would drift apart one fix at a time.
+  const {
+    phase,
+    open,
+    position,
+    triggerRef,
+    panelRef,
+    openPanel: openPopover,
+    closePanel,
+    finishExit,
+    revealRow,
+  } = usePopover<HTMLButtonElement, HTMLUListElement>({
+    disabled,
+    onOpenChange,
+    measureKey: options.length,
+  });
   const selectedIndex = options.findIndex((option) => option.value === value);
   const selected = selectedIndex >= 0 ? options[selectedIndex] : undefined;
 
-  const notifyOpen = useCallback(
-    (next: boolean) => {
-      onOpenChange?.(next);
-    },
-    [onOpenChange],
-  );
-
   // --- open / close -------------------------------------------------------------------
+  //
+  // Which row is active on open is the listbox's business and stays here; where the panel
+  // lands is the popover's and does not.
 
   const openPanel = useCallback(
     (start: 'selected' | 'first' | 'last') => {
@@ -163,36 +147,13 @@ export function Select({
         .map((option, index) => (option.disabled ? -1 : index))
         .filter((index) => index >= 0);
       const fallback = start === 'last' ? enabled[enabled.length - 1] : enabled[0];
-      const preferred = selectedIndex >= 0 && !options[selectedIndex]?.disabled ? selectedIndex : undefined;
+      const preferred =
+        selectedIndex >= 0 && !options[selectedIndex]?.disabled ? selectedIndex : undefined;
       setActiveIndex(preferred ?? fallback ?? -1);
-      setPosition(null);
-      setPhase('open');
-      notifyOpen(true);
+      openPopover();
     },
-    [disabled, notifyOpen, options, selectedIndex],
+    [disabled, openPopover, options, selectedIndex],
   );
-
-  const closePanel = useCallback(
-    (returnFocus: boolean) => {
-      setPhase((current) => (current === 'open' ? 'closing' : current));
-      if (returnFocus) {
-        triggerRef.current?.focus();
-      }
-      notifyOpen(false);
-    },
-    [notifyOpen],
-  );
-
-  // The exit animation has to finish before the node goes, so the panel stays mounted for
-  // one more beat. `data-phase` is read off the DOM rather than off a closure, so a panel
-  // that was reopened mid-exit is not torn down by its own stale animation.
-  useEffect(() => {
-    if (phase !== 'closing') {
-      return;
-    }
-    const timer = window.setTimeout(() => setPhase('closed'), EXIT_FALLBACK_MS);
-    return () => window.clearTimeout(timer);
-  }, [phase]);
 
   const commit = useCallback(
     (index: number) => {
@@ -206,116 +167,12 @@ export function Select({
     [closePanel, onChange, options],
   );
 
-  // --- placement ----------------------------------------------------------------------
-
-  useLayoutEffect(() => {
-    if (phase === 'closed') {
-      return;
-    }
-    const update = () => {
-      const trigger = triggerRef.current;
-      const panel = panelRef.current;
-      if (!trigger || !panel) {
-        return;
-      }
-      const rect = trigger.getBoundingClientRect();
-      const viewportW = document.documentElement.clientWidth;
-      const viewportH = document.documentElement.clientHeight;
-
-      // Scrolled past its own trigger, the panel is a menu belonging to nothing visible.
-      // Pinning it to the viewport edge would be worse than dismissing it.
-      if (phase === 'open' && (rect.bottom < 0 || rect.top > viewportH)) {
-        closePanel(false);
-        return;
-      }
-
-      const below = viewportH - rect.bottom - PANEL_GAP - VIEWPORT_EDGE;
-      const above = rect.top - PANEL_GAP - VIEWPORT_EDGE;
-      const wanted = Math.min(panel.scrollHeight + 2, PANEL_MAX_H);
-
-      // Down unless down does not fit and up fits better: the short iframe is exactly the
-      // case where a panel that never flips opens off the bottom edge.
-      const placement: PanelPosition['placement'] =
-        below >= wanted || below >= above ? 'bottom' : 'top';
-      const room = placement === 'bottom' ? below : above;
-      const height = Math.min(wanted, Math.max(PANEL_MIN_H, room));
-
-      const width = Math.max(panel.offsetWidth, rect.width);
-      const left = Math.max(
-        VIEWPORT_EDGE,
-        Math.min(rect.left, viewportW - width - VIEWPORT_EDGE),
-      );
-      const rawTop = placement === 'bottom' ? rect.bottom + PANEL_GAP : rect.top - PANEL_GAP - height;
-      const top = Math.max(
-        VIEWPORT_EDGE,
-        Math.min(rawTop, viewportH - height - VIEWPORT_EDGE),
-      );
-
-      setPosition((current) => {
-        if (
-          current &&
-          current.top === top &&
-          current.left === left &&
-          current.minWidth === rect.width &&
-          current.maxHeight === height &&
-          current.placement === placement
-        ) {
-          return current;
-        }
-        return { top, left, minWidth: rect.width, maxHeight: height, placement };
-      });
-    };
-
-    update();
-    // `true` so an ancestor scrolling - a card, the page, the slider - moves the panel with
-    // its trigger instead of leaving it stranded.
-    window.addEventListener('scroll', update, true);
-    window.addEventListener('resize', update);
-    return () => {
-      window.removeEventListener('scroll', update, true);
-      window.removeEventListener('resize', update);
-    };
-  }, [closePanel, phase, options.length]);
-
   // Keep the active row in view without `scrollIntoView`, which would also scroll the page.
   useLayoutEffect(() => {
-    if (!open || activeIndex < 0) {
-      return;
+    if (open && activeIndex >= 0) {
+      revealRow(optionRefs.current[activeIndex] ?? null);
     }
-    const list = panelRef.current;
-    const node = optionRefs.current[activeIndex];
-    if (!list || !node) {
-      return;
-    }
-    const top = node.offsetTop;
-    const bottom = top + node.offsetHeight;
-    if (top < list.scrollTop) {
-      list.scrollTop = Math.max(0, top - 4);
-    } else if (bottom > list.scrollTop + list.clientHeight) {
-      list.scrollTop = bottom - list.clientHeight + 4;
-    }
-  }, [activeIndex, open, position]);
-
-  // --- dismissal ----------------------------------------------------------------------
-
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    const onPointerDown = (event: PointerEvent) => {
-      const target = event.target;
-      if (!(target instanceof Node)) {
-        return;
-      }
-      if (triggerRef.current?.contains(target) || panelRef.current?.contains(target)) {
-        return;
-      }
-      // A click elsewhere is a click on that thing, so focus is left where it landed.
-      closePanel(false);
-    };
-    document.addEventListener('pointerdown', onPointerDown, true);
-    return () => document.removeEventListener('pointerdown', onPointerDown, true);
-  }, [closePanel, open]);
+  }, [activeIndex, open, position, revealRow]);
 
   // --- keyboard -----------------------------------------------------------------------
 
@@ -539,7 +396,7 @@ export function Select({
                   onPointerDown={keepFocus}
                   onAnimationEnd={(event) => {
                     if (event.currentTarget.dataset['phase'] === 'closing') {
-                      setPhase('closed');
+                      finishExit();
                     }
                   }}
                 >

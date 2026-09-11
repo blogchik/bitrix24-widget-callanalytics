@@ -79,6 +79,7 @@ __all__ = [
     "FilterError",
     "load_dashboard",
     "load_filter_facets",
+    "load_hours",
     "parse_filters",
     "resolve_timezone",
 ]
@@ -750,6 +751,169 @@ async def load_dashboard(principal: Principal, filters: CallFilters) -> dict[str
         "per_employee": series,
         "per_employee_all": employees,
         "series_cap": _SERIES_CAP,
+    }
+
+
+#: Rows a single `/hours` answer may carry, where a row is one (employee, local day).
+#:
+#: The grid is 24 cells wide, so this is 12 000 cells - about what a slider can render
+#: before scrolling it becomes the slower half of the page. It is a cap on the ANSWER and
+#: not on the question: the response says how many rows there really were, and the SPA
+#: tells the reader to narrow the period or the selection. A cap that quietly returns the
+#: first N reads as "this is all of it", which is the one thing it must not do.
+_HOUR_ROW_CAP: Final[int] = 500
+
+#: The hours of a day, as the grid draws them. Materialised rather than derived per row:
+#: every row carries all 24 whether or not a call happened in each, because a grid with
+#: holes in it is a grid that has to be read twice (the same argument §4.11 makes for
+#: zero-filling the per-day series).
+_DAY_HOURS: Final[tuple[int, ...]] = tuple(range(24))
+
+
+async def load_hours(principal: Principal, filters: CallFilters) -> dict[str, Any]:
+    """Talk time per employee, per local day, per hour (the "by hour" page).
+
+    One `GROUP BY` over the period, never a fourth grouping set on `/dashboard`: that
+    query is issued on every open of the left-menu page, and a `(portal_user_id, hour)`
+    set would make it aggregate up to `_EMPLOYEE_CAP` x 24 rows that nothing on the
+    dashboard draws.
+
+    **The two numbers in a cell are deliberately about different sets of calls.** Talk
+    time is `call_duration` over ANSWERED calls - the same definition the summary tile
+    carries, and the only one that means "time spent talking" - while the count is every
+    call in that hour. A cell reading "20 (43)" therefore says: forty-three attempts, and
+    twenty minutes of conversation to show for them. Narrowing the count to answered calls
+    would make the two numbers describe one set and lose exactly the comparison the page
+    exists for.
+
+    Hours and days are the **viewer's**, via `timezone(:tz, ...)` (§4.6 `tz`), so a call at
+    23:30 in Tashkent is not filed under the server's yesterday at 18:30. The buckets are
+    projected in an inner subquery and grouped by the projection, for the reason the module
+    docstring gives: a bound parameter compares equal only to itself, so grouping by the
+    expression would be rejected.
+
+    A `portal_user_id` of NULL is nobody's call (§3 allows it). It gets its own row, marked
+    `unassigned`, rather than being filtered out - dropping it would make the page quietly
+    disagree with every other count in the app about how many calls the portal made.
+    """
+    tz_param: BindParameter[str] = bindparam("viewer_tz", filters.tz_name)
+    local_ts = func.timezone(tz_param, Call.call_start_date)
+
+    scoped = (
+        base_select(principal)
+        .with_only_columns(
+            local_ts.cast(Date).label("day"),
+            extract("hour", local_ts).cast(Integer).label("hour"),
+            Call.portal_user_id.label("bx_user_id"),
+            Call.result_group.label("result_group"),
+            Call.call_duration.label("call_duration"),
+        )
+        # `predicates()` and not `facet_predicates()`: this page has no previous window to
+        # compare against, so it reads exactly the period it was asked for.
+        .where(*filters.predicates())
+        .subquery("scoped")
+    )
+
+    answered = scoped.c.result_group == _ANSWERED_STORED
+    aggregate = (
+        select(
+            scoped.c.day,
+            scoped.c.hour,
+            scoped.c.bx_user_id,
+            func.count().label("calls"),
+            func.coalesce(
+                func.sum(scoped.c.call_duration).filter(answered), 0
+            ).label("talk_seconds"),
+        )
+        .group_by(scoped.c.day, scoped.c.hour, scoped.c.bx_user_id)
+        .cte("agg")
+    )
+
+    stmt = select(
+        aggregate,
+        Employee.name.label("emp_name"),
+        Employee.last_name.label("emp_last_name"),
+        Employee.phone_inner.label("emp_phone_inner"),
+        Employee.active.label("emp_active"),
+    ).select_from(
+        # LEFT, exactly as the dashboard breakdown joins it: a `portal_user_id` with no
+        # cached employee row must still appear as "User #id" (§7) instead of vanishing.
+        aggregate.outerjoin(
+            Employee,
+            and_(
+                Employee.portal_id == principal.portal_id,
+                Employee.bx_user_id == aggregate.c.bx_user_id,
+            ),
+        )
+    )
+
+    async with tenant_txn(principal.portal_id) as session:
+        cells = [dict(row) for row in (await session.execute(stmt)).mappings().all()]
+
+    # (bx_user_id, day) -> the row being built. Assembled in Python rather than with a
+    # second, wider query: the grid is dense by construction and 24 zeroes per row are
+    # cheaper to write here than to make Postgres generate.
+    rows: dict[tuple[int | None, dt.date], dict[str, Any]] = {}
+    for cell in cells:
+        key = (cell["bx_user_id"], cell["day"])
+        row = rows.get(key)
+        if row is None:
+            user_id = cell["bx_user_id"]
+            row = {
+                "employee_id": user_id,
+                "bx_user_id": user_id,
+                "name": _display_name(cell["emp_name"], cell["emp_last_name"]),
+                "phone_inner": cell["emp_phone_inner"],
+                "active": True if cell["emp_active"] is None else bool(cell["emp_active"]),
+                "unassigned": user_id is None,
+                "date": cell["day"].isoformat(),
+                # [talk_seconds, calls] per hour, positionally. A list of objects would
+                # trip this payload's size for no gain: the index IS the hour.
+                "hours": [[0, 0] for _ in _DAY_HOURS],
+                "talk_seconds": 0,
+                "calls": 0,
+            }
+            rows[key] = row
+        hour = int(cell["hour"])
+        talk = int(cell["talk_seconds"])
+        calls = int(cell["calls"])
+        row["hours"][hour] = [talk, calls]
+        row["talk_seconds"] += talk
+        row["calls"] += calls
+
+    # Two stable passes rather than one key: a date has no negation, and reversing the
+    # whole sort would also reverse the names inside each day.
+    #
+    # Newest day first - the question is nearly always about this week - and inside a day,
+    # alphabetically. The employee chart ranks by volume because it is read as a ranking;
+    # a grid is read by looking somebody up, and for that a stable alphabet beats an order
+    # that moves every time the numbers do.
+    ordered = sorted(
+        rows.values(),
+        key=lambda item: (
+            item["name"] or "",
+            item["bx_user_id"] is None,
+            int(item["bx_user_id"] or 0),
+        ),
+    )
+    ordered.sort(key=lambda item: str(item["date"]), reverse=True)
+
+    total_rows = len(ordered)
+    shown = ordered[:_HOUR_ROW_CAP]
+
+    return {
+        "rows": shown,
+        # The ramp is normalised over the WHOLE table, so it is computed here and not in
+        # the browser: a client that re-derived it from the rows it received would paint a
+        # truncated answer on a different scale than the full one.
+        "max_cell_seconds": max(
+            (int(cell[0]) for row in shown for cell in row["hours"]), default=0
+        ),
+        "total_rows": total_rows,
+        "row_cap": _HOUR_ROW_CAP,
+        "truncated": total_rows > _HOUR_ROW_CAP,
+        "scope": principal.access,
+        **filters.describe(),
     }
 
 

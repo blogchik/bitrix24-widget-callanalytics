@@ -177,6 +177,9 @@ export default function HoursPage() {
     <>
       <style dangerouslySetInnerHTML={{ __html: `${VIZ_CSS}${NAV_CSS}${HOURLY_CSS}` }} />
       <PageShell
+        // Twenty-six columns: the reading-width cap would make this scroll sideways on a
+        // screen with room to spare.
+        wide
         title={t('app.hours.title')}
         subtitle={t('app.hours.subtitle')}
         nav={

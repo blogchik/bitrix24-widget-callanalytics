@@ -733,6 +733,7 @@ async def load_filter_facets(principal: Principal) -> dict[str, Any]:
         Employee.name,
         Employee.last_name,
         Employee.work_position,
+        Employee.phone_inner,
         Employee.active,
         Employee.found,
     ).where(Employee.portal_id == principal.portal_id)
@@ -796,6 +797,10 @@ async def load_filter_facets(principal: Principal) -> dict[str, Any]:
                 "bx_user_id": int(row["bx_user_id"]),
                 "name": _display_name(row["name"], row["last_name"]),
                 "work_position": row["work_position"],
+                # §7: the internal extension, which the filter shows in parentheses after
+                # the name. NULL for a portal that sets none, and for any row not yet
+                # refreshed - both render as no parentheses rather than as empty ones.
+                "phone_inner": row["phone_inner"],
                 "active": bool(row["active"]),
                 # `found=false` means `user.get` no longer returns this id (§3); the SPA
                 # renders "User #id" for it, which is why the name may be null.

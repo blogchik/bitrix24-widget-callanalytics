@@ -202,6 +202,10 @@ class FilteringBitrix:
                     "ACTIVE": True,
                     "WORK_POSITION": "Sales",
                     "UF_DEPARTMENT": [1],
+                    # §7: `user.get` is called with no field list, so a real portal's
+                    # `user_brief` answer carries this beside the rest. The fake says so
+                    # too, or the column below could never be shown to be written.
+                    "UF_PHONE_INNER": str(1000 + uid),
                 }
                 for uid in wanted
             ]
@@ -415,20 +419,55 @@ async def test_a_failing_page_leaves_no_permanent_hole(
 async def test_employees_referenced_by_calls_are_resolved(
     portal_and_bitrix,  # type: ignore[no-untyped-def]
 ) -> None:
-    """§7: the upsert leaves placeholders and the refresh job fills them in."""
+    """§7: the upsert leaves placeholders and the refresh job fills them in.
+
+    The extension is asserted here rather than in a test of its own because it is written
+    by the same statement as the name, and the way it goes wrong is not a failure to parse
+    it but a failure to list it: `_store` updates an explicit allowlist of columns on
+    conflict, so a column added to the record dict and forgotten there is inserted once
+    for a brand-new employee and then never updated again - which no test that only ever
+    sees a first refresh would notice.
+    """
     seeded, _ = portal_and_bitrix
     await _drive(seeded.portal_id, visits=8)
 
-    async with tenant_txn(seeded.portal_id) as session:
-        rows = (
-            await session.execute(
-                text("SELECT bx_user_id, name, fetched_at FROM employees ORDER BY bx_user_id")
-            )
-        ).mappings().all()
+    async def employees() -> list[dict[str, Any]]:
+        async with tenant_txn(seeded.portal_id) as session:
+            return [
+                dict(row)
+                for row in (
+                    await session.execute(
+                        text(
+                            "SELECT bx_user_id, name, phone_inner, fetched_at "
+                            "FROM employees ORDER BY bx_user_id"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            ]
 
+    rows = await employees()
     assert {int(r["bx_user_id"]) for r in rows} == {100, 101, 102}
     assert all(r["fetched_at"] is not None for r in rows), (
         "every placeholder should have been resolved by employees_refresh (§7)"
+    )
+    assert {int(r["bx_user_id"]): r["phone_inner"] for r in rows} == {
+        100: "1100",
+        101: "1101",
+        102: "1102",
+    }, "UF_PHONE_INNER must reach `employees.phone_inner`; the filter renders it (§7)"
+
+    # Force a second pass over rows that already exist, which is the path the conflict
+    # allowlist governs. The extension must survive it rather than being frozen at insert.
+    async with tenant_txn(seeded.portal_id) as session:
+        await session.execute(
+            text("UPDATE employees SET phone_inner = NULL, fetched_at = NULL")
+        )
+    await _drive(seeded.portal_id, visits=8)
+    assert all(r["phone_inner"] is not None for r in await employees()), (
+        "a refresh of an existing row left `phone_inner` behind: the column is missing "
+        "from the ON CONFLICT DO UPDATE allowlist in `_store`."
     )
 
 

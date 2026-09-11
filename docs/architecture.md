@@ -409,12 +409,14 @@ CREATE TABLE employees (
     active         boolean      NOT NULL DEFAULT true,
     found          boolean      NOT NULL DEFAULT true,
     departments    integer[]    NOT NULL DEFAULT '{}',
+    phone_inner    varchar(32),
     fetched_at     timestamptz,
     PRIMARY KEY (portal_id, bx_user_id)
 );
 CREATE INDEX employees_stale_idx ON employees (portal_id, fetched_at NULLS FIRST);
 
 COMMENT ON TABLE  employees IS 'Per-portal user_brief cache (no contact details by scope design). Includes dismissed users (active=false) because historical calls reference them.';
+COMMENT ON COLUMN employees.phone_inner IS 'UF_PHONE_INNER from user.get (user_brief scope). Internal telephony extension, shown beside the name in the employee filter. NULL = the portal sets none, or the row has not been refreshed since the column was added. Not a contact detail: email and personal phone are user_basic, which this app never requests.';
 COMMENT ON COLUMN employees.found IS 'false when user.get returned nothing for this id; retried daily instead of every cycle; UI shows "User #id".';
 COMMENT ON COLUMN employees.fetched_at IS 'NULL = placeholder inserted by the call upsert for an unseen PORTAL_USER_ID; refresh job takes NULLs first, then rows older than EMPLOYEE_TTL_HOURS.';
 
@@ -517,7 +519,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE ca_owner IN SCHEMA public GRANT USAGE, SELECT 
 - **`portals`** — tenant registry and the single portal credential in one row: minimal, and the `token_version` / `FOR UPDATE` single-flight needs exactly one row to lock. `member_id` has a format CHECK so garbage never becomes a tenant, but it is treated as public data. `client_endpoint` is written only from the OAuth response. `token_admin_verified_at` records that the stored credential belongs to a proven administrator. `token_status` is the one column the settings page and dashboard banner read to explain why sync stopped. `application_token_enc` survives uninstall so late/duplicate lifecycle events still verify. `last_event_ts` makes event delivery idempotent and stops a retried uninstall from wiping a fresh reinstall. `purge_pending`/`purge_bodies` make uninstall cleanup (including the CLEAN=1 body wipe) durable without a queue. The ONAPPUSERREADY system-user credential is **not** stored in v1 (unused, and a stored 180-day token is a liability).
 - **`portal_sync`** — everything the worker needs to resume from any crash, plus the two safety columns the review demanded: `sync_generation` (fencing) and `rescan_from_id` (no NULL-derived full rescans). `throttle_hits` separates "the portal is busy" from "the portal is broken". `run_started_at` distinguishes a crashed run from a dispatch miss. Separate from `portals` because it is rewritten after every batch and must never contend with the credential row's lock.
 - **`calls`** — the cache. Natural key `(portal_id, bx_id)` is the upsert target; the surrogate `id` is only for the API's opaque row ids. Generated `has_record` and `result_group` make the recording and result mappings identical in filters, summaries and jobs. Constraints on Bitrix-supplied values were removed and string widths raised so a novel `CALL_TYPE`, a `DEAL` entity type or a long failure code cannot abort a 500-row chunk. The range index is covering so summary/heatmap/per-employee aggregation is an index-only scan.
-- **`employees`** — `user_brief` fields only (scope). `fetched_at` NULL placeholders are inserted by the call upsert so the refresh job never has to `SELECT DISTINCT` over `calls`; `found=false` stops retrying deleted users every cycle. Dismissed users are kept because their calls remain.
+- **`employees`** — `user_brief` fields only (scope), which includes the internal extension `phone_inner` and excludes email and personal phone. `fetched_at` NULL placeholders are inserted by the call upsert so the refresh job never has to `SELECT DISTINCT` over `calls`; `found=false` stops retrying deleted users every cycle. Dismissed users are kept because their calls remain.
 - **`crm_contexts`** — the resolved matching set for a CRM tab, written only by a successful resolution by the *current* opener and read only when at least as fresh as the JWT, so a privileged user's resolution is never replayed for someone who lacks CRM rights.
 - **`rest_log`** — the moderation log for both directions with recursive redaction and a body cap; `portal_id` nullable so pre-install calls and rejected events are logged. Retention by batched `DELETE` on the `ts` index.
 - **`portal_events`** — small lifecycle audit that outlives `rest_log` retention; the first thing support reads for a misbehaving portal, and the place a quarantined row is recorded. No tokens, ever.
@@ -708,7 +710,8 @@ Terminal states set `token_status` and `next_run_at='infinity'`: OAuth `invalid_
 ---
 
 ## 7. Employee cache
-- `employees` holds `user_brief` fields (no email/phone by scope), `active`, `departments`, `photo_url`, `found`.
+- `employees` holds `user_brief` fields (no email or personal phone by scope — those are `user_basic`), `active`, `departments`, `photo_url`, `phone_inner`, `found`.
+- `phone_inner` is `UF_PHONE_INNER`, part of `user_brief` and already present in the `user.get` answer the refresher parses (it sends no field list), so showing it in the employee filter costs no new scope and no extra request. It is the portal's own internal extension, not a contact detail.
 - Writers (all inside `tenant_txn`): (a) the call upsert inserts placeholders for unseen `PORTAL_USER_ID`s; (b) `/app/` upserts the viewer from `user.current`; (c) `employees_refresh` inside `sync_portal` runs immediately when placeholders exist and otherwise every `EMPLOYEE_TTL_HOURS` (default 4): rows with `fetched_at IS NULL` first, then stale ones, chunked by 50 ids into `user.get {FILTER:{"@ID":[…]}, ADMIN_MODE:true}` commands, up to 50 commands per batch, with the portal token; on an `ADMIN_MODE` error retry without it. Never `ACTIVE=true` — dismissed users own historical calls; the UI greys them with a "dismissed" badge. Ids with no result get `found=false` and are retried daily.
 - Readers: `GET /api/v1/filters` and the calls table join `employees` under RLS; a miss renders "User #id".
 

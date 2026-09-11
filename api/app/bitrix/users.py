@@ -139,8 +139,13 @@ def parse_user(raw: Any) -> dict[str, Any] | None:
     """One `user_brief` record -> the shape the `employees` cache stores (§7).
 
     Returns None when the record carries no usable numeric `ID`; the caller then leaves
-    that id unresolved (`found=false`) rather than inventing a row. Contact fields are
-    never read: the app holds `user_brief` only, and §3 has no column for them.
+    that id unresolved (`found=false`) rather than inventing a row.
+
+    Contact fields are never read: EMAIL, PERSONAL_PHONE and WORK_PHONE belong to
+    `user_basic`, the app holds `user_brief` only, and §3 has no column for them.
+    `UF_PHONE_INNER` is not one of them despite the name - it is the portal's own
+    internal extension, it is part of `user_brief`, and §7 shows it in the employee
+    filter.
     """
     if not isinstance(raw, Mapping):
         return None
@@ -158,6 +163,11 @@ def parse_user(raw: Any) -> dict[str, Any] | None:
         # still resolve to a name, so the flag is stored and rendered, not used to skip.
         "active": _as_bool(_field(raw, "ACTIVE", "active"), default=True),
         "departments": _as_int_list(_field(raw, "UF_DEPARTMENT", "uf_department")),
+        # The one UF_* field besides the department list that §3 stores: the internal
+        # extension the employee filter shows beside the name. It arrives in the same
+        # `user_brief` response as the rest - `fetch_users` asks for no field list - so
+        # keeping it costs no scope and no extra request.
+        "phone_inner": _as_str(_field(raw, "UF_PHONE_INNER", "uf_phone_inner")),
         "timezone": _as_str(_field(raw, "TIME_ZONE", "time_zone")),
     }
 
@@ -191,7 +201,9 @@ async def user_current(client: BitrixClient) -> dict[str, Any]:
     """`user.current` as a parsed record (§4.4 step 4 upserts the viewer from it).
 
     Scope: `user`, `user_brief` or `user_basic` - any of the three (verified). The app
-    holds `user_brief`, so EMAIL and phones are absent by construction.
+    holds `user_brief`, so EMAIL and personal phones are absent by construction. What
+    `user.current` reports of the UF_* fields is not, which is why `upsert_viewer` writes
+    none of them.
     """
     return _require_user(await client.call(USER_CURRENT, {}))
 

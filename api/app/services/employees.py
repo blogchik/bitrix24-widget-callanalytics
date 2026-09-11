@@ -79,6 +79,10 @@ async def upsert_viewer(portal_id: int, identity: Identity) -> None:
       employee in the UI (§7 keeps them, greyed, because their calls remain).
     * `departments` - only `user.get` returns `UF_DEPARTMENT`; writing `{}` here would
       erase what the refresher learned.
+    * `phone_inner` - the same argument as `departments`, and the one the viewer would
+      notice: it is their own extension disappearing from the filter on every app open.
+      `user.current` is not documented to report `UF_PHONE_INNER`, and this app has never
+      measured that it does, so `employees_refresh` stays its only writer.
 
     `fetched_at` is set because this row is real data, not a placeholder: §7's refresh
     job takes `NULL` rows first, and a viewer that keeps re-inserting itself as

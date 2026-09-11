@@ -254,18 +254,23 @@ async def store_context(
         )
 
 
-async def seed_employee(portal_id: int, user_id: int, name: str) -> None:
+async def seed_employee(
+    portal_id: int, user_id: int, name: str, phone_inner: str | None = None
+) -> None:
+    """One cached employee. `phone_inner=None` is the ordinary case, not a degenerate one:
+    a portal that sets no extensions, and any row not refreshed since §7 grew the column.
+    """
     async with tenant_txn(portal_id) as session:
         await session.execute(
             text(
                 """
-                INSERT INTO employees (portal_id, bx_user_id, name, last_name, active, found,
-                                       fetched_at)
-                VALUES (:pid, :uid, :name, 'Operator', true, true, now())
+                INSERT INTO employees (portal_id, bx_user_id, name, last_name, phone_inner,
+                                       active, found, fetched_at)
+                VALUES (:pid, :uid, :name, 'Operator', :ext, true, true, now())
                 ON CONFLICT (portal_id, bx_user_id) DO NOTHING
                 """
             ),
-            {"pid": portal_id, "uid": user_id, "name": name},
+            {"pid": portal_id, "uid": user_id, "name": name, "ext": phone_inner},
         )
 
 
@@ -1028,6 +1033,104 @@ async def test_a_missing_context_is_409_and_not_the_whole_portal(
 
     assert response.status_code == 409
     assert response.json() == {"code": "context_missing"}
+
+
+# --- the filter facets -----------------------------------------------------------------
+
+
+FILTERS_PATH: Final[str] = "/api/v1/filters"
+
+
+async def get_filters(client: httpx.AsyncClient, token: str) -> httpx.Response:
+    response = await client.get(FILTERS_PATH, headers={"Authorization": f"Bearer {token}"})
+    assert_no_record_url(response)
+    return response
+
+
+async def test_the_employee_facet_carries_each_persons_internal_extension(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """§7: the filter names people, and in a portal with two Ivanovs a name is not an id.
+
+    The extension is the number the rest of the business already uses to mean one of them,
+    so `/filters` has to carry it or the SPA has nothing to put in the parentheses. NULL is
+    asserted alongside a real value because it is the ordinary case twice over - a portal
+    that sets no extensions, and any row not yet refreshed since the column existed - and
+    the filter must render those as no parentheses rather than as empty ones.
+
+    This is also the first test of this endpoint at all, which is why it checks the shape
+    of the payload and not only the new field.
+    """
+    await seed_employee(portal.portal_id, USER_A, "Ada", phone_inner="101")
+    await seed_employee(portal.portal_id, USER_B, "Ben")
+
+    response = await get_filters(client, session_for(portal))
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    by_id = {int(row["id"]): row for row in body["employees"]}
+    assert set(by_id) == {USER_A, USER_B}
+    assert by_id[USER_A]["phone_inner"] == "101"
+    assert by_id[USER_B]["phone_inner"] is None, (
+        "an employee with no extension must answer with NULL, not with an empty string: "
+        "the SPA decides between a name and a name plus parentheses on exactly that."
+    )
+    assert by_id[USER_A]["name"] == "Ada Operator", (
+        "the display name stays what it was; the extension is a field beside it, not part "
+        "of it - the dashboard's employee chart reads the same name and wants no number."
+    )
+
+
+async def test_an_own_viewer_gets_only_themselves_in_the_employee_facet(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """§4.7: the scope collapse is derived from `scope_filter`, not re-implemented.
+
+    An `own` principal has nobody else to filter by, so the facet is one entry - their own,
+    extension included - and `employee_filter_enabled` is false, which is how the SPA knows
+    to hide the control rather than offer it with a single pointless option. Listing a
+    colleague here would leak the portal's staff list to someone Bitrix24 has already
+    refused the portal's statistics.
+    """
+    await seed_employee(portal.portal_id, USER_A, "Ada", phone_inner="101")
+    await seed_employee(portal.portal_id, USER_B, "Ben", phone_inner="102")
+
+    token = session_for(portal, user_id=USER_A, access="own", is_admin=False)
+    response = await get_filters(client, token)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["employee_filter_enabled"] is False
+    assert [int(row["id"]) for row in body["employees"]] == [USER_A], (
+        "an `own` viewer was shown a colleague in the employee facet"
+    )
+    assert body["employees"][0]["phone_inner"] == "101"
+
+
+async def test_one_portals_employee_facet_never_shows_anothers(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """`employees` carries FORCED RLS (§3), and this endpoint reads it directly.
+
+    `load_filter_facets` is the one read of `employees` that does not go through
+    `calls_repo`, so the tenant predicate on it is worth pinning on its own: a query that
+    forgot `tenant_txn` here would return the other portal's staff without erroring.
+    """
+    other = await seed_portal()
+    try:
+        await seed_employee(portal.portal_id, USER_A, "Ada", phone_inner="101")
+        await seed_employee(other.portal_id, USER_B, "Ben", phone_inner="102")
+
+        mine = await get_filters(client, session_for(portal))
+        assert mine.status_code == 200, mine.text
+        assert [int(row["id"]) for row in mine.json()["employees"]] == [USER_A]
+
+        theirs = await get_filters(client, session_for(other))
+        assert theirs.status_code == 200, theirs.text
+        assert [int(row["id"]) for row in theirs.json()["employees"]] == [USER_B]
+    finally:
+        await wipe(other.portal_id)
+        await delete_portal(other.member_id)
 
 
 # --- the recording URL, once more, deliberately ----------------------------------------

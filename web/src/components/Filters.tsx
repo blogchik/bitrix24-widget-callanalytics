@@ -68,7 +68,18 @@ export interface EmployeeOption {
   name?: string | null;
   /** Dismissed users keep their calls (§7) and stay selectable, marked as such. */
   active?: boolean | null;
+  /** `UF_PHONE_INNER` (§7): the internal extension, shown after the name. */
+  phone_inner?: string | null;
 }
+
+/**
+ * The longest extension this filter will render.
+ *
+ * A real internal number is two to six characters, but `UF_PHONE_INNER` is a free-text
+ * field and some portals put a whole phone number in it. Rendering that would push every
+ * row of the dropdown out to its width cap to carry one row's value.
+ */
+const EXTENSION_MAX_CHARS = 8;
 
 /** One telephony line / integration (`GET /api/v1/filters`). */
 export interface LineOption {
@@ -239,19 +250,37 @@ export function Filters({
   );
 
   /**
-   * A dismissed employee keeps their calls (§7) and stays selectable. "Dismissed" is the
-   * option's `hint`, not part of its label: as a suffix it was what made these rows the
-   * longest in the list and pushed the control wider than every other control in the row.
+   * An employee row carries two things beside the name, and they are in different slots
+   * for reasons that are worth stating together, because they look inconsistent.
+   *
+   * **"Dismissed" is the `hint`.** A dismissed user keeps their calls (§7) and stays
+   * selectable, but as a label suffix the word was what made these rows the longest in
+   * the list and pushed the control wider than every other control in the row.
+   *
+   * **The extension is part of the `label`.** In a portal with two Ivanovs the name is
+   * not an identifier and the extension is - so it has to survive selection, and the
+   * trigger renders the label only: in the `hint` it would vanish the moment the reader
+   * picked that employee, leaving a filter whose chosen state says less than its options
+   * did. It is also five or six characters against the word's nine or ten, and
+   * {@link EXTENSION_MAX_CHARS} keeps it that way, so the width finding above does not
+   * repeat here.
+   *
+   * No extension is offered beside "User #17": two numbers side by side, meaning
+   * different things, is worse than one.
    */
   const employeeOptions = useMemo(
     (): readonly SelectOption[] => [
       { value: '', label: allLabel },
       ...options.employees.map((employee) => {
         const name = employee.name?.trim();
+        const extension = employee.phone_inner?.trim();
         return {
           value: String(employee.id),
-          label:
-            name || t('app.dashboard.filter.unknownEmployee', { id: String(employee.id) }),
+          label: name
+            ? extension && extension.length <= EXTENSION_MAX_CHARS
+              ? `${name} (${extension})`
+              : name
+            : t('app.dashboard.filter.unknownEmployee', { id: String(employee.id) }),
           hint:
             employee.active === false ? t('app.dashboard.filter.dismissed') : undefined,
         };

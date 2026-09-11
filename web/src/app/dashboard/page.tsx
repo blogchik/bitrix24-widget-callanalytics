@@ -151,6 +151,9 @@ export default function DashboardPage() {
     <>
       <style dangerouslySetInnerHTML={{ __html: `${VIZ_CSS}${NAV_CSS}` }} />
       <PageShell
+        // The same column as the by-hour page: both are grids, and a reading-width cap
+        // left the charts and the call table narrower than the screen they had.
+        wide
         title={t('app.dashboard.title')}
         subtitle={data ? rangeLabel(data.range, locale) : undefined}
         nav={

@@ -105,12 +105,79 @@ export const RAMP: readonly string[] = [
  * Linear and monotone, with one deliberate kink: any non-zero count is at least step 1,
  * so "one call happened here" never renders identically to "nothing happened here".
  */
-export function rampIndex(value: number, max: number): number {
+export function rampIndex(value: number, max: number, steps: number = RAMP.length): number {
   if (!Number.isFinite(value) || value <= 0 || !Number.isFinite(max) || max <= 0) {
     return 0;
   }
-  const step = Math.ceil((value / max) * (RAMP.length - 1));
-  return Math.min(RAMP.length - 1, Math.max(1, step));
+  const step = Math.ceil((value / max) * (steps - 1));
+  return Math.min(steps - 1, Math.max(1, step));
+}
+
+// --- the talk-time ramp (the by-hour grid) --------------------------------------------
+
+/**
+ * Green through amber to red, for the hours grid — and a deliberate exception to the rule
+ * the heatmap above states, so the reasoning has to be written down rather than assumed.
+ *
+ * The heatmap refuses a rainbow because colour is its ONLY channel: a cell there carries
+ * no text, so a hue that two readers rank differently is a value two readers read
+ * differently. The hours grid is the opposite case. Every cell prints its minutes and its
+ * call count, always; the paint is a second, redundant encoding of a number that is
+ * already there in words. Nothing is lost when it cannot be told apart — which is the
+ * condition under which a red/green pair is safe, and it is met here and only here.
+ *
+ * The steps are still measurements, not preferences. Lightness is chosen so the printed
+ * number clears 4.5:1 against the ink on every step of both themes (measured: 5.4:1 at the
+ * worst light step, 4.6:1 at the worst dark one), because a cell whose colour hides its
+ * own number would have taken the value away rather than added to it.
+ */
+export const TALK_RAMP_LIGHT: readonly string[] = [
+  '#dbf0e2',
+  '#cfeed3',
+  '#c9edc2',
+  '#cfedb4',
+  '#e0f3a0',
+  '#f8f18e',
+  '#fad97e',
+  '#f8be72',
+  '#f4a568',
+  '#ed8b60',
+  '#e4725c',
+  '#da6058',
+];
+
+/** The same hues sunk into the dark surface, with the light ink on top. */
+export const TALK_RAMP_DARK: readonly string[] = [
+  '#1e482c',
+  '#1d5224',
+  '#265d1b',
+  '#3e6919',
+  '#5d750e',
+  '#756d07',
+  '#8a6706',
+  '#9d5d08',
+  '#a44e0c',
+  '#a73f13',
+  '#a7331b',
+  '#a72d25',
+];
+
+/** Which talk-time step a number of seconds lands on. */
+export function talkIndex(seconds: number, max: number): number {
+  return rampIndex(seconds, max, TALK_RAMP_LIGHT.length);
+}
+
+/**
+ * The paint of talk step `index`.
+ *
+ * Unlike {@link rampVar} this ramp is NOT reversed for dark mode. The blue ramp encodes
+ * its quantity in lightness, so on a dark surface it has to run the other way to keep
+ * "near zero sits closest to the surface"; this one encodes it in hue, and a reversal
+ * would make green mean "all day on the phone".
+ */
+export function talkVar(index: number): string {
+  const clamped = Math.min(TALK_RAMP_LIGHT.length - 1, Math.max(0, Math.trunc(index)));
+  return `var(--ca-viz-talk-${clamped})`;
 }
 
 /** The paint of ramp step `index`, clamped into range. */
@@ -167,6 +234,10 @@ function rampBlock(order: readonly string[]): string {
   return order.map((hex, index) => `--ca-viz-ramp-${index}:${hex};`).join('');
 }
 
+function talkBlock(order: readonly string[]): string {
+  return order.map((hex, index) => `--ca-viz-talk-${index}:${hex};`).join('');
+}
+
 /**
  * The tokens above as CSS, injected once by the dashboard page.
  *
@@ -188,6 +259,7 @@ export const VIZ_CSS: string = `
 --ca-viz-up-soft:#e9f5e9;
 --ca-viz-down-soft:#fbecec;
 ${rampBlock(RAMP)}
+${talkBlock(TALK_RAMP_LIGHT)}
 }
 @media (prefers-color-scheme: dark){
 :root{
@@ -204,6 +276,7 @@ ${rampBlock(RAMP)}
 --ca-viz-up-soft:#16301a;
 --ca-viz-down-soft:#341c1c;
 ${rampBlock([...RAMP].reverse())}
+${talkBlock(TALK_RAMP_DARK)}
 }
 }
 .ca-viz-num{font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;}

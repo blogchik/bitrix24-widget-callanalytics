@@ -25,12 +25,20 @@
  */
 
 import { useLocale, useTranslations } from 'next-intl';
+import { usePathname } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { ErrorState, LoadingBlock, PageShell, Section } from '@/components/AppFrame';
+import {
+  ErrorState,
+  LoadingBlock,
+  PageShell,
+  Section,
+  StaleNotice,
+} from '@/components/AppFrame';
 import CallsPerDayChart, { type DayBucket } from '@/components/CallsPerDayChart';
 import CallsTable from '@/components/CallsTable';
 import EmployeeBars, { type EmployeeBucket } from '@/components/EmployeeBars';
+import PageNav, { NAV_CSS } from '@/components/PageNav';
 import Filters, {
   defaultFilters,
   toQuery,
@@ -78,6 +86,7 @@ export default function DashboardPage() {
   const t = useTranslations();
   const locale = useLocale();
   const me = useMe();
+  const pathname = usePathname();
 
   const [filters, setFilters] = useState<DashboardFilters | null>(null);
   const [options, setOptions] = useState<FilterOptions>(EMPTY_FILTER_OPTIONS);
@@ -140,10 +149,20 @@ export default function DashboardPage() {
 
   return (
     <>
-      <style dangerouslySetInnerHTML={{ __html: VIZ_CSS }} />
+      <style dangerouslySetInnerHTML={{ __html: `${VIZ_CSS}${NAV_CSS}` }} />
       <PageShell
         title={t('app.dashboard.title')}
         subtitle={data ? rangeLabel(data.range, locale) : undefined}
+        nav={
+          <PageNav
+            current={pathname}
+            label={t('app.nav.label')}
+            items={[
+              { href: '/dashboard', label: t('app.nav.dashboard') },
+              { href: '/hours', label: t('app.nav.hours') },
+            ]}
+          />
+        }
         banner={me.data.access === 'own' ? <span>{t('app.ownScopeBanner')}</span> : undefined}
       >
         <SyncBanner sync={me.data.sync} isAdmin={me.data.is_admin} locale={locale} />
@@ -332,19 +351,6 @@ function EmptyPeriod({ importing }: { importing: boolean }) {
 }
 
 /** A failed refetch while usable numbers are still on screen: explain, offer, keep. */
-function StaleNotice({ error, onRetry }: { error: unknown; onRetry: () => void }) {
-  const t = useTranslations();
-  const { bodyKey } = presentError(error);
-  return (
-    <div className="ca-banner flex flex-wrap items-center gap-x-4 gap-y-2" role="status">
-      <span className="flex-1">{t(bodyKey)}</span>
-      <button type="button" className="ca-button ca-button-quiet" onClick={onRetry}>
-        {t('app.retry')}
-      </button>
-    </div>
-  );
-}
-
 /** "1 Aug - 7 Sep 2026": the period the server actually aggregated, under the title. */
 function rangeLabel(range: DashboardRange, locale: string): string {
   const options: Intl.DateTimeFormatOptions = {

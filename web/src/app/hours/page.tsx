@@ -37,7 +37,11 @@ import {
   type FilterOptions,
   EMPTY_FILTER_OPTIONS,
 } from '@/components/Filters';
-import HourlyTalkTable, { HOURLY_CSS, type HourRow } from '@/components/HourlyTalkTable';
+import HourlyTalkTable, {
+  HOURLY_CSS,
+  type HourRow,
+  type HourTotals,
+} from '@/components/HourlyTalkTable';
 import PageNav, { NAV_CSS } from '@/components/PageNav';
 import StateCard from '@/components/StateCard';
 import { DateRange, MultiSelect, SegmentedControl, type SelectOption } from '@/components/ui';
@@ -49,6 +53,7 @@ import { VIZ_CSS } from '@/lib/viz';
 /** The response `GET /api/v1/hours` answers with. */
 interface HoursResponse {
   rows: HourRow[];
+  totals: HourTotals;
   max_cell_seconds: number;
   total_rows: number;
   row_cap: number;
@@ -253,6 +258,7 @@ export default function HoursPage() {
             <div className={grid.pending ? 'ca-viz-dim' : undefined}>
               <HourlyTalkTable
                 rows={data.rows}
+                totals={data.totals}
                 maxCellSeconds={data.max_cell_seconds}
                 locale={locale}
                 t={t}

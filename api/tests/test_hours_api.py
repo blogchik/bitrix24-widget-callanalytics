@@ -513,6 +513,99 @@ async def test_the_row_cap_truncates_and_says_that_it_did(
     assert body["row_cap"] == _HOUR_ROW_CAP
 
 
+async def test_the_footer_sums_every_hour_down_its_own_column(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """The totals row, and the one arithmetic it has to get right.
+
+    Two employees on two days, arranged so no two cells share a value: a footer that
+    summed the wrong axis, or summed a row twice, cannot pass by coincidence.
+    """
+    await seed_employee(portal.portal_id, USER_A, "Ada")
+    await seed_employee(portal.portal_id, USER_B, "Ben")
+    # 06:00 UTC is 11:00 Tashkent, 07:00 UTC is 12:00.
+    plan = (
+        (1, date(2026, 3, 10), 6, USER_A, 60),
+        (2, date(2026, 3, 10), 6, USER_B, 120),
+        (3, date(2026, 3, 10), 7, USER_A, 180),
+        (4, date(2026, 3, 11), 6, USER_A, 240),
+    )
+    for bx_id, day, hour, user_id, duration in plan:
+        await seed_call(
+            portal.portal_id,
+            bx_id,
+            started=datetime(day.year, day.month, day.day, hour, 0, tzinfo=UTC),
+            user_id=user_id,
+            duration=duration,
+        )
+
+    body = (await get_hours(client, session_for(portal))).json()
+    totals = body["totals"]
+
+    assert (totals["hours"][11][0], totals["hours"][11][1]) == (60 + 120 + 240, 3), (
+        "hour 11 is summed down the column, across both employees AND both days"
+    )
+    assert (totals["hours"][12][0], totals["hours"][12][1]) == (180, 1)
+    assert all(
+        pair == [0, 0] for hour, pair in enumerate(totals["hours"]) if hour not in (11, 12)
+    ), "an hour nobody worked sums to zero, not to a missing entry"
+
+    assert totals["talk_seconds"] == 600 and totals["calls"] == 4
+    assert totals["talk_seconds"] == sum(int(row["talk_seconds"]) for row in body["rows"]), (
+        "the grand total is the same number whichever axis it is added along"
+    )
+    assert totals["rows_counted"] == len(body["rows"])
+
+
+async def test_the_footer_covers_every_matching_row_even_when_the_table_is_truncated(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """The footer is about the selection, not about how much of it fits on a screen.
+
+    This is the assertion that decides where the sum is computed. A client adding up the
+    rows it received would answer for 500 of them and say nothing about the rest — the
+    wrong number, given confidently, in the one case where the reader most needs the right
+    one. Summed here, the footer stays true and the truncation notice explains why the
+    visible cells do not add up to it.
+    """
+    from app.services.stats import _HOUR_ROW_CAP
+
+    rows_wanted = _HOUR_ROW_CAP + 5
+    async with tenant_txn(portal.portal_id) as session:
+        await session.execute(
+            text(
+                """
+                INSERT INTO calls (portal_id, bx_id, call_id, call_type, call_start_date,
+                                   call_duration, call_failed_code, portal_user_id,
+                                   phone_number, portal_number)
+                SELECT :pid, g, 'foot-' || g, 1, :started, 60, '200', g,
+                       '+998900000000', 'line-1'
+                FROM generate_series(1, :rows) AS g
+                """
+            ),
+            {
+                "pid": portal.portal_id,
+                "started": datetime(2026, 3, 10, 6, 0, tzinfo=UTC),
+                "rows": rows_wanted,
+            },
+        )
+
+    body = (await get_hours(client, session_for(portal))).json()
+    assert body["truncated"] is True
+    assert len(body["rows"]) == _HOUR_ROW_CAP
+
+    totals = body["totals"]
+    assert totals["calls"] == rows_wanted, (
+        "the footer counted only the rows that fit. It must count every row the filter "
+        "matched, which is the number the reader asked for."
+    )
+    assert totals["hours"][11] == [rows_wanted * 60, rows_wanted]
+    assert totals["rows_counted"] == rows_wanted
+    assert totals["calls"] > sum(int(row["calls"]) for row in body["rows"]), (
+        "and it is therefore deliberately larger than the visible rows add up to"
+    )
+
+
 async def test_the_colour_scale_is_normalised_over_the_answer_the_client_receives(
     client: httpx.AsyncClient, portal: SeededPortal
 ) -> None:

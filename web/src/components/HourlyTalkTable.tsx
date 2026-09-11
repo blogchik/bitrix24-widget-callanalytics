@@ -19,9 +19,10 @@
  * The scroll is announced rather than left to be discovered. That is not politeness, it is
  * a defect this codebase has already had once: the hour x weekday heatmap used to lay out
  * at a fixed width inside an `overflow-x: auto` box, and at 375px six hours of the day
- * existed, were paid for, and were invisible. Hence the fade at the edge, the `tabindex`
- * and the named region, so a keyboard and a screen reader can both reach the hours that
- * are off screen.
+ * existed, were paid for, and were invisible. So the region carries `tabindex` and a name,
+ * which is how a keyboard and a screen reader reach the hours that are off screen, and the
+ * day's totals are pinned to the right edge, which is how everyone else can see that the
+ * cells run underneath something and therefore that there is more of them.
  * ---------------------------------------------------------------------------------
  *
  * The paint is a ramp over talk seconds, normalised server-side over the whole answer. It
@@ -66,18 +67,6 @@ export const HOURLY_CSS = `
   position: relative;
   overflow-x: auto;
   overscroll-behavior-x: contain;
-}
-/* The fade says "there is more this way" without spending a control on saying it. It sits
-   above the cells and takes no pointer events, so it can never eat a tap. */
-.ca-hours-scroll::after {
-  content: '';
-  position: sticky;
-  top: 0;
-  right: 0;
-  float: right;
-  width: 24px;
-  height: 1px;
-  pointer-events: none;
 }
 /* The caption stays exactly what it is - a visually hidden sentence naming the table for
    a screen reader (§4.11) - but it is hidden by a clip path rather than by the overflow of
@@ -137,6 +126,28 @@ export const HOURLY_CSS = `
 .ca-hours .ca-hours-date {
   left: 150px;
   min-width: 92px;
+}
+/* The day's totals, pinned to the other edge.
+   Sticky rather than merely last: the grid scrolls, and the total is the one number a
+   reader wants while looking at hour nineteen. It is also what marks the right-hand edge -
+   the hour cells visibly slide under it, which says "there is more this way" without
+   spending a control on saying it. */
+.ca-hours .ca-hours-total {
+  position: sticky;
+  right: 0;
+  z-index: 1;
+  background: var(--ca-surface);
+  border-left: 1px solid var(--ca-border);
+  min-width: 74px;
+  text-align: center;
+  padding: 5px 8px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ca-hours thead .ca-hours-total {
+  z-index: 3;
+  font-weight: 600;
 }
 .ca-hours td.ca-hours-cell {
   min-width: 46px;
@@ -205,6 +216,9 @@ export function HourlyTalkTable({
                 {hour}
               </th>
             ))}
+            <th scope="col" className="ca-hours-total">
+              {t('app.hours.total')}
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -254,6 +268,21 @@ export function HourlyTalkTable({
                     </td>
                   );
                 })}
+                {/* Deliberately unpainted. The ramp is normalised over CELL talk time, and
+                    a day's total is an order of magnitude past the busiest hour in it - on
+                    that scale every total would be the reddest step, which is a column
+                    that says the same thing about every row. Weight carries it instead. */}
+                <td
+                  className="ca-hours-total"
+                  title={t('app.hours.totalTitle', {
+                    minutes: formatCount(Math.round(row.talk_seconds / 60), locale),
+                    seconds: formatCount(row.talk_seconds, locale),
+                    calls: formatCount(row.calls, locale),
+                  })}
+                >
+                  {formatCount(Math.round(row.talk_seconds / 60), locale)} (
+                  {formatCount(row.calls, locale)})
+                </td>
               </tr>
             );
           })}

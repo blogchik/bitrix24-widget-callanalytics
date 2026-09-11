@@ -144,6 +144,8 @@
       "selected": "{count} selected",
       "subtitle": "Minutes on answered calls, and how many calls were made in that hour.",
       "title": "Talk time by hour",
+      "total": "Total",
+      "totalTitle": "{minutes} min ({seconds} s) over the day, {calls} calls",
       "truncated": "Showing {shown} of {total} rows. Narrow the period or the employee selection.",
       "user": "Employee"
     },

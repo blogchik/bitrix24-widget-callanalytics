@@ -1,7 +1,7 @@
 'use client';
 
 import { useTranslations } from 'next-intl';
-import { useEffect, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 
 import { StateCard } from '@/components/StateCard';
 import { presentError } from '@/lib/api';
@@ -35,8 +35,15 @@ export interface AppFrameProps {
 }
 
 export function AppFrame({ children }: AppFrameProps) {
+  const [standalone, setStandalone] = useState(false);
   useEffect(() => {
     captureToken();
+  }, []);
+
+  // Its own effect, and not a line inside the one below: that one returns early when the
+  // SDK is absent, which is precisely the case this needs to detect.
+  useEffect(() => {
+    setStandalone(!isAvailable());
   }, []);
 
   useEffect(() => {
@@ -85,9 +92,29 @@ export function AppFrame({ children }: AppFrameProps) {
     };
   }, []);
 
-  // No `min-h-screen`: the height of this element is what `fitWindow()` measures, so
-  // forcing a viewport height would pin the slider open at full size forever.
-  return <div className="ca-page w-full">{children}</div>;
+  /*
+   * A viewport-height floor, and ONLY when this is not a Bitrix24 slider.
+   *
+   * Inside one, the height of this element is what `fitWindow()` measures and reports to
+   * the parent frame. A `100vh` floor there resolves against the iframe's CURRENT height,
+   * so every measurement would come back at least as tall as the frame already is: the
+   * slider could grow and never shrink, and switching from a month to a single day would
+   * leave the frame stretched around a two-row table forever. That is why this file
+   * refused a blanket `min-h-screen`, and it still refuses one.
+   *
+   * Standalone - a browser tab, the audit harness - nothing is measuring and nothing is
+   * resized, so a short page simply ends partway down the window and the rest is
+   * browser-coloured nothing. There the floor is exactly what is wanted.
+   *
+   * Decided after mount rather than during render: `isAvailable()` reads `window`, so the
+   * server renders `false` and a value read during the first client render would disagree
+   * with the HTML it is hydrating.
+   */
+  return (
+    <div className={standalone ? 'ca-page w-full min-h-screen' : 'ca-page w-full'}>
+      {children}
+    </div>
+  );
 }
 
 /*
@@ -110,6 +137,15 @@ export interface PageShellProps {
   chips?: ReactNode;
   /** Full-width notice above the content ("you see your own calls only"). */
   banner?: ReactNode;
+  /**
+   * Let the column grow past the reading width, for a page that is one wide table.
+   *
+   * The 1280px cap is sized for prose and tiles. The by-hour grid is twenty-six columns
+   * and wants about 1430px, so under that cap it scrolled sideways on a 1920px screen
+   * that had seven hundred spare pixels on either side of it - a scrollbar the display
+   * never needed, put there by the layout rather than by the data.
+   */
+  wide?: boolean;
   /**
    * Links between the pages of this placement, under the header.
    *
@@ -139,9 +175,19 @@ export interface PageShellProps {
  * Everything is a multiple of 4, and vertical steps come in one pair (16 on a phone,
  * 20-32 from `sm` up) so the page has a single rhythm instead of one per component.
  */
-export function PageShell({ title, subtitle, chips, banner, nav, children }: PageShellProps) {
+export function PageShell({
+  title,
+  subtitle,
+  chips,
+  banner,
+  nav,
+  wide = false,
+  children,
+}: PageShellProps) {
   return (
-    <div className={`${SHELL_WIDTH} px-4 py-6 sm:px-6 lg:px-8 lg:py-8`}>
+    <div
+      className={`${wide ? WIDE_SHELL_WIDTH : SHELL_WIDTH} px-4 py-6 sm:px-6 lg:px-8 lg:py-8`}
+    >
       <header className="mb-4 flex flex-wrap items-start justify-between gap-3 sm:mb-6">
         <div className="min-w-0">
           <h1 className="text-[20px] font-semibold leading-tight">{title}</h1>
@@ -158,6 +204,16 @@ export function PageShell({ title, subtitle, chips, banner, nav, children }: Pag
 
 /** The content column, shared by {@link PageShell} and {@link LoadingBlock}. */
 const SHELL_WIDTH = 'mx-auto w-full max-w-[1280px]';
+
+/**
+ * The column for a page that is one wide table.
+ *
+ * Still capped, and the cap is not arbitrary: the grid is `width: max-content` with
+ * `min-width: 100%`, so a container wider than the table stretches its columns rather than
+ * leaving a margin. 1600px clears the grid's natural width without pulling twenty-four
+ * columns of numbers apart on an ultrawide display.
+ */
+const WIDE_SHELL_WIDTH = 'mx-auto w-full max-w-[1600px]';
 
 /**
  * A titled card. Milestone 5 drops charts and tables into these.

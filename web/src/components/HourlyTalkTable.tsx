@@ -49,8 +49,28 @@ export interface HourRow {
   calls: number;
 }
 
+/** The footer: each hour summed down its column, over every row the filter matched. */
+export interface HourTotals {
+  hours: ReadonlyArray<readonly [number, number] | readonly number[]>;
+  talk_seconds: number;
+  calls: number;
+  /** How many rows it was summed over, which is not always how many are on screen. */
+  rows_counted: number;
+}
+
 export interface HourlyTalkTableProps {
   rows: readonly HourRow[];
+  /**
+   * The column footer, or `undefined` when the server did not send one.
+   *
+   * Optional on purpose. A deploy puts the new page in front of the old API for a few
+   * seconds, and this component reading `totals.hours` off `undefined` took the whole page
+   * down with it - a blank frame is the one outcome §4.11 rules out, and it was reachable
+   * by a payload that was merely older rather than wrong. Missing, the footer is simply
+   * not drawn: an absent summary row is a visible absence, where one re-derived from the
+   * rows on screen would be a confident number that a truncated answer makes wrong.
+   */
+  totals?: HourTotals | null;
   /** The ramp's top, from the server, so a truncated answer is painted on the same scale. */
   maxCellSeconds: number;
   locale: string;
@@ -162,6 +182,24 @@ export const HOURLY_CSS = `
 .ca-hours td.ca-hours-cell[data-empty='true'] {
   color: var(--ca-muted);
 }
+/* The footer is a summary of the column above it, so it is separated by a rule rather
+   than by another border of the same weight as the row borders. It pins horizontally with
+   everything else - a footer that slid out from under its own columns would be summing
+   whichever hours happened to be on screen. */
+.ca-hours tfoot th,
+.ca-hours tfoot td {
+  border-top: 2px solid var(--ca-border);
+  border-bottom: none;
+  font-weight: 600;
+  background: var(--ca-surface);
+}
+.ca-hours tfoot td.ca-hours-cell {
+  color: var(--ca-text);
+}
+.ca-hours tfoot .ca-hours-id,
+.ca-hours tfoot .ca-hours-total {
+  z-index: 2;
+}
 .ca-hours-dim {
   opacity: 0.72;
 }
@@ -177,11 +215,19 @@ export const HOURLY_CSS = `
 
 export function HourlyTalkTable({
   rows,
+  totals,
   maxCellSeconds,
   locale,
   t,
   nameOf,
 }: HourlyTalkTableProps) {
+  // One check, so the twenty-five cells below cannot each forget it.
+  const footer = useMemo(
+    (): HourTotals | null =>
+      totals && Array.isArray(totals.hours) && totals.hours.length === 24 ? totals : null,
+    [totals],
+  );
+
   const dateFormat = useMemo(
     () => new Intl.DateTimeFormat(locale, { day: '2-digit', month: 'short' }),
     [locale],
@@ -287,6 +333,50 @@ export function HourlyTalkTable({
             );
           })}
         </tbody>
+        {footer ? (
+        <tfoot>
+          <tr>
+            {/* The label spans both identifying columns: the footer is not one employee on
+                one day, so a name cell and a date cell beside it would be two blanks
+                asking to be read as missing rather than as inapplicable. */}
+            <th scope="row" colSpan={2} className="ca-hours-id ca-hours-user">
+              {t('app.hours.totalRow')}
+            </th>
+            {HOURS.map((hour) => {
+              const pair = footer.hours[hour];
+              const seconds = Number(pair?.[0] ?? 0);
+              const calls = Number(pair?.[1] ?? 0);
+              const minutes = Math.round(seconds / 60);
+              return (
+                <td
+                  key={hour}
+                  className="ca-hours-cell"
+                  data-empty={calls === 0 && seconds === 0 ? 'true' : undefined}
+                  title={t('app.hours.columnTitle', {
+                    hour,
+                    minutes: formatCount(minutes, locale),
+                    calls: formatCount(calls, locale),
+                    rows: formatCount(footer.rows_counted, locale),
+                  })}
+                >
+                  {formatCount(minutes, locale)} ({formatCount(calls, locale)})
+                </td>
+              );
+            })}
+            <td
+              className="ca-hours-total"
+              title={t('app.hours.grandTitle', {
+                minutes: formatCount(Math.round(footer.talk_seconds / 60), locale),
+                calls: formatCount(footer.calls, locale),
+                rows: formatCount(footer.rows_counted, locale),
+              })}
+            >
+              {formatCount(Math.round(footer.talk_seconds / 60), locale)} (
+              {formatCount(footer.calls, locale)})
+            </td>
+          </tr>
+        </tfoot>
+        ) : null}
       </table>
     </div>
   );

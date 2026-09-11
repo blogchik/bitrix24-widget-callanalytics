@@ -901,8 +901,26 @@ async def load_hours(principal: Principal, filters: CallFilters) -> dict[str, An
     total_rows = len(ordered)
     shown = ordered[:_HOUR_ROW_CAP]
 
+    # The column footer, summed over EVERY row the filter matched - not over the rows that
+    # survived the cap. The question it answers ("across this team, when is the phone
+    # busy") is about the selection, not about how much of it fits on a screen, and a
+    # footer that quietly shrank with the display would be the wrong answer given
+    # confidently. When the two disagree the truncation notice is what explains it.
+    hour_totals = [[0, 0] for _ in _DAY_HOURS]
+    for row in ordered:
+        for hour, (talk, calls) in enumerate(row["hours"]):
+            hour_totals[hour][0] += int(talk)
+            hour_totals[hour][1] += int(calls)
+
     return {
         "rows": shown,
+        "totals": {
+            "hours": hour_totals,
+            "talk_seconds": sum(pair[0] for pair in hour_totals),
+            "calls": sum(pair[1] for pair in hour_totals),
+            # What the footer is actually over, so the SPA can say so rather than imply it.
+            "rows_counted": total_rows,
+        },
         # The ramp is normalised over the WHOLE table, so it is computed here and not in
         # the browser: a client that re-derived it from the rows it received would paint a
         # truncated answer on a different scale than the full one.

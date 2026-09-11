@@ -33,7 +33,7 @@
 import { useTranslations } from 'next-intl';
 import { useMemo, useState, type MouseEvent as ReactMouseEvent } from 'react';
 
-import { formatCount } from '@/lib/format';
+import { formatCount, withExtension } from '@/lib/format';
 import { SERIES_ORDER } from '@/lib/viz';
 
 /** One row of the per-employee breakdown from `GET /api/v1/dashboard`. */
@@ -41,6 +41,8 @@ export interface EmployeeBucket {
   /** `calls.portal_user_id`; `null` for the aggregated "Other" bucket. */
   employee_id: number | null;
   name?: string | null;
+  /** §7: the internal extension, rendered in parentheses after the name. */
+  phone_inner?: string | null;
   /** Dismissed users keep their calls (§7) and are shown, marked, never hidden. */
   active?: boolean | null;
   /** True on the server-side "everyone past the top N" row. */
@@ -53,8 +55,7 @@ export interface EmployeeBucket {
   unassigned?: boolean | null;
   total: number;
   answered: number;
-  missed: number;
-  not_connected: number;
+  no_answer: number;
 }
 
 export interface EmployeeBarsProps {
@@ -101,7 +102,11 @@ export function EmployeeBars({ employees, locale }: EmployeeBarsProps) {
     if (row.other) {
       return t('app.dashboard.employees.other');
     }
-    const name = row.name?.trim();
+    // §7: the extension beside the name, through the same helper the filter and the call
+    // table use - this chart sits directly under that filter, and a person who reads
+    // "Азиз Каримов (101)" in one and "Азиз Каримов" in the other has to check whether
+    // they are the same row.
+    const name = withExtension(row.name, row.phone_inner);
     if (name) {
       return name;
     }

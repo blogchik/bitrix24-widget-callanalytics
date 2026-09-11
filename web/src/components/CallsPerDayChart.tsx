@@ -13,7 +13,7 @@
  *  * **A 2px surface gap between stacked segments** and a **4px rounded top on the
  *    topmost segment only** - the rounded end says "the data stops here"; the squared
  *    bottom says "this is anchored to the baseline".
- *  * **Fixed series order and fixed hues** (`answered`, `missed`, `not_connected`),
+ *  * **Fixed series order and fixed hues** (`answered`, `no_answer`),
  *    assigned by outcome and not by size, so applying a filter never repaints the bars
  *    that survive it.
  *  * **A crosshair and a tooltip listing every series** for the hovered day - a stacked
@@ -42,8 +42,7 @@ export interface DayBucket {
   /** `YYYY-MM-DD`. */
   date: string;
   answered: number;
-  missed: number;
-  not_connected: number;
+  no_answer: number;
 }
 
 export interface CallsPerDayChartProps {
@@ -71,7 +70,7 @@ const MAX_BAR = 28;
 const MAX_SLOTS = 400;
 
 function total(bucket: DayBucket): number {
-  return bucket.answered + bucket.missed + bucket.not_connected;
+  return bucket.answered + bucket.no_answer;
 }
 
 /** Every day in `[from, to]`, with zeros where the API returned nothing. */
@@ -88,7 +87,7 @@ function densify(days: DayBucket[], from: string, to: string): DayBucket[] {
   const out: DayBucket[] = [];
   let cursor = from;
   for (let index = 0; index < MAX_SLOTS; index += 1) {
-    out.push(byDate.get(cursor) ?? { date: cursor, answered: 0, missed: 0, not_connected: 0 });
+    out.push(byDate.get(cursor) ?? { date: cursor, answered: 0, no_answer: 0 });
     if (cursor === to) {
       break;
     }

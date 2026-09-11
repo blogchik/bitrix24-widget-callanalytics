@@ -471,6 +471,11 @@ async def test_each_filter_narrows_the_result_to_exactly_the_rows_it_names(
             {"bx_id": 6, "started": day + timedelta(minutes=5), "rest_app_id": 7, "code": "200"},
             {"bx_id": 7, "started": day + timedelta(minutes=6), "code": "200"},
             {"bx_id": 8, "started": day + timedelta(minutes=7), "code": "200"},
+            # CALL_TYPE 5 is "informational": not a conversation with a customer, and
+            # deliberately in neither direction group. It is here so that the gap is
+            # asserted rather than assumed - folding it into "outgoing" to leave no gap
+            # would be a plausible, wrong, and entirely silent change.
+            {"bx_id": 10, "started": day + timedelta(minutes=8), "call_type": 5, "code": "200"},
             # Outside the period every request below asks for.
             {"bx_id": 9, "started": day - timedelta(days=30), "user_id": USER_A, "code": "200"},
         ],
@@ -486,32 +491,44 @@ async def test_each_filter_narrows_the_result_to_exactly_the_rows_it_names(
     def expect(*bx_ids: int) -> set[int]:
         return {identifiers[bx_id] for bx_id in bx_ids}
 
-    assert await returned() == expect(1, 2, 3, 4, 5, 6, 7, 8), (
+    assert await returned() == expect(1, 2, 3, 4, 5, 6, 7, 8, 10), (
         "the period filter is not applied: the call thirty days earlier is in the result "
-        "(or the eight inside the day are not)."
+        "(or the nine inside the day are not)."
     )
     assert await returned(employee=USER_B) == expect(3, 4), (
         "the employee facet did not narrow to USER_B's two calls"
     )
-    assert await returned(result="answered") == expect(1, 3, 5, 6, 7, 8), (
-        "the result facet must use the generated `result_group` (§3), the single "
-        "server-side mapping shared by the cards, the filter and the recheck job."
+    assert await returned(result="answered") == expect(1, 3, 5, 6, 7, 8, 10), (
+        "the result facet reads §3's generated `result_group`, collapsed once in "
+        "`services/stats.py` so the cards, the filter and the table cannot disagree."
     )
-    assert await returned(result="missed") == expect(2)
-    assert await returned(result="not_connected") == expect(4), (
-        "603 is neither answered nor missed; it is the third group"
+    assert await returned(result="no_answer") == expect(2, 4), (
+        "304 (missed) and 603 (declined) are one answer: nobody picked up. The facet must "
+        "be the COMPLEMENT of answered, so a §3 outcome nobody has thought of yet lands "
+        "here rather than falling out of both groups."
     )
-    assert await returned(result=["missed", "not_connected"]) == expect(2, 4), (
-        "a repeated facet is an OR within itself - two result groups, both shown"
+    assert await returned(result=["answered", "no_answer"]) == expect(
+        1, 2, 3, 4, 5, 6, 7, 8, 10
+    ), (
+        "selecting both groups is no predicate at all, not an impossible AND"
     )
-    assert await returned(direction=2) == expect(5), (
-        "the direction facet must select on the raw `call_type` Bitrix24 delivered (§3 "
-        "keeps unknown codes rather than constraining them)"
+    assert await returned(direction="incoming") == expect(5), (
+        "`incoming` is CALL_TYPE 2 and 3: a redirected call still came in. The name is "
+        "the wire format - which code means what is a reading of Bitrix24's semantics "
+        "and stays server-side with the research note that supports it."
+    )
+    assert await returned(direction="outgoing") == expect(1, 2, 3, 4, 6, 7, 8), (
+        "`outgoing` is CALL_TYPE 1 and 4 (a callback is the system dialling out)"
+    )
+    both_directions = await returned(direction=["incoming", "outgoing"])
+    assert identifiers[10] not in both_directions, (
+        "an informational call (CALL_TYPE 5) must belong to NEITHER direction. Selecting "
+        "both groups still excludes it, which is what makes the gap deliberate."
     )
     assert await returned(line=7) == expect(6), (
         "the line / source facet selects on `rest_app_id` (§3)"
     )
-    assert await returned(line="builtin") == expect(1, 2, 3, 4, 5, 7, 8), (
+    assert await returned(line="builtin") == expect(1, 2, 3, 4, 5, 7, 8, 10), (
         "`rest_app_id IS NULL` means built-in telephony (§3), which cannot be expressed as "
         "an id - so 'builtin' has to be its own value rather than a missing filter."
     )

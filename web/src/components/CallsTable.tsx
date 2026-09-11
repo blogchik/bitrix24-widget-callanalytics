@@ -772,7 +772,12 @@ function CallRowView({
         </td>
       ) : null}
 
-      <td title={direction.title}>{direction.label}</td>
+      {/* A `CALL_TYPE` that is neither incoming nor outgoing - an informational call, or
+          a code a future build invents - gets the same dash every other empty cell in
+          this table gets, with the raw value still in the title. */}
+      <td title={direction?.title}>
+        {direction ? direction.label : <span className="ca-muted">—</span>}
+      </td>
 
       <td>
         <span className="ca-viz-num ca-nowrap">{formatPhone(call.phone_number)}</span>
@@ -893,8 +898,8 @@ function CallCardView({
 
         <div className="ca-cc-main">
           <span className="ca-cc-number">{formatPhone(call.phone_number)}</span>
-          <span className="ca-cc-dir" title={direction.title}>
-            {direction.label}
+          <span className="ca-cc-dir" title={direction?.title}>
+            {direction ? direction.label : '—'}
           </span>
         </div>
 

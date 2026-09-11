@@ -36,8 +36,7 @@ import { formatCount, formatDuration } from '@/lib/format';
 export interface PeriodTotals {
   total: number;
   answered: number;
-  missed: number;
-  not_connected: number;
+  no_answer: number;
   /** Sum of `calls.call_duration` over the period, in seconds. */
   talk_seconds: number;
 }
@@ -68,7 +67,7 @@ function answeredRate(totals: PeriodTotals | null): number | null {
  * Mean talk time over *answered* calls.
  *
  * `call_duration` is 0 for an unanswered call (§3), so dividing by `total` would report
- * a portal's missed-call rate as if it were a shorter conversation.
+ * a portal's no-answer rate as if it were a shorter conversation.
  */
 function averageTalk(totals: PeriodTotals | null): number | null {
   if (!totals || totals.answered <= 0) {
@@ -236,10 +235,10 @@ export function SummaryCards({ summary, locale }: SummaryCardsProps) {
       />
 
       <Tile
-        label={t('app.dashboard.summary.missed')}
-        value={formatCount(summary.missed, locale)}
-        hint={summary.total > 0 ? percent(summary.missed / summary.total, locale) : undefined}
-        comparison={compareCounts(summary.missed, previous?.missed, locale)}
+        label={t('app.dashboard.summary.noAnswer')}
+        value={formatCount(summary.no_answer, locale)}
+        hint={summary.total > 0 ? percent(summary.no_answer / summary.total, locale) : undefined}
+        comparison={compareCounts(summary.no_answer, previous?.no_answer, locale)}
       />
 
       <Tile

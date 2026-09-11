@@ -32,13 +32,12 @@ import {
   type SegmentedOption,
   type SelectOption,
 } from '@/components/ui';
+import { DIRECTION_GROUPS, directionKey, withExtension } from '@/lib/format';
 import { RESULT_GROUPS } from '@/lib/viz';
 
 /** §10 step 5: the custom period is capped at 366 days (`MAX_PERIOD_DAYS`). */
 export const MAX_PERIOD_DAYS = 366;
 
-/** Documented `CALL_TYPE` values, in the order the filter offers them. */
-const DIRECTION_VALUES = ['1', '2', '3', '4', '5'] as const;
 
 /** `line` value standing for "built-in telephony", i.e. `rest_app_id IS NULL`. */
 export const BUILTIN_LINE = 'builtin';
@@ -54,7 +53,7 @@ export interface DashboardFilters {
   to: string;
   /** `employees.portal_user_id` as a string, or `''` for all. */
   employee: string;
-  /** `CALL_TYPE` as a string, or `''` for all. */
+  /** `incoming` | `outgoing`, or `''` for all. */
   direction: string;
   /** A `calls.result_group` value, or `''` for all. */
   result: string;
@@ -72,14 +71,6 @@ export interface EmployeeOption {
   phone_inner?: string | null;
 }
 
-/**
- * The longest extension this filter will render.
- *
- * A real internal number is two to six characters, but `UF_PHONE_INNER` is a free-text
- * field and some portals put a whole phone number in it. Rendering that would push every
- * row of the dropdown out to its width cap to carry one row's value.
- */
-const EXTENSION_MAX_CHARS = 8;
 
 /** One telephony line / integration (`GET /api/v1/filters`). */
 export interface LineOption {
@@ -262,8 +253,8 @@ export function Filters({
    * trigger renders the label only: in the `hint` it would vanish the moment the reader
    * picked that employee, leaving a filter whose chosen state says less than its options
    * did. It is also five or six characters against the word's nine or ten, and
-   * {@link EXTENSION_MAX_CHARS} keeps it that way, so the width finding above does not
-   * repeat here.
+   * the length cap in {@link withExtension} keeps it that way, so the width finding
+   * above does not repeat here.
    *
    * No extension is offered beside "User #17": two numbers side by side, meaning
    * different things, is worse than one.
@@ -272,15 +263,11 @@ export function Filters({
     (): readonly SelectOption[] => [
       { value: '', label: allLabel },
       ...options.employees.map((employee) => {
-        const name = employee.name?.trim();
-        const extension = employee.phone_inner?.trim();
+        const name = withExtension(employee.name, employee.phone_inner);
         return {
           value: String(employee.id),
-          label: name
-            ? extension && extension.length <= EXTENSION_MAX_CHARS
-              ? `${name} (${extension})`
-              : name
-            : t('app.dashboard.filter.unknownEmployee', { id: String(employee.id) }),
+          label:
+            name ?? t('app.dashboard.filter.unknownEmployee', { id: String(employee.id) }),
           hint:
             employee.active === false ? t('app.dashboard.filter.dismissed') : undefined,
         };
@@ -292,7 +279,10 @@ export function Filters({
   const directionOptions = useMemo(
     (): readonly SelectOption[] => [
       { value: '', label: allLabel },
-      ...DIRECTION_VALUES.map((code) => ({ value: code, label: t(`call.direction.${code}`) })),
+      // Two directions, not the five raw `CALL_TYPE` codes: the server owns which code
+      // counts as which (`services/stats.py::_DIRECTIONS`), and the filter offers the
+      // question a portal actually asks.
+      ...DIRECTION_GROUPS.map((group) => ({ value: group, label: t(directionKey(group)) })),
     ],
     [allLabel, t],
   );

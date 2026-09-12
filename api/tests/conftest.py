@@ -343,3 +343,19 @@ def _reset_deal_state() -> None:
 
     reset_deal_caches()
     reset_deal_report_rate_limit()
+
+
+@pytest.fixture(autouse=True)
+def _reset_utm_state() -> None:
+    """Clear the UTM report's process-local caches and limiters between tests (§4.13).
+
+    The capability cache is the one that bites: it is keyed by PORTAL and a seeded portal
+    reuses ids, so a test that scripted "this build has no UTM fields" would silently hand
+    that verdict to the next test's portal and skip the probe it was written to exercise.
+    The per-viewer window is twelve reports per ten minutes, which a module with a dozen
+    cases reaches on its own.
+    """
+    from app.services.utm_stats import reset_utm_caches, reset_utm_report_rate_limit
+
+    reset_utm_caches()
+    reset_utm_report_rate_limit()

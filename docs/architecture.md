@@ -74,6 +74,12 @@ Bitrix24 Marketplace application: one deployment serves many portals, reads only
 │   │   │   ├── session.py                 # tenant_txn(portal_id): one transaction with SET LOCAL app.portal_id,
 │   │   │   │                              # re-issued for every transaction; control_txn() for portals/portal_sync/rest_log
 │   │   │   └── models.py                  # SQLAlchemy 2.x mapped classes mirroring §3
+│   │   ├── api/                       # /api/v1: session, dashboard, filters, calls, hours,
+│   │   │                              # deals (§4.12), utm (§4.13), record, portal
+│   │   ├── bitrix/                    # client, oauth, crm, statistic, users, deals (§4.12),
+│   │   │                              # utm (§4.13) - pure command builders, no HTTP
+│   │   ├── services/                  # stats, calls_repo, crm_context, employees, portals,
+│   │   │                              # deal_stats (§4.12), utm_stats (§4.13)
 │   │   ├── security/
 │   │   │   ├── crypto.py                  # AES-256-GCM envelope: key_id||nonce||ct||tag, AAD=member_id:column
 │   │   │   ├── session_token.py           # JWT HS256 issue/verify (session) + short-lived playback URL token
@@ -625,6 +631,7 @@ Registered in the vendor cabinet as the "Event installation handler URL" (assump
 | Tests on a fully isolated box (no refresh) | any | `/state/unsupported_portal`, explained; nothing written |
 | Opens with no portal row (DB restored) | `POST /app/` | Admin: self-heal → dashboard; non-admin: "not installed yet" |
 | Opens `/settings/` | `POST /settings/` | Admin status page; non-admin "administrators only" |
+| Opens the UTM page on a portal with leads turned off | `POST /app/` `DEFAULT` | Deals-only report, lead columns absent, one sentence saying so |
 | Probes endpoints with garbage | any | Translated "bad request" page, HTTP 400 |
 
 ---
@@ -762,6 +769,244 @@ comparable, and adding them would invent a number.
 
 Both caches and both limiters are **process-local**, correct only because v1 runs exactly one
 `api` container. A second replica silently doubles every budget and halves both hit rates.
+
+---
+
+### 4.13 UTM analytics — `POST /api/v1/utm`, a live CRM read
+
+The fourth left-menu page, and the only one that answers a marketing question. A row is one
+combination of UTM tags; the columns are leads, deals, outcomes and amount. Like §4.12 it
+holds no rows of its own.
+
+**The owner's four constraints** (given 2026-09-12, not re-litigated in code):
+
+1. **Live CRM read** — no table, no migration, no sync phase, exactly as §4.12.
+2. **One unified funnel** — a row carries leads *and* deals *and* the money, so a reader
+   compares channels rather than two separate reports.
+3. **Creation date only.** Deliberately DIFFERENT from §4.12's created-or-modified-or-closed.
+   A UTM tag records where a record came from, so the only question it can honestly answer
+   is "how many arrived from here, in this period".
+4. Counts, `OPPORTUNITY`, the won / lost / in-progress split, conversion and average deal.
+
+#### Three things this page does NOT have, and why
+
+* **No dictionary phase.** §4.12 spends its cold path on `crm.category.list` plus one
+  `crm.status.list` per funnel because its COLUMNS are portal data. This page's columns are
+  UTM values, which arrive on the rows, and the outcome comes off `stageSemanticId`, which
+  research block (g) already verified is on the row. So the cold path is **two** round trips
+  and the warm path is **one**.
+* **No `logic: "OR"`.** Constraint 3 is one flat leg (`>=createdTime` AND `<createdTime`),
+  which every list method has always honoured. The consequence is worth stating: the legacy
+  dialects cost EXACTLY what the universal ones cost here, so a `MethodNotFound` demotion is
+  free — where in §4.12 it triples the scan.
+* **No cardinality refusal.** See "The bucket ladder".
+
+`api/app/bitrix/deals.py` is not modified. Its `_select` carries a §6 promise about what the
+DEAL report may receive, and this page needs eleven other fields and a second entity; a new
+vocabulary got a new module (`api/app/bitrix/utm.py`) that imports the genuinely shared
+scalars rather than widening that one.
+
+#### The credential
+
+Identical to §4.12 and for the same reasons: the viewer's own Bitrix24 token, posted in the
+body, `user.current` in the first batch or **401 `invalid_session`**, an absent token is
+**409 `viewer_token_required`** and never 401, and `require_data_access` decides only that a
+user Bitrix24 refused telephony to gets no data endpoint.
+
+`oauth.with_portal_token` must not appear in `api/utm.py` or `services/utm_stats.py`.
+
+An `acc != 'all'` viewer has `@assignedById` pinned server-side on **both entity legs**. The
+lead half is the one easy to forget, and forgetting it puts the whole company's leads in the
+denominator of that viewer's own conversion rate.
+
+#### Two entities, two dialects, and one optional leg
+
+| | Primary | Fallback (on demotion) |
+|---|---|---|
+| Leads | `crm.item.list` `entityTypeId=1`, camelCase | `crm.lead.list`, UPPER_CASE, `STATUS_SEMANTIC_ID` |
+| Deals | `crm.item.list` `entityTypeId=2`, camelCase | `crm.deal.list`, UPPER_CASE, `STAGE_SEMANTIC_ID` |
+| Field map | `crm.item.fields` | `crm.lead.fields` / `crm.deal.fields` |
+
+`crm.item.*` normalises a lead's `STATUS_ID` / `STATUS_SEMANTIC_ID` into the same `stageId` /
+`stageSemanticId` a deal uses — the universal field list documents both as common to lead and
+deal and lists no `statusId` at all. That is what lets one dialect SHAPE serve both entities;
+only the legacy spellings diverge.
+
+**Leads are optional; deals are not.** A portal in simple CRM mode answers `MethodNotFound`
+for the lead leg. That DEGRADES the report to deals-only, sets `scan.leads.available=false`
+and prints one sentence; it never refuses. `leads.available=false` is deliberately
+distinguishable on the wire from `leads.total==0`, because "this portal has no leads module"
+and "nobody created a lead last month" are different facts a marketer acts on differently.
+Both legs refused is **403 `crm_no_access`** — an empty table is indistinguishable from "you
+may see none", which §4.11 forbids.
+
+The degradation is unconditional, not cold-path-only: a WARM report whose cached verdict
+still says leads exist drops the lead leg on a structurally-absent page-0 error and evicts
+that verdict, so the next report re-probes. Otherwise an administrator turning leads off
+would get an hour of `method_missing` where a fresh reader gets a deals-only report.
+
+#### The honour probe survives being halved
+
+Two commands per entity: an unfiltered baseline (so a zero proves something) and a
+year-2999 selection that must answer zero. The third probe (`closed` + `movedTime`) is gone
+because nothing here reads those fields.
+
+The instinct is that one flat leg is safer than a nested group and the probe can go. It is
+the opposite. Under §4.12 an ignored `createdTime` widened the union to "created in the
+period OR everything" — bad, bounded by the other legs, usually caught by the preflight cap.
+Here an ignored `>=createdTime` **deletes the period**: the selection becomes the portal's
+entire history. On a large portal that surfaces as a confusing `utm_scan_too_large`; on a
+small one it is a **200** — a lifetime report with a one-month range printed above it,
+internally consistent in every cell, and wrong. The verdict is cached only when the baseline
+is non-zero, for §4.12's reason.
+
+#### The UTM probe, and the gap it cannot close
+
+`crm.item.fields` is asked for both entity types. A missing core name, or none of the five
+UTM names, demotes that entity to its legacy dialect — `UTM_SOURCE` is documented on
+`crm.lead.fields` / `crm.deal.fields`, and only its camelCase re-exposure is inferred, so
+"the universal method has never heard of these" is a reason to use the old method rather than
+to give up. A legacy dialect that also declares no UTM leaves that entity with zero
+dimensions; when BOTH entities end up there the answer is **409 `utm_unsupported`** with
+mandated copy — never a 200 with an empty table, and never a 200 with everything in the
+"no tag" bucket, because both are indistinguishable on screen from "nobody used tagged links
+this month".
+
+**What cannot be detected:** `crm.item.fields` proves a field EXISTS; it does not prove
+`crm.item.list` returns it when named in `select`. There is no honest detector — Bitrix24
+omits null keys, so "no row carried the key" is identical to "these rows genuinely have no
+tag". So it is REPORTED, not detected: `scan.<entity>.tagged_rows` counts records carrying
+any tag, and a zero over a non-zero scan prints one sentence that is true in both worlds.
+
+#### Round trips, and the refusal ladder
+
+Warm: **one** batch — `user.current` plus page 0 of each entity. Cold: **two** (three if a
+dialect demotes). Page batches hold 25 commands, not the 50 a batch allows: Bitrix24 caps one
+request at 60 s. Every `crm.*` call goes through `batch()`, never `call()` — `call()` writes
+the whole response body to `rest_log`, which here means customer lead rows (§6).
+
+| Rung | Answer |
+|---|---|
+| Preflight `leads + deals > UTM_SCAN_CAP` | 400 `utm_scan_too_large` {leads, deals, total, max_total, days} |
+| Projected cost exceeds the remaining deadline | the same 400, **before** spending the pages |
+| `UTM_SCAN_DEADLINE_SEC` (each batch is `wait_for`-bounded) | the same 400 |
+| `time.operating` past the soft ratio | 503 `operation_time_limit` + `Retry-After` |
+| `UTM_REPORT_LIMIT` per `(portal, user)` per 10 min | 429 `rate_limited` + `Retry-After` |
+| Admission gates full | 503 `retry` + `Retry-After` |
+
+Both counts are named separately in the refusal because the lever differs: a portal drowning
+in leads and one drowning in deals need different advice.
+
+#### The bucket ladder — and why it is not the truncation §4.12 forbids
+
+A `utm_term` that is unique per click makes the combination count enormous. A cardinality
+REFUSAL would be wrong: the count is unknowable until the scan that produced it has been paid
+for, so the refusal would arrive after the cost it existed to prevent — exactly what this
+ladder's own rule forbids ("refuse BEFORE spending the batches that cannot finish"). The data
+is already in hand; there is nothing left to refuse. So, after the scan and before
+serialisation:
+
+1. **Value truncation** at `UTM_VALUE_MAX_CHARS`, applied BEFORE keying, so two values that
+   differ only past the cut merge rather than rendering as two identical rows.
+2. **Per-dimension `other`** — everything past the top `UTM_VALUE_CAP` of a dimension is
+   rewritten to one reserved bucket.
+3. **Dimension collapse** — if the row count is still past `UTM_COMBINATION_CAP`, `utm_term`
+   and then `utm_content` leave the composite key. The order is published so the page can say
+   in advance which control it will lose.
+
+No lead and no deal is dropped at any rung; every count still lands somewhere; `Σ rows ==
+totals` holds **exactly**. This is relabelling, and it is the move `EmployeeBars`' "Other"
+row and §4.12's own row cap already make. The rule those two obey — never drop a row a
+supervisor might act on — is not violated, because nothing is dropped. Collapsing a dimension
+out of the key cannot change any other dimension's marginal: that is a property of a
+projection, and `test_utm_aggregate.py` asserts it bit for bit.
+
+#### `facets` — the part that makes the page free to use
+
+Alongside the combination rows the response carries five small per-dimension marginals,
+computed **before** bucketing and **before** any filter. They cost at most `5 ×
+UTM_VALUE_CAP` rows and they buy three things the combination table cannot:
+
+* the filter option lists, with real counts, in the response already on screen;
+* an exact distinct count for a dimension that was later collapsed — a fact rather than an
+  apology;
+* chart sources that do not re-fold thousands of rows on every keystroke inside a slider.
+
+Consequently **the UTM filters cost no REST at all**. They are not in the SPA's fetch-effect
+dependency list: changing one leaves the query string byte-identical and only a `useMemo`
+re-runs. Period and employee are what cost a scan, and the page's layout says so. Options
+always come from the unfiltered facets, so they never shrink when a filter is applied — the
+cross-filter trap where picking one source collapses the medium list and there is no way
+back.
+
+`dimensions` is accepted by the API and narrows the FOLD, not the scan (same pages, smaller
+response). It is deliberately **not** exposed as a control: it would sit among the controls
+this page promises are free while actually costing a round trip. The reader's grouping
+control is client-side.
+
+#### Currency
+
+`opportunityAccount` + `accountCurrencyId` — Bitrix24's own conversion into the portal's
+accounting currency, computed with the portal's own rates, which is the number the portal's
+own CRM reports print. Agreeing with Bitrix24 rather than inventing a second exchange rate is
+`crm_context.py`'s standing doctrine.
+
+Three rules make that safe:
+
+* The source is chosen for the WHOLE report — `account` only when EVERY amount-bearing row
+  carried the pair, `native` otherwise. Choosing per row would mix two denominations inside
+  one column the moment a single record was missing it.
+* The account currency is a portal setting, so the observed set must be a singleton. If it is
+  not, `amounts.trusted=false` and the page **hides** the amount column, the average-deal
+  column and every money figure, and says why. A missing column a sentence explains is
+  recoverable; a wrong total a supervisor acts on is not.
+* **Money is deals-only.** A lead carries `OPPORTUNITY` too, and it is an estimate a
+  salesperson typed; summing it beside deal amounts double-counts every converted lead. It is
+  absent from the lead dialect entirely rather than filtered out later.
+
+Amounts cross the wire as decimal STRINGS at scale two, quantised per record on the way in,
+so every aggregate is a sum of exact cents and the browser's own column sum agrees digit for
+digit. A float round-trip would make a row disagree with its own total in the fifteenth
+digit — §4.12's forbidden discrepancy arriving through a channel nobody would suspect.
+
+#### Attribution, and the sentence the page must print
+
+Leads and deals are grouped **each by its own tags**. `leadId` is NOT joined, for three
+reasons: a June deal may belong to a March lead, so resolving the join needs a second
+unbounded scan whose size is unknown until the deal scan finishes — which destroys the one
+property the whole budget ladder rests on; Bitrix24 copies `UTM_*` from lead to deal on
+conversion, so the join mostly re-derives a value already on the row; and importing a
+March lead into a June report contradicts constraint 3.
+
+The cheap, bounded stand-in is `deals_from_lead`, one extra select field and one counter:
+"of the 31 deals here, 22 came from a lead" tells the reader exactly how far to trust that
+row's conversion cell.
+
+So conversion is a period-cohort ratio, and **a value above 100 % is normal**. The page says
+so above the table, and a row with deals and no leads renders `—` rather than `∞`, `0 %`, or
+nothing at all.
+
+#### Response and aggregation
+
+Counts and decimal strings only. Conversion, average deal size and every share are derived in
+the browser, so no toggle costs a REST round trip. `combinations[].k` is POSITIONAL against
+`dimensions` — five repeated key names over thousands of rows is roughly three times the
+bytes, and this ships into a slider on a phone.
+
+The three reserved buckets are **declared** in the response (`buckets`) rather than
+hardcoded in the SPA: a portal may genuinely tag a campaign `other`, and `U+0001` prefixes
+make the sentinels unreachable as real values.
+
+Invariants the wire guarantees, each asserted in `tests/test_utm_aggregate.py` and again in
+`tests/test_utm_api.py`: `won + lost + in_progress == total` on every measure; `Σ
+combinations == totals`; `Σ facets[d].values == totals` for every `d`; `deals_from_lead <=
+deals`.
+
+#### Caveat
+
+Both the capability cache and both limiters are **process-local**, correct only because v1
+runs exactly one `api` container. A second replica silently doubles every budget and halves
+the hit rate.
 
 ---
 

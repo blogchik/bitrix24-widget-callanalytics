@@ -37,13 +37,46 @@ export const CODE_UNKNOWN = 'unknown';
 export class ApiError extends Error {
   readonly code: string;
   readonly status: number;
+  /**
+   * The rest of the error body, when the server sent one.
+   *
+   * Several §8 codes carry numbers the user needs in order to act: `period_too_long` names
+   * its limit, and `deal_scan_too_large` names the deal count, the cap and the period
+   * length — "too large" without them is a refusal nobody can work with. The body was
+   * already parsed to read `code`; keeping the rest costs nothing and was previously
+   * discarded, which quietly made those messages unwritable.
+   *
+   * It is portal-shaped data from our own API, never rendered raw: a page reads named
+   * fields out of it and passes them to ICU placeholders.
+   */
+  readonly details?: Readonly<Record<string, unknown>>;
 
-  constructor(code: string, status: number, message?: string) {
+  constructor(
+    code: string,
+    status: number,
+    message?: string,
+    details?: Readonly<Record<string, unknown>>,
+  ) {
     super(message ?? code);
     this.name = 'ApiError';
     this.code = code;
     this.status = status;
+    this.details = details;
   }
+}
+
+/** The error body minus its `code`, or undefined when there was nothing else in it. */
+function detailsFromBody(body: unknown): Readonly<Record<string, unknown>> | undefined {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return undefined;
+  }
+  const rest: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
+    if (key !== 'code') {
+      rest[key] = value;
+    }
+  }
+  return Object.keys(rest).length > 0 ? rest : undefined;
 }
 
 /**
@@ -74,9 +107,24 @@ const OWN_MESSAGE_CODES: ReadonlySet<string> = new Set([
   CODE_TIMEOUT,
   CODE_SERVER,
   'context_missing',
+  // §4.12. All four are about THIS request rather than about the session or the portal, so
+  // none of them has a §4.11 state to borrow: the reader has to narrow the period, sign in
+  // to Bitrix24 again, or drop a parameter, and only a sentence can say which.
+  'deal_scan_too_large',
+  'deal_report_failed',
+  'viewer_token_required',
+  'unsupported_filter',
 ]);
 
 export interface ErrorPresentation {
+  /**
+   * Values for the ICU placeholders in `bodyKey`, taken from the error body (§8).
+   *
+   * Present only for the `errors.<code>` sentences that have placeholders at all —
+   * `deal_scan_too_large` names the deal count, the cap and the period length, and a
+   * refusal without those numbers is one nobody can act on.
+   */
+  bodyValues?: Record<string, string | number>;
   /** Which §4.11 state to render. */
   kind: StateKind;
   /** Catalogue key for the heading. */
@@ -95,9 +143,36 @@ export function presentError(error: unknown): ErrorPresentation {
     return { kind, titleKey: `state.${kind}.title`, bodyKey: `state.${kind}.body`, code };
   }
   if (OWN_MESSAGE_CODES.has(code)) {
-    return { kind: 'error', titleKey: 'state.error.title', bodyKey: `errors.${code}`, code };
+    return {
+      kind: 'error',
+      titleKey: 'state.error.title',
+      bodyKey: `errors.${code}`,
+      bodyValues: messageValues(error),
+      code,
+    };
   }
   return { kind: 'error', titleKey: 'state.error.title', bodyKey: 'state.error.body', code };
+}
+
+/**
+ * The scalar fields of an error body, for the ICU placeholders of `errors.<code>`.
+ *
+ * Only strings and finite numbers cross: a placeholder is rendered into a sentence, and an
+ * object or an array there would either throw inside the formatter or print `[object
+ * Object]` at the reader. Everything else is dropped, and {@link safeTranslate} covers the
+ * case where that leaves a placeholder unfilled.
+ */
+function messageValues(error: unknown): Record<string, string | number> | undefined {
+  if (!(error instanceof ApiError) || !error.details) {
+    return undefined;
+  }
+  const values: Record<string, string | number> = {};
+  for (const [key, value] of Object.entries(error.details)) {
+    if (typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value))) {
+      values[key] = value;
+    }
+  }
+  return Object.keys(values).length > 0 ? values : undefined;
 }
 
 /** Pull the machine code out of whatever error envelope the backend used. */
@@ -205,7 +280,12 @@ export async function apiFetch<T>(path: string, options: RequestOptions = {}): P
     const renewed = await exchange();
     if (!renewed) {
       clearToken();
-      throw new ApiError(response.status === 401 ? CODE_INVALID_SESSION : code, response.status);
+      throw new ApiError(
+        response.status === 401 ? CODE_INVALID_SESSION : code,
+        response.status,
+        undefined,
+        detailsFromBody(body),
+      );
     }
     try {
       response = await send(path, renewed, options);
@@ -220,7 +300,7 @@ export async function apiFetch<T>(path: string, options: RequestOptions = {}): P
     code = codeFromBody(body, response.status);
   }
 
-  throw new ApiError(code, response.status);
+  throw new ApiError(code, response.status, undefined, detailsFromBody(body));
 }
 
 // --- GET /me ------------------------------------------------------------------------

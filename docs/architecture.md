@@ -629,6 +629,142 @@ Registered in the vendor cabinet as the "Event installation handler URL" (assump
 
 ---
 
+### 4.12 Deal analytics — `POST /api/v1/deals`, a live CRM read
+
+The third left-menu page. A row is one operator inside one funnel; the columns are that
+funnel's own stages, read from the portal. It is the only read in this app that holds no
+rows of its own.
+
+**The owner's four constraints** (given 2026-09-12, not re-litigated in code):
+
+1. Stage columns come from the portal (`crm.status.list`); nothing about the reference
+   report's stage names is hardcoded, because the app is mass-market.
+2. Rows group by funnel (`CATEGORY_ID`).
+3. A deal counts if it was **created, modified or closed** inside the period; the operator
+   is `ASSIGNED_BY_ID`.
+4. **Nothing is stored** — no table, no migration, no sync phase.
+
+Two reference columns cannot be reproduced and are not faked. `Главный оператор` needs the
+`department` scope, a vendor-cabinet change that re-lists the app and forces every installed
+portal to re-consent; decision 2 replaces it with the funnel heading. `С новых в треш` is a
+stage **transition**, and the list methods return only the current stage — the owner chose
+to drop it rather than pay a second full scan over `crm.stagehistory.list`.
+
+#### The credential
+
+`principal.access` (`all|own|denied`) is decided from `user.admin` plus a
+`voximplant.statistic.get` probe. It is a **telephony** verdict, and `acc='all'` is not
+permission to read one deal. So every `crm.*` call on this path runs on the **viewer's own
+Bitrix24 token**, posted in the request body — §4.8's doctrine applied verbatim: *we never
+model Bitrix24's CRM permissions, we borrow the answer.* `crm.category.list` is documented as
+returning only the funnels the caller may see, so the report is correct by construction for
+an administrator, a team lead and a salesperson alike.
+
+* The endpoint is a **POST** because a live token must never enter a URL (§6).
+* `user.current` rides in the first batch and must return the JWT's `sub`, or **401
+  `invalid_session`** — the check `POST /calls/{id}/play-url` already makes.
+* An absent token is **409 `viewer_token_required`**, the code the SPA already answers with
+  `BX24.getAuth()`. Never 401: that makes `apiFetch` re-mint *our* JWT and re-post the same
+  stale Bitrix token.
+* `require_data_access` stays on the route and decides exactly one thing: `acc='denied'` gets
+  no data endpoint at all (§4.7).
+* An `acc != 'all'` viewer has `@assignedById` pinned to themselves **server-side**. Not only
+  because a control can be bypassed: operator names come from the `employees` cache, which
+  the worker fills under the installer's credential with `ADMIN_MODE: true`.
+* `oauth.with_portal_token` must not appear in `api/deals.py` or `services/deal_stats.py`.
+
+#### Two dialects, probed once per portal
+
+| | Primary | Fallback (on `errors.MethodNotFound`) |
+|---|---|---|
+| List | `crm.item.list` `entityTypeId=2`, `result.items`, camelCase | `crm.deal.list` × 3 selections, bare array, UPPER_CASE |
+| Dictionary | `crm.category.list` + `crm.status.list` | `crm.dealcategory.list` + `crm.dealcategory.stage.list` |
+
+`crm.deal.*` is officially discontinued for new development, and — decisively — `logic: "OR"`
+filter grouping is documented **only** for `crm.item.list`. Constraint 3 is therefore ONE
+paged query on the primary path and three deduped selections on the fallback. Never gate on a
+version number; the only detector is the typed error.
+
+**The period filter** (`closed` + `movedTime`, never `CLOSEDATE` — which is a writable
+*planned* end date, so a back-dated value would pull years-old deals into a one-week report):
+
+```json
+{"0": {"logic": "OR",
+       "0": {">=createdTime": "<startISO>", "<createdTime": "<endISO>"},
+       "1": {">=updatedTime": "<startISO>", "<updatedTime": "<endISO>"},
+       "2": {"=closed": "Y", ">=movedTime": "<startISO>", "<movedTime": "<endISO>"}}}
+```
+
+Bounds carry an **explicit offset**: a bare date is read in the *portal's* zone while this app
+computes its period in the viewer's, which is the normal case.
+
+**The honour probe.** Only `createdTime` is confirmed by a retrieved doc; the rest are
+inferred. An unknown filter key may be **ignored** rather than refused, which silently widens
+the union to "created in the period OR everything" — a report that is plausible, larger than
+the truth, and wrong with no symptom. `crm.item.fields` proves a name exists; three probe
+commands in the **exact nested `logic` shape** prove the filter is applied. A verdict is
+cached only when the unfiltered baseline is non-zero: a viewer who can see no deals proves
+nothing about the build.
+
+`ENTITY_ID` is `DEAL_STAGE` for funnel 0 and `DEAL_STAGE_<id>` otherwise. **`DEAL_STAGE_0`
+returns an empty list with no error** — a silent zero-column funnel, caught only by the unit
+test that asserts both branches.
+
+A column is keyed on the **pair** `"<category_id>:<status_id>"`: `STATUS_ID` uniqueness is
+documented as limited to its own directory and the default funnel's codes are unprefixed.
+
+#### Round trips, and the refusal ladder
+
+Warm (dictionary cached): **one** batch — `user.current` plus page 0. Cold: **three** —
+identity and funnels, then stages and the probe, then the deals. Page batches hold 25
+commands, not the 50 a batch allows: Bitrix24 caps one request at 60 s.
+
+**Every `crm.*` call goes through `batch()`, never `call()`** — `call()` writes the whole
+response body to `rest_log`, which for this path means customer deal rows (§6).
+
+Every rung **refuses**; none truncates, because a partial Итого row is a number a supervisor
+may act on with nothing on screen saying it is partial.
+
+| Rung | Answer |
+|---|---|
+| Preflight `total > DEAL_SCAN_CAP` | 400 `deal_scan_too_large` {deals, max_deals, days} |
+| Projected cost exceeds the remaining deadline | the same 400, **before** spending the pages |
+| `DEAL_SCAN_DEADLINE_SEC` (each batch is `wait_for`-bounded) | the same 400 |
+| `time.operating` past the soft ratio | 503 `operation_time_limit` + `Retry-After` |
+| `DEAL_REPORT_LIMIT` per `(portal, user)` per 10 min | 429 `rate_limited` + `Retry-After` |
+| Admission gates full | 503 `retry` + `Retry-After` |
+
+The deadline is validated below 25 s because `apiFetch` aborts at 30 s with a controller no
+caller can extend — past that the user gets a generic network error instead of the
+explanation this endpoint computed. The operating budget is read adaptively from `time`; a
+429 here blocks the method for this app across the **whole portal**, including the CRM tab.
+
+Admission is a per-portal `Semaphore(1)` inside a process-wide `Semaphore(N)`: the leaky
+bucket is counted per source IP and every tenant shares one egress address.
+
+#### Response and aggregation
+
+Integers only — `won/total` and `lost/total` are derived in the browser, so no toggle costs a
+REST round trip. `totals` deliberately carries **no** `cells`: two funnels' stages are not
+comparable, and adding them would invent a number.
+
+* A deal whose stage the dictionary cannot name gets a **synthesised `known: false` column**,
+  never a drop: `Σ cells + unknown_stage == total` must hold on every row, and a row whose
+  cells do not add up is the one discrepancy a reader can see and cannot explain.
+* A funnel the deals mention but the dictionary omits (created since the cache was filled) is
+  appended after the known ones.
+* The unassigned row is kept and sorts last, as `load_hours` keeps its NULL row.
+* `subtotal` is server-computed over every operator, including any past the 200-row cap.
+* The page states that every count is a **current-stage snapshot** of deals that touched the
+  period — the most likely misreading of the whole report.
+
+#### Caveat
+
+Both caches and both limiters are **process-local**, correct only because v1 runs exactly one
+`api` container. A second replica silently doubles every budget and halves both hit rates.
+
+---
+
 ## 5. Sync design
 
 ### 5.1 Principles

@@ -31,7 +31,6 @@ below is a list of named columns and the URL is not among them; what the browser
 
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from collections import deque
@@ -44,6 +43,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from starlette.datastructures import QueryParams
 
 from app.api.record import remember_viewer_token
+from app.api.viewer_token import read_viewer_access_token
 from app.bitrix.errors import BitrixError
 from app.bitrix.identity import resolve_identity
 from app.config import settings
@@ -92,16 +92,6 @@ _ACTIVE: Final[str] = "active"
 _REFRESH_LIMIT: Final[int] = 30
 _REFRESH_WINDOW_S: Final[float] = 600.0
 _REFRESH_RETRY_AFTER: Final[int] = 60
-
-#: A body that carries a live Bitrix24 access token (§4.6 keeps such bodies out of every
-#: log). One opaque string; the length is checked before parsing so an oversized body is
-#: refused undecoded.
-_MAX_BODY_BYTES: Final[int] = 8 * 1024
-_TOKEN_CHARS: Final[frozenset[str]] = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
-)
-_TOKEN_MIN: Final[int] = 16
-_TOKEN_MAX: Final[int] = 512
 
 #: The two facets that belong to the table and not to the charts, with the spellings the
 #: SPA may use. They live here rather than in `services/stats.py` because neither means
@@ -505,37 +495,6 @@ def _correlation_id() -> uuid.UUID:
     return uuid.uuid4()
 
 
-async def _viewer_access_token(request: Request) -> str | None:
-    """`{"access_token": ...}` from the body, or None - and never the value in an error.
-
-    Parsed by hand for §4.6's reason: FastAPI's `RequestValidationError` renders the
-    offending `input`, and for this endpoint that input is a live Bitrix24 access token.
-    No log line in this module names it either.
-    """
-    raw = await request.body()
-    if not raw:
-        return None
-    if len(raw) > _MAX_BODY_BYTES:
-        raise PrincipalError("bad_request", 400)
-    try:
-        payload = json.loads(raw)
-    except (ValueError, UnicodeDecodeError):
-        raise PrincipalError("bad_request", 400) from None
-    if not isinstance(payload, dict):
-        raise PrincipalError("bad_request", 400)
-    value = payload.get("access_token")
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise PrincipalError("bad_request", 400)
-    token = value.strip()
-    if not token:
-        return None
-    if not _TOKEN_MIN <= len(token) <= _TOKEN_MAX or not set(token) <= _TOKEN_CHARS:
-        raise PrincipalError("bad_request", 400)
-    return token
-
-
 async def _call_in_scope(principal: Principal, call_id: int) -> Any | None:
     """One row, re-scoped (§4.7). `None` means "not yours" and "not there" alike."""
     statement = (
@@ -584,7 +543,7 @@ async def play_url(
     if not row.has_record:
         raise PrincipalError("record_missing", 404)
 
-    viewer_token = await _viewer_access_token(request)
+    viewer_token = await read_viewer_access_token(request)
     if principal.access != _ACCESS_ALL:
         if viewer_token is None:
             # A machine code, not a failure: the SPA answers it by calling

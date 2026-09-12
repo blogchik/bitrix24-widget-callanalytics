@@ -156,7 +156,8 @@
     "nav": {
       "dashboard": "Summary",
       "hours": "By hour",
-      "label": "Pages"
+      "label": "Pages",
+      "deals": "By deal"
     },
     "ownScopeBanner": "You see your own calls only.",
     "period": {
@@ -240,6 +241,33 @@
         "no_stats_permission": "The account the app synchronises with has lost access to call statistics, so new calls are not being imported.",
         "reauth_required": "The app's authorisation has expired, so new calls are not being imported."
       }
+    },
+    "deals": {
+      "title": "Deals by operator",
+      "subtitle": "How many deals each operator carries, and where those deals stand now.",
+      "empty": "No deals in this period",
+      "caption": "One row per operator; one column per stage of the “{funnel}” funnel",
+      "regionLabel": "Stages of the “{funnel}” funnel, scrolls sideways",
+      "operator": "Operator",
+      "unassigned": "Unassigned",
+      "totalColumn": "Total",
+      "subtotalRow": "Total",
+      "grandTotal": "All funnels",
+      "grandTotalNote": "No stage breakdown here: each funnel has its own stages, and adding them together would invent a number.",
+      "inProgress": "In progress",
+      "won": "Won",
+      "lost": "Lost",
+      "other": "Other",
+      "showPercent": "Show %",
+      "unknownFunnel": "Funnel #{id}",
+      "unknownStage": "Stage {id}",
+      "blankStage": "No stage",
+      "scopeNote": "Showing the deals and funnels you can see in Bitrix24 CRM.",
+      "currentStageNote": "Every count is the CURRENT stage of deals that were created, changed or closed in the selected period. It is a snapshot of today, not a picture of the period.",
+      "rowsTruncated": "Showing {shown} of {total} operators; the Total row covers all of them.",
+      "funnelsHidden": "{count, plural, one {# funnel is hidden} other {# funnels are hidden}}: they have no deals in this period.",
+      "stageDictionaryFailed": "Stage names could not be read for {count, plural, one {# funnel} other {# funnels}} — those columns are labelled by code. The counts are still correct.",
+      "stageDictionaryTruncated": "{count, plural, one {# funnel has} other {# funnels have}} more than 50 stages; Bitrix24 returns only the first 50 and the rest are labelled by code."
     }
   },
   "call": {
@@ -267,7 +295,11 @@
     "invalid_session": "The app session has expired. Close this window and open the app from Bitrix24 again.",
     "network": "Could not reach the app server. Check your connection and try again.",
     "server": "The app server returned an error. Try again in a minute.",
-    "timeout": "The app server did not answer in time. Please try again."
+    "timeout": "The app server did not answer in time. Please try again.",
+    "deal_scan_too_large": "This period holds too many deals ({deals}) — more than the limit of {max_deals}. Pick a period shorter than {days} days, or filter by operator.",
+    "deal_report_failed": "Bitrix24 did not return part of the data, so the report was not built. Try again in a minute.",
+    "viewer_token_required": "Your CRM access could not be confirmed. Reload this page inside Bitrix24.",
+    "unsupported_filter": "The “{filter}” filter does not apply on this page."
   },
   "install": {
     "fallback": "Could not reach Bitrix24. Close this window and start the installation again.",

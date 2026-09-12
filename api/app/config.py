@@ -104,6 +104,29 @@ class Settings(BaseSettings):
     uninstall_grace_days: int = Field(default=30, ge=1)
     max_period_days: int = Field(default=366, ge=1)
 
+    # ---- Deal report (§4.12), a LIVE read with no stored rows ----
+    #: Deals one report may aggregate. A larger selection is REFUSED with the count and the
+    #: limit attached, never truncated: a partial report carries a partial Итого row, and a
+    #: supervisor may act on it without anything on screen saying which rows are missing.
+    deal_scan_cap: int = Field(default=6000, ge=50)
+    #: The period cap for THIS page alone. `max_period_days` stays 366 for the two pages
+    #: that read Postgres; a live REST scan cannot honestly offer a year inside the SPA's
+    #: thirty-second fetch timeout.
+    deal_report_max_period_days: int = Field(default=92, ge=1)
+    #: The scan's wall clock. Bounded below 25 s BY VALIDATION, because `apiFetch` aborts at
+    #: `REQUEST_TIMEOUT_MS = 30_000` with a controller no caller can extend - past that the
+    #: user gets a generic network error instead of the explanation this endpoint computed.
+    deal_scan_deadline_sec: float = Field(default=18.0, gt=0.0, le=25.0)
+    #: Reports one VIEWER may run per portal per ten minutes.
+    deal_report_limit: int = Field(default=12, ge=1)
+    #: How long a viewer's funnel/stage dictionary stands. Funnels change far more slowly
+    #: than deals do, and re-reading 1+K commands on every render is the single biggest
+    #: avoidable cost of the no-storage decision.
+    deal_dictionary_ttl_sec: int = Field(default=300, ge=0)
+    #: Concurrent reports in this process. Sized for the shared egress IP, which Bitrix24's
+    #: leaky bucket counts per source address across every tenant this deployment serves.
+    deal_report_concurrency: int = Field(default=6, ge=1, le=32)
+
     # ---- Modes ----
     recording_mode: Literal["off", "proxy"] = "off"
     # §5.9 keeps the Celery swap open; an unknown backend name is a startup error,
@@ -222,6 +245,21 @@ class Settings(BaseSettings):
         if level not in _LOG_LEVELS:
             raise ConfigError(f"LOG_LEVEL is not a logging level: {value!r}")
         return level
+
+    @model_validator(mode="after")
+    def _check_deal_period_within_shared_cap(self) -> Settings:
+        """The deal page may be stricter than the shared cap, never looser.
+
+        A `DEAL_REPORT_MAX_PERIOD_DAYS` above `MAX_PERIOD_DAYS` is unreachable - the shared
+        `parse_filters` refuses the range first - so it is a configuration that can never
+        mean what it says, and the honest place to find that out is startup.
+        """
+        if self.deal_report_max_period_days > self.max_period_days:
+            raise ConfigError(
+                f"DEAL_REPORT_MAX_PERIOD_DAYS {self.deal_report_max_period_days} "
+                f"exceeds MAX_PERIOD_DAYS {self.max_period_days}"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_active_key_present(self) -> Settings:

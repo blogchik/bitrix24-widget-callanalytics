@@ -53,6 +53,7 @@ __all__ = [
     "USER_REFRESH",
     "Err",
     "FakeBitrix",
+    "Page",
     "RecordedRequest",
     "SeededPortal",
     "clear_rest_logs",
@@ -147,6 +148,25 @@ class Err:
 
 #: A scripted answer: a raw result value, an `Err`, or a callable taking the recorded
 #: request and returning either of those (used when the answer depends on the params).
+@dataclass(frozen=True)
+class Page:
+    """One page of a list method, with the envelope fields that live OUTSIDE `result`.
+
+    `crm.item.list` and `crm.deal.list` report the size of the selection in `total` and the
+    next offset in `next`, and a batch reports both per command in `result_total` /
+    `result_next` rather than inside `result`. The deal report's preflight gate reads
+    exactly those, so a fake that only ever answered `result` could not exercise the one
+    branch that refuses a selection too large to scan.
+
+    A bare list stays valid everywhere it was valid before: only tests that care about the
+    envelope reach for this.
+    """
+
+    items: Any
+    total: int | None = None
+    next: int | None = None
+
+
 Scripted = Any
 
 
@@ -439,7 +459,14 @@ class FakeBitrix:
         entry = self._resolve(self._next(method, _DEFAULT_RESULTS.get(method, True)), record)
         if isinstance(entry, Err):
             return httpx.Response(entry.http_status, json=entry.body())
-        return httpx.Response(200, json={"result": entry, "time": _time_block()})
+        body: dict[str, Any] = {"result": entry, "time": _time_block()}
+        if isinstance(entry, Page):
+            body["result"] = entry.items
+            if entry.total is not None:
+                body["total"] = entry.total
+            if entry.next is not None:
+                body["next"] = entry.next
+        return httpx.Response(200, json=body)
 
     def _answer_batch(self, record: RecordedRequest) -> httpx.Response:
         # A whole-batch failure (HTTP 401 expired_token on the batch envelope itself)
@@ -452,11 +479,19 @@ class FakeBitrix:
         results: dict[str, Any] = {}
         errors: dict[str, Any] = {}
         times: dict[str, Any] = {}
+        totals: dict[str, Any] = {}
+        nexts: dict[str, Any] = {}
         for key, command in record.commands.items():
             method = command.split("?", 1)[0].strip().lower()
             entry = self._resolve(self._next(method, _DEFAULT_RESULTS.get(method, True)), record)
             if isinstance(entry, Err):
                 errors[key] = entry.body()
+            elif isinstance(entry, Page):
+                results[key] = entry.items
+                if entry.total is not None:
+                    totals[key] = entry.total
+                if entry.next is not None:
+                    nexts[key] = entry.next
             else:
                 results[key] = entry
             times[key] = _time_block()
@@ -466,8 +501,8 @@ class FakeBitrix:
                 "result": {
                     "result": results,
                     "result_error": errors,
-                    "result_total": {},
-                    "result_next": {},
+                    "result_total": totals,
+                    "result_next": nexts,
                     "result_time": times,
                 },
                 "time": _time_block(sum(t["operating"] for t in times.values()) or 0.1),

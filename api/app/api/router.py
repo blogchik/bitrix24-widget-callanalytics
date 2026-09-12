@@ -19,6 +19,7 @@ from fastapi import APIRouter
 
 from app.api.calls import router as calls_router
 from app.api.dashboard import router as dashboard_router
+from app.api.deals import router as deals_router
 from app.api.filters import router as filters_router
 from app.api.hours import router as hours_router
 from app.api.portal import router as portal_router
@@ -38,5 +39,6 @@ router.include_router(dashboard_router)  # GET /dashboard (one GROUPING SETS que
 router.include_router(filters_router)  # GET /filters (employees + lines / sources)
 router.include_router(calls_router)  # GET /calls, POST /calls/{id}/refresh, /play-url
 router.include_router(hours_router)  # GET /hours (talk time per employee x day x hour)
+router.include_router(deals_router)  # POST /deals (funnel x operator, live CRM read, §4.12)
 router.include_router(record_router)  # GET /calls/{id}/record?t=<signed> (§9)
 router.include_router(portal_router)  # GET /portal/sync-status, POST /portal/reauthorize

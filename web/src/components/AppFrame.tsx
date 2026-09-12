@@ -277,14 +277,35 @@ export function LoadingBlock({ label }: { label: string }) {
  * `presentError` decides which state and which catalogue key; nothing from the error
  * object itself is ever rendered.
  */
+/**
+ * `t(key, values)` that cannot take the page down.
+ *
+ * next-intl THROWS when a message has a placeholder and the value for it is missing, and
+ * the messages this is used for are error copy — so the one moment it would throw is the
+ * moment the page is already showing a failure. §4.11 rules out a blank frame, so a
+ * message that cannot be formatted degrades to the generic sentence rather than to nothing.
+ */
+function safeTranslate(
+  t: ReturnType<typeof useTranslations>,
+  key: string,
+  values: Record<string, string | number> | undefined,
+  fallbackKey: string,
+): string {
+  try {
+    return values ? t(key, values) : t(key);
+  } catch {
+    return t(fallbackKey);
+  }
+}
+
 export function ErrorState({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
   const t = useTranslations();
-  const { kind, titleKey, bodyKey } = presentError(error);
+  const { kind, titleKey, bodyKey, bodyValues } = presentError(error);
   return (
     <StateCard
       kind={kind}
       title={t(titleKey)}
-      body={t(bodyKey)}
+      body={safeTranslate(t, bodyKey, bodyValues, 'state.error.body')}
       action={
         onRetry ? (
           <button type="button" className="ca-button" onClick={onRetry}>
@@ -307,10 +328,10 @@ export function ErrorState({ error, onRetry }: { error: unknown; onRetry?: () =>
  */
 export function StaleNotice({ error, onRetry }: { error: unknown; onRetry: () => void }) {
   const t = useTranslations();
-  const { bodyKey } = presentError(error);
+  const { bodyKey, bodyValues } = presentError(error);
   return (
     <div className="ca-banner flex flex-wrap items-center gap-x-4 gap-y-2" role="status">
-      <span className="flex-1">{t(bodyKey)}</span>
+      <span className="flex-1">{safeTranslate(t, bodyKey, bodyValues, 'state.error.body')}</span>
       <button type="button" className="ca-button ca-button-quiet" onClick={onRetry}>
         {t('app.retry')}
       </button>

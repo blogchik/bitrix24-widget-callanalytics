@@ -7,6 +7,24 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# ---- OS security patches ----------------------------------------------------
+# The base image is rebuilt on Python's schedule, not Debian's, so between rebuilds it
+# carries whatever its point release shipped with - and the CD gate refuses to deploy an
+# image with a CRITICAL that HAS a published fix (`ignore-unfixed: true`, cd.yml). That is
+# the right gate to keep, so the image has to pick the fixes up itself: `python:3.12-slim`
+# was twelve packages behind trixie when this was added, `perl-base` among them, carrying
+# three CRITICALs already fixed in `5.40.1-6+deb13u1`.
+#
+# `upgrade`, not `install perl-base`: pinning the package of the month leaves the other
+# eleven and fails again the next time Debian patches something else. The cost is that two
+# builds of the same commit can differ, because the apt snapshot is an input the sha does
+# not name. That is acceptable here precisely because what gets deployed is an IMAGE tag
+# that CD records - `deploy <sha>` pulls a published image, it does not rebuild one.
+RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
 # Unprivileged runtime user; /app is its home so pip/pytest caches never land in /root.
 RUN groupadd --system --gid 10001 app \
  && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app \

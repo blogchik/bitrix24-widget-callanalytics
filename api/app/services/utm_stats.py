@@ -91,7 +91,7 @@ from app.bitrix.utm import (
     core_names,
     fields_command,
     fields_key,
-    honour_keys,
+    honour_key,
     honour_probe_commands,
     honour_verdict,
     legacy_of,
@@ -620,20 +620,16 @@ def _decide(
     if not dimensions:
         return ("demote", (), "utm_missing")
 
-    baseline_key, future_key = honour_keys(dialect.kind)
-    for key in (baseline_key, future_key):
-        probe_error = batch.error(key)
-        if probe_error is None:
-            continue
+    probe_key = honour_key(dialect.kind)
+    probe_error = batch.error(probe_key)
+    if probe_error is not None:
         if _structurally_absent(probe_error):
             return ("demote", (), "method_missing")
         if isinstance(probe_error, (AccessDenied, UserAccessError)):
             return ("unavailable", (), probe_error.code)
         raise _classify(probe_error)
 
-    verdict = honour_verdict(
-        baseline=batch.total_of(baseline_key), future=batch.total_of(future_key)
-    )
+    verdict = honour_verdict(future=batch.total_of(probe_key))
     if verdict is False:
         return ("demote", (), "filter_ignored")
     if verdict is None:
@@ -1306,8 +1302,6 @@ async def _report(
             capability, cacheable = await _capability(
                 client, principal, budget, scan_probe, filters.days
             )
-            if cacheable:
-                _remember_capability(portal.id, capability)
             first = None
             from_cache = False
 
@@ -1324,6 +1318,19 @@ async def _report(
         # keeps one rule about this cache: it is only ever filled from a full probe.
         _capability_cache.pop(portal.id, None)
         capability = scanned
+    elif not from_cache:
+        # The verdict is remembered HERE rather than straight after the probe, because the
+        # last piece of evidence it needs comes from the scan: a `>=created: 2999` answering
+        # zero only proves the filter held if this viewer can read records at all, and a
+        # selection that returned rows proves exactly that. Asking Bitrix24 the same question
+        # directly - an unfiltered list, counting the whole table - is what this page used to
+        # do, and it is what made a production portal answer `operation_time_limit` forever.
+        #
+        # A period with nothing in it therefore leaves the portal un-cached and the next open
+        # cold. That is the honest trade and it is cheap now: the cold path is two field maps
+        # and two selections that match nothing.
+        if cacheable and scan.totals[KIND_LEAD] + scan.totals[KIND_DEAL] > 0:
+            _remember_capability(portal.id, capability)
 
     # A dimension the caller asked to group by that this portal does not store would be a
     # column of nothing but the `none` bucket. Narrow to what both the portal and the caller

@@ -24,10 +24,11 @@ viewport widths; and the project now ships through CI/CD rather than by hand.
 | Deployed to production behind a Cloudflare Tunnel | done |
 | Custom UI kit: select, input, date range, audio player, responsive layout | done |
 | CI/CD: `dev` for work, `main` for deployment, images from GHCR | done |
+| UTM analytics: leads and deals by advertising tag, read live from CRM | done |
 | Recording playback in a real browser, inside a real portal | open — `docs/spike-recording-playback.md` |
 | Bitrix24 Marketplace moderation | not started — `docs/moderation-checklist.md` |
 
-403 tests pass against a real PostgreSQL 16.
+530 tests pass against a real PostgreSQL 16.
 
 ## Running it locally
 

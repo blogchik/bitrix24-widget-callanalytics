@@ -127,6 +127,37 @@ class Settings(BaseSettings):
     #: leaky bucket counts per source address across every tenant this deployment serves.
     deal_report_concurrency: int = Field(default=6, ge=1, le=32)
 
+    # ---- UTM report (§4.13), a LIVE read with no stored rows ----
+    #: Leads and deals SUMMED. One cap rather than two because the two scans share one
+    #: deadline and one operating budget, so a portal with few leads may honestly spend the
+    #: whole allowance on deals. A larger selection is REFUSED with both counts attached.
+    utm_scan_cap: int = Field(default=6000, ge=50)
+    #: The period cap for THIS page alone. Stricter than `max_period_days` for the reason
+    #: §4.12 gives, and this page scans TWO entities inside the same thirty-second timeout.
+    utm_report_max_period_days: int = Field(default=92, ge=1)
+    #: The scan's wall clock. Bounded below 25 s BY VALIDATION, because `apiFetch` aborts at
+    #: `REQUEST_TIMEOUT_MS = 30_000` with a controller no caller can extend.
+    utm_scan_deadline_sec: float = Field(default=18.0, gt=0.0, le=25.0)
+    #: Reports one VIEWER may run per portal per ten minutes.
+    utm_report_limit: int = Field(default=12, ge=1)
+    #: Concurrent reports in this process. Sized for the shared egress IP, which Bitrix24's
+    #: leaky bucket counts per source address across every tenant this deployment serves.
+    utm_report_concurrency: int = Field(default=6, ge=1, le=32)
+    #: Distinct values kept per dimension before the rest fold into one `other` bucket. NOT
+    #: a refusal: nothing is dropped, so `sum(rows) == totals` holds either way (§4.13).
+    utm_value_cap: int = Field(default=200, ge=10)
+    #: Combination rows tolerated before `utm_term` and then `utm_content` are lifted out of
+    #: the composite key. Also not a refusal - collapsing a dimension cannot change any other
+    #: dimension's marginal, so every number the page prints stays exact.
+    utm_combination_cap: int = Field(default=5000, ge=100)
+    #: A tag longer than this is cut BEFORE it becomes part of a key, so two values that
+    #: differ only past the cut merge instead of rendering as two identical rows.
+    utm_value_max_chars: int = Field(default=120, ge=16)
+    #: How long a portal's dialect / UTM-field verdict stands. Configurable where §4.12's is
+    #: a constant, because this verdict can say "leads are off" and an administrator who
+    #: turns them back on wants it to expire on demand rather than in an hour.
+    utm_capability_ttl_sec: int = Field(default=3600, ge=0)
+
     # ---- Modes ----
     recording_mode: Literal["off", "proxy"] = "off"
     # §5.9 keeps the Celery swap open; an unknown backend name is a startup error,
@@ -257,6 +288,21 @@ class Settings(BaseSettings):
         if self.deal_report_max_period_days > self.max_period_days:
             raise ConfigError(
                 f"DEAL_REPORT_MAX_PERIOD_DAYS {self.deal_report_max_period_days} "
+                f"exceeds MAX_PERIOD_DAYS {self.max_period_days}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_utm_period_within_shared_cap(self) -> Settings:
+        """The UTM page may be stricter than the shared cap, never looser.
+
+        Same argument as the deal page's: a value above `MAX_PERIOD_DAYS` is unreachable
+        because the shared `parse_filters` refuses the range first, so it is a configuration
+        that can never mean what it says.
+        """
+        if self.utm_report_max_period_days > self.max_period_days:
+            raise ConfigError(
+                f"UTM_REPORT_MAX_PERIOD_DAYS {self.utm_report_max_period_days} "
                 f"exceeds MAX_PERIOD_DAYS {self.max_period_days}"
             )
         return self

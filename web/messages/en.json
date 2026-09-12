@@ -157,7 +157,8 @@
       "dashboard": "Summary",
       "hours": "By hour",
       "label": "Pages",
-      "deals": "By deal"
+      "deals": "By deal",
+      "utm": "Traffic"
     },
     "ownScopeBanner": "You see your own calls only.",
     "period": {
@@ -268,6 +269,69 @@
       "funnelsHidden": "{count, plural, one {# funnel is hidden} other {# funnels are hidden}}: they have no deals in this period.",
       "stageDictionaryFailed": "Stage names could not be read for {count, plural, one {# funnel} other {# funnels}} — those columns are labelled by code. The counts are still correct.",
       "stageDictionaryTruncated": "{count, plural, one {# funnel has} other {# funnels have}} more than 50 stages; Bitrix24 returns only the first 50 and the rest are labelled by code."
+    },
+    "utm": {
+      "title": "Traffic sources",
+      "subtitle": "Which tagged links brought the leads and the deals, and what they were worth.",
+      "scopeNote": "Showing the leads and deals you can see in Bitrix24 CRM.",
+      "summary": "Totals",
+      "trend": "By day",
+      "trendLabel": "Leads and deals created per day",
+      "ranking": "Top {dimension}",
+      "matrix": "Source x medium",
+      "funnel": "Funnel by {dimension}",
+      "empty": "Nothing matched in this period",
+      "leads": "Leads",
+      "deals": "Deals",
+      "won": "Won",
+      "lost": "Lost",
+      "inProgress": "In progress",
+      "conversion": "Conversion",
+      "amount": "Amount",
+      "averageDeal": "Average deal",
+      "fromLead": "From a lead",
+      "outcome": "Outcome",
+      "allTags": "All tags",
+      "showPercent": "Show %",
+      "groupBy": "Group by",
+      "measure": "Show",
+      "measureVolume": "Leads and deals",
+      "measureConversion": "Conversion",
+      "noTag": "No tag",
+      "otherValues": "Other values",
+      "collapsedValue": "Not broken down",
+      "noValues": "No values in this period",
+      "moreRows": "{count, plural, one {# more value} other {# more values}}",
+      "caption": "One row per {dimension}; leads, deals, outcome and amount",
+      "regionLabel": "Funnel by {dimension}, scrolls sideways",
+      "matrixRegion": "{rows} by {columns}, scrolls sideways",
+      "matrixCell": "{row} / {column}: {count}",
+      "outcomeLabel": "Won {won}, lost {lost}, in progress {inProgress}",
+      "facetHint": "{leads} leads, {deals} deals",
+      "freeFiltersNote": "These filters re-read nothing: the period and the employee above are what cost a request to Bitrix24.",
+      "trendNote": "This chart shows the whole selected period and employee. The tag filters apply to everything below it.",
+      "attributionNote": "Leads and deals are grouped by their own tags. Conversion is deals divided by leads within the same tag, over the period they were CREATED. It does not trace one lead into its deal: a deal may have been created by hand, or from a lead created before this period. A value above 100% is normal and means exactly that.",
+      "snapshotNote": "Won, lost and in progress are where these records stand TODAY. The period selects when they were created, not what happened during it.",
+      "amountNote": "Amounts are the deal amount field, converted by Bitrix24 into the portal's accounting currency ({currency}). This is not revenue and not payments received: a deal created in this period may close much later, or never.",
+      "currencyMixed": "The amount column is hidden: this portal's deals are denominated in more than one currency ({currencies}), and adding them up would invent a number.",
+      "leadsUnavailable": "Leads are not available on this portal, so the report covers deals only.",
+      "noTaggedRows": "Bitrix24 returned no UTM tags on any of the {count} leads created in this period. Either those links carried no tags, or this portal's build does not return UTM through the API.",
+      "collapsedNote": "Not broken down by {dimensions}: this period has too many distinct values to group by them. Every other number is unaffected.",
+      "valuesCapped": "Only the top {kept} values of a tag are listed separately; the rest are grouped under “Other values” and are still counted in every total.",
+      "dimension": {
+        "utm_source": "Advertising system (utm_source)",
+        "utm_medium": "Traffic type (utm_medium)",
+        "utm_campaign": "Campaign (utm_campaign)",
+        "utm_content": "Content (utm_content)",
+        "utm_term": "Search term (utm_term)"
+      },
+      "short": {
+        "utm_source": "Source",
+        "utm_medium": "Medium",
+        "utm_campaign": "Campaign",
+        "utm_content": "Content",
+        "utm_term": "Term"
+      }
     }
   },
   "call": {
@@ -299,7 +363,11 @@
     "deal_scan_too_large": "This period holds too many deals ({deals}) — more than the limit of {max_deals}. Pick a period shorter than {days} days, or filter by operator.",
     "deal_report_failed": "Bitrix24 did not return part of the data, so the report was not built. Try again in a minute.",
     "viewer_token_required": "Your CRM access could not be confirmed. Reload this page inside Bitrix24.",
-    "unsupported_filter": "The “{filter}” filter does not apply on this page."
+    "unsupported_filter": "The “{filter}” filter does not apply on this page.",
+    "utm_scan_too_large": "This period has too many leads and deals to read live ({total} of {max_total} over {days} days). Narrow the period, or pick an employee.",
+    "utm_report_failed": "Bitrix24 could not answer the traffic-source report. Try again in a moment.",
+    "utm_unsupported": "This portal's Bitrix24 does not return UTM tags on leads and deals through the API, so this page cannot be built. The other pages are unaffected.",
+    "bad_dimension": "Unknown breakdown: {dimension}."
   },
   "install": {
     "fallback": "Could not reach Bitrix24. Close this window and start the installation again.",

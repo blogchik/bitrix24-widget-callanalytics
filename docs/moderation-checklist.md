@@ -39,3 +39,17 @@ when no error was logged.
 
 - Bitrix24's "Call statistics" permission has four levels (own / department / any / none). The app maps them to administrator → all calls, everyone else → their own calls, no permission → the explanatory state. A department-level manager therefore sees only their own calls in v1.
 - Fully isolated on-premise portals that cannot reach `oauth.bitrix.info` are not supported: they get an explicit state page and nothing is stored.
+
+### UTM analytics (§4.13)
+
+| Step | Expected |
+|---|---|
+| Open "Traffic sources" from the page nav | The report renders; no blank frame, no untranslated key |
+| Change a UTM filter | The numbers change immediately and the network tab shows NO request |
+| Change the period | One request; the previous report stays on screen while it runs |
+| Pick a period of 93 days in the calendar | The calendar does not offer it (the cap is geometry, not a 400) |
+| Open on a portal with leads turned off | A deals-only report plus one sentence saying so — never `0 → 44` and `—%` |
+| Open on a portal whose links carry no tags | Every row under "No tag", plus the sentence explaining the two possible causes |
+| Open as a non-admin with own-calls rights | Only that user's own leads and deals, and no employee control |
+| Read the conversion column on a tag with more deals than leads | A value above 100 %, with the note above the table explaining it |
+| Narrow the browser to 375 px | No horizontal page scroll; the table and the matrix scroll inside their own regions and say so |

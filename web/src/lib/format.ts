@@ -232,3 +232,41 @@ export function formatDateTime(
     return date.toISOString().replace('T', ' ').slice(0, 16);
   }
 }
+
+/**
+ * An amount in the portal's own currency (§4.13).
+ *
+ * **Why the fallback exists, and why it is not a nicety.** A Bitrix24 currency id is
+ * whatever the administrator configured - `crm.currency.*` lets a portal invent one - so it
+ * is NOT reliably an ISO 4217 code, and `Intl.NumberFormat` throws a `RangeError` on an
+ * unknown one rather than degrading. A mass-market app that trusted the code would blank
+ * the money column on exactly the portals that customised it. So an unusable code falls
+ * back to the grouped number with the raw code beside it, which is still true and still
+ * readable.
+ *
+ * `—` for a missing value, the convention `formatCount` and `percent` already set: an
+ * absent amount is an absence, never `0`.
+ */
+export function formatMoney(
+  value: number | null | undefined,
+  currency: string | null | undefined,
+  locale: string,
+): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return '—';
+  }
+  const code = (currency ?? '').trim();
+  if (code) {
+    try {
+      return new Intl.NumberFormat(locale, {
+        style: 'currency',
+        currency: code,
+        maximumFractionDigits: 0,
+      }).format(value);
+    } catch {
+      // A portal-defined code. Fall through to the number plus the code verbatim.
+    }
+  }
+  const number = formatCount(Math.round(value), locale);
+  return code ? `${number} ${code}` : number;
+}

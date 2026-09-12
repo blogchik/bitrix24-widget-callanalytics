@@ -125,6 +125,35 @@ rows, not about the CRM.
 - On an old on-premise build, does `crm.dealcategory.stage.list` really behave as the OUTDATED docs describe? The fallback dialect is only as good as its `FakeBitrix` script until a real such portal is seen.
 - Is one deal always one order on the owner's portal? "Всего заказов" counts deals; summing `OPPORTUNITY` or a quantity user-field instead would be a different `select`, a different aggregation and a currency question.
 
+### Block (h) — UTM tags, leads as a universal item, and the accounting currency (for §4.13)
+
+Researched 2026-09-12 against apidocs.bitrix24.com. Block (g) covered deals as a pipeline;
+nothing before this touched leads as DATA, and nothing touched UTM at all.
+
+- [verified] (UTM fields exist on both entities) `utmSource`, `utmMedium`, `utmCampaign`, `utmContent`, `utmTerm` are listed among the COMMON fields of the universal CRM object model, for leads and for deals alike; the UPPER_CASE twins `UTM_SOURCE` … `UTM_TERM` are documented on `crm.lead.fields` and `crm.deal.fields` as plain strings with `isReadOnly: false`.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/universal/object-fields.html , https://apidocs.bitrix24.com/api-reference/crm/leads/crm-lead-fields.html , https://apidocs.bitrix24.com/api-reference/crm/deals/crm-deal-fields.html
+  - impact: the feature is possible on the EXISTING `crm` scope. No vendor-cabinet change, no re-consent, no re-listing of the app.
+- [verified] (They must be named explicitly) `select: ["*"]` returns standard fields only and excludes custom and multiple fields; the `UF_*` mask covers custom fields and there is no mask that covers UTM.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/leads/crm-lead-list.html
+  - impact: `_select` names all five per dialect. An omitted `select` would return every `UF_*` too, which §6 forbids receiving, let alone logging.
+- [verified] (A lead is entity type 1) `entityTypeId` is 1 for a lead and 2 for a deal in `crm.item.*`.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/universal/crm-item-list.html
+- [verified] (The universal model has no `statusId`) The common field list documents `stageId` and `stageSemanticId` for leads and deals both, and lists no `statusId`: `crm.item.*` normalises a lead's `STATUS_ID` / `STATUS_SEMANTIC_ID` into the stage pair. The LEGACY methods keep the distinction — `crm.lead.list` says `STATUS_SEMANTIC_ID` where `crm.deal.list` says `STAGE_SEMANTIC_ID`.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/universal/object-fields.html
+  - impact: one dialect SHAPE serves both entities on the universal path; only the legacy spellings diverge, which is why `bitrix/utm.py` is a table of four constants rather than one shape with an id swapped in.
+- [verified] (Paging is the same as block (g)) Fixed 50 records per page, `start` offset, `total` in the envelope.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/leads/crm-lead-list.html
+  - impact: the preflight `total` bounds the cost of BOTH legs, which is what lets §4.13 refuse an impossible selection in one round trip rather than discovering it at the browser's timeout.
+- [unknown] (Does `select` actually RETURN the UTM fields?) `crm.item.fields` proves a field exists on the entity; no retrieved page states that `crm.item.list` returns `utmSource` when it is named in `select`. Bitrix24 omits null keys rather than returning `null`, so an all-empty result is indistinguishable from "these records genuinely carry no tags".
+  - impact: reported rather than detected — `scan.<entity>.tagged_rows` plus one sentence on the page that is true in both worlds. **This is the highest-value thing to settle on a real portal:** `crm.item.list {entityTypeId:1, select:["id","utmSource"], filter:{"=id":<a tagged lead>}}`. A positive answer deletes a hedge; a negative one makes the legacy dialects the only path and `LEAD_ITEM`/`DEAL_ITEM` dead code.
+- [unknown] (`OPPORTUNITY_ACCOUNT` / `ACCOUNT_CURRENCY_ID`) Neither appears in the retrieved lead or deal field tables; the pair is documented only in the SPA section. Whether it exists on leads and deals, and whether it is read-only, is unconfirmed.
+  - impact: §4.13 probes for it and falls back to `OPPORTUNITY` + `CURRENCY_ID` grouped by currency. Either way the singleton guard decides whether a money column is shown at all, so a wrong guess costs a hidden column and never a wrong number.
+- [unknown] (Does lead→deal conversion copy `UTM_*`?) Believed yes — the fields exist on both entities and the converter carries them — but not verified against a retrieved page or a live portal.
+  - impact: if it does NOT, §4.13's independent grouping is weaker and the attribution note becomes the page's most important sentence rather than a caveat. The decision not to join on `leadId` stands either way, because the join's cost is unbounded at preflight.
+- [unknown] (What does `crm.item.list {entityTypeId:1}` answer in simple CRM mode?) It may error, or it may return an empty list. If it returns empty, "leads are turned off" and "no leads this month" are indistinguishable and the copy must cover both.
+  - impact: §4.13 treats only a typed `MethodNotFound` / `AccessDenied` as "unavailable", so an empty 200 currently reads as "no leads this month".
+
+
 ### Corrections to brief
 - Brief says telephony roles are 'Administrator/Manager/Operator'. Official helpdesk lists default roles Administrator, Chief executive, Head of department, Manager; there is no 'Operator' default role. The 'Call statistics' permission has four values: Only their own calls / Calls from their department / Any calls / No access.
 - Brief implies the 'no rights' case is detected by 'render explicit state'. Concretely: voximplant.statistic.get with the user's token returns error code ACCESS_DENIED ('Insufficient permissions to view call statistics'), not an empty result; a user with 'own calls' level gets a normal (filtered) 200 response. The app cannot distinguish 'department' from 'own' or 'any' for non-admins via REST — only admin vs non-admin vs denied.

@@ -55,6 +55,76 @@ the original project brief; those corrections are already folded into `docs/arch
   - src: https://apidocs.bitrix24.com/api-reference/scopes/permissions.html
   - impact: Error handler must distinguish insufficient_scope (config bug, fail loudly/log) from ACCESS_DENIED (user-rights state, render no-access UI) from expired_token (refresh once).
 
+### Block (g) — CRM deals, funnels and stages (for the deal analytics page, §4.12)
+
+Researched 2026-09-12 against apidocs.bitrix24.com and the b24restdocs source. Nothing in the
+earlier blocks touched deals as *data*: block (c) established only that
+`voximplant.statistic.get` has no `DEAL` entity type, which is a statement about telephony
+rows, not about the CRM.
+
+- [verified] (Method family) 'Development of the crm.deal.* methods has been discontinued. For new development, use the universal methods crm.item.* with entityTypeId = 2.' The camelCase mapping is documented on the same page: `STAGE_ID` -> `stageId`, `CATEGORY_ID` -> `categoryId`, `ASSIGNED_BY_ID` -> `assignedById`.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/deals/index.html
+  - impact: `crm.item.list` is the primary path; `crm.deal.list` is kept only as a `MethodNotFound` fallback for older on-premise builds.
+- [verified] (OR logic) `filter` keys are AND-ed. Nested numeric-keyed groups carrying a `logic` member are documented ONLY for `crm.item.list`, with a worked example that unions two date ranges: `filter: {"0": {"logic": "OR", "0": {">=createdTime": ...}, "1": {">=createdTime": ...}}}`. No `logic` example exists on any `crm.deal.*` page.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/universal/crm-item-list.html
+  - impact: owner decision 3 (created OR modified OR closed) is ONE paged query on `crm.item.list` and three deduped selections on `crm.deal.list`. An undocumented `logic` on the old method would be UNSAFE: an ignored key returns a wrong, over-broad result rather than an error.
+- [verified] (Page size) 'The page size for results is always static - 50 records.' No `limit` / `pageSize` / `top` parameter exists on the list contract; `start` must be a multiple of 50.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/deals/crm-deal-list.html
+  - impact: request count is `ceil(N/50)` with no lever. This is THE cost variable of the no-storage design, and the reason for the preflight gate.
+- [verified] (start: -1) Disables the total-count calculation. Measured on a 2,387,743-row selection: counting `next=50, total=2387743, duration=49.92s`; with `start=-1` `total=0`, no `next`, `duration=0.098s`. There is no `crm.*.count` method and no count-only flag anywhere.
+  - src: https://apidocs.bitrix24.com/settings/performance/huge-data.html
+  - impact: `start:-1` is a cursor tool, not a count tool. The deal report rejects it: forfeiting `total` forfeits the preflight gate, which is the only thing that can refuse an impossible report in two seconds instead of twenty-eight.
+- [verified] (Envelope) `crm.deal.list` answers a BARE ARRAY in `result`; `crm.item.list` wraps its rows in `result.items`. Both carry `total`, `next` and `time` at the top level, and a batch reports them per command in `result_total` / `result_next` / `result_time`.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/universal/crm-item-list.html
+  - impact: the row parser must branch on the method, not on the shape.
+- [verified] (Dates accepted and returned) ISO 8601 with an explicit offset, e.g. `"DATE_CREATE": "2024-08-30T14:29:00+02:00"`. Filters accept the same form, and also a bare date. 'At the API level, all dates and times are stored according to the server parameters' — i.e. the PORTAL's zone, not the caller's.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/deals/crm-deal-get.html
+  - impact: period bounds must be serialised WITH an offset. A bare date is read in the portal's zone and would shift the window for every viewer in another zone, which is the normal case for this app.
+- [verified] (CLOSEDATE is not a close timestamp) `crm.deal.fields` declares `CLOSEDATE` as `{"type": "date", "isReadOnly": false}` — the deal's declared END of its date range, paired with `BEGINDATE`, pre-filled at creation and editable by anyone who can edit the deal. `DATE_CREATE` / `DATE_MODIFY` / `MOVED_TIME` are `datetime` and read-only.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/deals/crm-deal-fields.html
+  - impact: the "closed in this period" leg uses the READ-ONLY pair `closed = "Y"` plus `movedTime`, never `CLOSEDATE`. A back-dated `CLOSEDATE` would pull years-old deals into a one-week report and a forward-dated one would hide a deal that closed yesterday.
+- [verified] (Funnels) `crm.category.list {entityTypeId: 2}` is current and returns `result.categories[]` in camelCase (`id`, `name`, `sort`, `isDefault`), INCLUDING the default funnel as a real row with `id: 0`, `isDefault: "Y"`. `crm.dealcategory.list` is filed under OUTDATED and returns a flat UPPER_CASE array with no `isDefault`. Both are filtered by the CALLER's permissions.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/universal/category/crm-category-list.html
+  - impact: nothing needs synthesising for funnel 0. An EMPTY list means "this user may see no funnels", not "this portal has none" — it must render the `crm_no_access` state, never a blank table.
+- [verified] (Stages) `crm.status.list {order: {SORT: "ASC"}, filter: {ENTITY_ID: ...}}`, where `ENTITY_ID` is `DEAL_STAGE` for the default funnel and `DEAL_STAGE_<id>` otherwise. Verbatim warning: 'the default funnel with the identifier 0 — the code without the numeric part, DEAL_STAGE. There is no DEAL_STAGE_0 code: with it, the method returns an EMPTY LIST WITHOUT AN ERROR.' Arrays are not accepted for `ENTITY_ID`, and each pipeline requires its own call.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/status/crm-status-list.html
+  - impact: `DEAL_STAGE_0` is a SILENT bug — a funnel with zero columns, no exception and no log line. `tests/test_deal_aggregate.py` asserts both branches. Dictionary cost is `1 + K` commands for K funnels, packable into one batch.
+- [verified] (SEMANTICS) A closed three-valued set on the stage directory: `null` = in progress, `"S"` = success, `"F"` = failure, declared `isImmutable`. Per-funnel invariant: exactly ONE `S` stage, possibly MANY `F` stages, the rest `null`. `crm.status.add` documents the in-progress value as `""` while every `crm.status.list` example returns JSON `null`. `EXTRA.SEMANTICS` is a different, open-ended text field (a published response carries `apology`).
+  - src: https://apidocs.bitrix24.com/api-reference/crm/status/crm-status-fields.html
+  - impact: normalise `null` and `""` identically, and accept only `S`/`F` — anything else is in-progress, so a value nobody has thought of is never counted as a won or a lost deal. "Refused" must sum over ALL `F` stages: a single lose-stage lookup under-counts every portal that added refusal reasons.
+- [verified] (The deal carries its own semantic) `STAGE_SEMANTIC_ID` (`stageSemanticId`) is a read-only field on the deal itself with values `P` / `S` / `F`.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/deals/crm-deal-fields.html
+  - impact: the two rollup columns need no dictionary join at all. The dictionary is needed only for funnel names, column HEADERS and column ORDER.
+- [verified] (Stage id format) `STATUS_ID` is category-prefixed for non-default funnels (`C1:NEW`, `C10:PREPAYMENT_INVOIC`) and bare in funnel 0 (`NEW`), and 'STATUS_ID uniqueness is limited to its own directory'. `NEW`, `WON` and `LOSE` come back `SYSTEM='Y'`; `PREPARATION`, `EXECUTING` and `APOLOGY` are `SYSTEM='N'` and may be deleted or renamed. `CATEGORY_ID` on a status row is a STRING for a numbered funnel and `null` for the default one.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/status/crm-status-list.html
+  - impact: a column key must be the PAIR `(category_id, status_id)`; the `C<n>:` prefix is never parsed and never assumed present; and the category id is carried by the batch COMMAND KEY rather than read back off the row.
+- [verified] (Stage names are data) `NAME` is a required, editable per-portal string, seeded in the portal's language at creation. `NAME_INIT` is read-only but populated only for `SYSTEM='Y'` stages. No `LANG` parameter exists on `crm.status.list` or `crm.category.list`.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/status/crm-status-fields.html
+  - impact: stage and funnel names pass through untranslated and must NEVER enter `web/messages/*.json` — `tools/check-i18n.mjs` would demand a matching key in both bundles for something no bundle can hold. Only the fallback for an unnameable stage is a catalogue key.
+- [verified] (Batch cost) A batch is ONE request against the leaky bucket and is 'not accounted for in operating', but each nested method bills its own per-method-per-app operating time. Exceeding it returns HTTP 429 `OPERATION_TIME_LIMIT` and blocks THAT METHOD for THAT APP across the whole portal. Rate limits in 2026: drain 2/sec (Enterprise 5), burst 50 (Enterprise 250), 503 `QUERY_LIMIT_EXCEEDED` above it. A single cloud request is capped at 60 s.
+  - src: https://apidocs.bitrix24.com/settings/performance/limits.html
+  - impact: batching makes the report cheap on requests and NOT cheap on the thing that actually blocks a portal. Page batches are capped at 25 commands, not 50, and the endpoint reads `time.operating` adaptively. A runaway report would take `crm.item.list` away from this app portal-wide — including the CRM detail tab's own reads.
+- [verified] (Scope) `crm.item.list`, `crm.category.list` and `crm.status.list` all require only the `crm` scope, which the app already holds. `crm.status.list` is executable by 'any user with permission to read at least one CRM object'; `crm.category.list` by any user, with the result filtered by access.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/universal/crm-item-list.html
+  - impact: no vendor-cabinet change and no forced re-consent for the whole feature.
+- [unknown] (crm.status.list paging) The method reference documents only `order` and `filter` — no `start`, no page size — but the deal-funnels tutorial states 'API returns maximum 50 records per response'. Whether `start` is accepted here is not documented.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/status/crm-status-list.html
+  - impact: a funnel with more than 50 stages may lose column HEADERS. The endpoint compares the row count against the returned `total` and reports the funnel in `scan.stage_dictionary_truncated`; the COUNTS stay correct because the missing stages are synthesised from the deals themselves.
+- [unknown] (crm.category.list availability) No 'available from version X' note appears on the current docs, and the one web claim attributing it to CRM 21.400.0+ is not present on the page it cites.
+  - src: not found
+  - impact: never gate on a version number. Call it first and fall back on the typed `MethodNotFound` only; cache the verdict per portal.
+
+### Corrections to brief (deal analytics)
+- `crm.deal.list` cannot express the owner's "created OR modified OR closed" period in one query: its filter keys are strictly AND-ed and no `logic` grouping is documented for it. Only `crm.item.list` can, and that is why the universal method is the primary path rather than a modernisation for its own sake.
+- `CLOSEDATE` is NOT "when the deal closed". It is a writable planned end date. Using it for the closed leg of a period would silently mis-file back-dated and future-dated deals.
+- There is no count-only call. Every `total` costs a page of rows alongside it, and `start:-1` buys speed by removing `total` entirely.
+- The camelCase spellings `updatedTime`, `movedTime`, `closed` and `stageSemanticId` are INFERRED from the documented mapping; only `createdTime` appears verbatim in a retrieved example. Because an unknown filter key may be ignored rather than refused, the endpoint proves both that the name exists (`crm.item.fields`) and that the filter is applied (a probe in the exact nested `logic` shape) before believing a portal.
+
+### Open questions (deal analytics)
+- Does `crm.status.list` accept `start`? If it does, a funnel with more than 50 stages could be read in full instead of reported as truncated.
+- On an old on-premise build, does `crm.dealcategory.stage.list` really behave as the OUTDATED docs describe? The fallback dialect is only as good as its `FakeBitrix` script until a real such portal is seen.
+- Is one deal always one order on the owner's portal? "Всего заказов" counts deals; summing `OPPORTUNITY` or a quantity user-field instead would be a different `select`, a different aggregation and a currency question.
+
 ### Corrections to brief
 - Brief says telephony roles are 'Administrator/Manager/Operator'. Official helpdesk lists default roles Administrator, Chief executive, Head of department, Manager; there is no 'Operator' default role. The 'Call statistics' permission has four values: Only their own calls / Calls from their department / Any calls / No access.
 - Brief implies the 'no rights' case is detected by 'render explicit state'. Concretely: voximplant.statistic.get with the user's token returns error code ACCESS_DENIED ('Insufficient permissions to view call statistics'), not an empty result; a user with 'own calls' level gets a normal (filtered) 200 response. The app cannot distinguish 'department' from 'own' or 'any' for non-admins via REST — only admin vs non-admin vs denied.

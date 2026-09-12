@@ -172,6 +172,39 @@ export function formatCount(value: number | null | undefined, locale: string): s
 }
 
 /**
+ * A RATIO as a percentage in the viewer's locale (`0.4567` -> `46 %` in ru, `46%` in en).
+ *
+ * It takes the ratio, NOT a pre-multiplied number: feeding it `45.67` renders `4 567 %`,
+ * and that mistake is silent. The name says percent and the argument is a share, so the
+ * docblock is the only place the two can be reconciled - hence this paragraph.
+ *
+ * `—` for a missing or non-finite value, the convention `formatCount` already sets: a
+ * percentage with no denominator is an absence, never `0 %` and never `NaN %`.
+ *
+ * Note for layout: the ru locale puts a NON-BREAKING SPACE before the sign (`45,7 %`),
+ * so a Russian percentage is measurably wider than its English twin. The deal table's
+ * column widths are budgeted against ru for that reason.
+ */
+export function percent(
+  value: number | null | undefined,
+  locale: string,
+  digits = 0,
+): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return '—';
+  }
+  try {
+    return new Intl.NumberFormat(locale, {
+      style: 'percent',
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    }).format(value);
+  } catch {
+    return `${Math.round(value * 100)}%`;
+  }
+}
+
+/**
  * ISO timestamp -> local text in the *viewer's* timezone (the JWT `tz` claim, §4.6).
  *
  * Never the browser's timezone: a portal in another region must read its own clock.

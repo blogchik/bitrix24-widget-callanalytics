@@ -189,6 +189,7 @@ export default function HoursPage() {
             items={[
               { href: '/dashboard', label: t('app.nav.dashboard') },
               { href: '/hours', label: t('app.nav.hours') },
+              { href: '/deals', label: t('app.nav.deals') },
             ]}
           />
         }

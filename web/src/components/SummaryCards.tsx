@@ -30,7 +30,7 @@
 
 import { useTranslations } from 'next-intl';
 
-import { formatCount, formatDuration } from '@/lib/format';
+import { formatCount, formatDuration, percent } from '@/lib/format';
 
 /** Totals over one period, as `GET /api/v1/dashboard` returns them. */
 export interface PeriodTotals {
@@ -74,18 +74,6 @@ function averageTalk(totals: PeriodTotals | null): number | null {
     return null;
   }
   return totals.talk_seconds / totals.answered;
-}
-
-function percent(value: number, locale: string, digits = 0): string {
-  try {
-    return new Intl.NumberFormat(locale, {
-      style: 'percent',
-      minimumFractionDigits: digits,
-      maximumFractionDigits: digits,
-    }).format(value);
-  } catch {
-    return `${Math.round(value * 100)}%`;
-  }
 }
 
 function signedPercent(value: number, locale: string): string {

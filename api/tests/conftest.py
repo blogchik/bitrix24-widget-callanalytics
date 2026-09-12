@@ -327,3 +327,19 @@ def _reset_oauth_rate_limit() -> None:
     from app.bitrix.oauth import reset_exchange_rate_limit
 
     reset_exchange_rate_limit()
+
+
+@pytest.fixture(autouse=True)
+def _reset_deal_state() -> None:
+    """Clear the deal report's process-local caches and limiters between tests (§4.12).
+
+    Three of them, and each would corrupt a neighbouring test in its own way: the funnel
+    dictionary is keyed `(portal_id, user_id)` and a seeded portal reuses ids, the dialect
+    verdict would make the second test skip the honour probe the first one scripted, and
+    the per-viewer window is twelve reports per ten minutes - which a module with a dozen
+    cases reaches on its own, against a limiter that exists to protect a live portal.
+    """
+    from app.services.deal_stats import reset_deal_caches, reset_deal_report_rate_limit
+
+    reset_deal_caches()
+    reset_deal_report_rate_limit()

@@ -148,10 +148,16 @@ def sample_deals() -> list[dict[str, Any]]:
     ]
 
 
-#: The two answers a well-behaved portal gives the honour probe: a non-empty baseline (so
-#: the verdict is conclusive and may be cached) and an empty year-2999 selection.
-def honour_pair() -> tuple[Page, Page]:
-    return (Page(items=[lead(99, source="probe")], total=1), Page(items=[], total=0))
+#: What a well-behaved portal answers the honour probe: nothing is dated the year 2999.
+#: One page, not two - there is no unfiltered baseline any more (§4.13).
+def honour_ok() -> Page:
+    return Page(items=[], total=0)
+
+
+#: What a portal that IGNORES `>=createdTime` answers: the filter was dropped, so the
+#: selection is the whole table and the total is non-zero.
+def honour_ignored() -> Page:
+    return Page(items=[lead(98, source="probe")], total=7)
 
 
 def cold_fake(
@@ -163,22 +169,19 @@ def cold_fake(
 ) -> FakeBitrix:
     """A portal that answers the whole cold path: identity, both field maps, both probes, both pages.
 
-    The `crm.item.list` queue is consumed in batch order: `hl0`, `hl1`, `hd0`, `hd1` in the
-    probe batch, then `l0` and `d0` in the scan.
+    The `crm.item.list` queue is consumed in batch order: the lead probe then the deal probe
+    in the cold batch, then `l0` and `d0` in the scan.
     """
     lead_rows = sample_leads() if leads is None else leads
     deal_rows = sample_deals() if deals is None else deals
-    baseline, future = honour_pair()
     return (
         FakeBitrix()
         .on("user.current", me())
         .on("crm.item.fields", item_fields(), item_fields())
         .on(
             "crm.item.list",
-            baseline,
-            future,
-            baseline,
-            future,
+            honour_ok(),
+            honour_ok(),
             Page(items=lead_rows, total=lead_total if lead_total is not None else len(lead_rows)),
             Page(items=deal_rows, total=deal_total if deal_total is not None else len(deal_rows)),
         )
@@ -514,10 +517,9 @@ async def test_a_portal_without_leads_gets_a_deals_only_report(
         .on("crm.lead.fields", Err("ERROR_METHOD_NOT_FOUND"))
         .on(
             "crm.item.list",
-            # The lead probes error too; the deal probes answer normally, then the deal page.
+            # The lead probe errors too; the deal probe answers normally, then the deal page.
             Err("ERROR_METHOD_NOT_FOUND"),
-            Err("ERROR_METHOD_NOT_FOUND"),
-            *honour_pair(),
+            honour_ok(),
             Page(items=sample_deals(), total=2),
         )
         .on("crm.lead.list", Err("ERROR_METHOD_NOT_FOUND"))
@@ -582,9 +584,9 @@ async def test_a_build_with_no_utm_fields_anywhere_is_refused_with_mandated_copy
         .on("crm.item.fields", item_fields(utm=False), item_fields(utm=False))
         .on("crm.lead.fields", legacy_fields(utm=False))
         .on("crm.deal.fields", legacy_fields(utm=False))
-        .on("crm.item.list", *honour_pair(), *honour_pair())
-        .on("crm.lead.list", *honour_pair())
-        .on("crm.deal.list", *honour_pair())
+        .on("crm.item.list", honour_ok(), honour_ok())
+        .on("crm.lead.list", honour_ok())
+        .on("crm.deal.list", honour_ok())
     )
     with patch_httpx(fake):
         response = await post_utm(client, session_for(portal))
@@ -624,17 +626,15 @@ async def test_a_universal_method_without_utm_demotes_to_the_legacy_dialect(
         .on("crm.item.fields", item_fields(utm=False), item_fields(utm=False))
         .on("crm.lead.fields", legacy_fields())
         .on("crm.deal.fields", legacy_fields())
-        .on("crm.item.list", *honour_pair(), *honour_pair())
+        .on("crm.item.list", honour_ok(), honour_ok())
         .on(
             "crm.lead.list",
-            Page(items=[legacy_lead], total=1),
-            Page(items=[], total=0),
+            honour_ok(),
             Page(items=[legacy_lead], total=1),
         )
         .on(
             "crm.deal.list",
-            Page(items=[legacy_deal], total=1),
-            Page(items=[], total=0),
+            honour_ok(),
             Page(items=[legacy_deal], total=1),
         )
     )
@@ -660,16 +660,15 @@ async def test_a_portal_that_ignores_the_period_filter_is_demoted(
     A non-empty answer to "created at or past the year 2999" means the key was dropped, and
     on this page a dropped period key does not widen the selection - it deletes it.
     """
-    ignoring = Page(items=[lead(98, source="probe")], total=7)
     fake = (
         FakeBitrix()
         .on("user.current", me())
         .on("crm.item.fields", item_fields(), item_fields())
         .on("crm.lead.fields", legacy_fields())
         .on("crm.deal.fields", legacy_fields())
-        .on("crm.item.list", ignoring, ignoring, ignoring, ignoring)
-        .on("crm.lead.list", *honour_pair(), Page(items=[], total=0))
-        .on("crm.deal.list", *honour_pair(), Page(items=[], total=0))
+        .on("crm.item.list", honour_ignored(), honour_ignored())
+        .on("crm.lead.list", honour_ok(), Page(items=[], total=0))
+        .on("crm.deal.list", honour_ok(), Page(items=[], total=0))
     )
     with patch_httpx(fake):
         response = await post_utm(client, session_for(portal))
@@ -796,17 +795,14 @@ async def test_a_failed_follow_up_page_refuses_rather_than_answering_partially(
     client: httpx.AsyncClient, portal: SeededPortal
 ) -> None:
     """A silently dropped page under-counts one UTM row and reads to the user as data."""
-    baseline, future = honour_pair()
     fake = (
         FakeBitrix()
         .on("user.current", me())
         .on("crm.item.fields", item_fields(), item_fields())
         .on(
             "crm.item.list",
-            baseline,
-            future,
-            baseline,
-            future,
+            honour_ok(),
+            honour_ok(),
             Page(items=sample_leads(), total=120),
             Page(items=sample_deals(), total=2),
             Err("QUERY_LIMIT_EXCEEDED"),
@@ -878,3 +874,45 @@ async def test_leads_disappearing_between_two_reports_degrades_rather_than_refus
     with patch_httpx(after):
         assert (await post_utm(client, session_for(portal))).status_code == 200
     assert after.rest_count == 2
+
+
+async def test_a_period_with_nothing_in_it_does_not_cache_the_verdict(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """The trade that paid for deleting the unfiltered baseline, pinned.
+
+    A `>=created: 2999` answering zero only proves the filter held if this viewer can read
+    records at all. The scan is where that evidence now comes from, so a selection that
+    matched nothing leaves the portal un-cached and the next open cold. That is cheap: the
+    cold path is two field maps and two selections that match nothing - where the unfiltered
+    baseline it replaced counted the whole lead table and the whole deal table.
+    """
+    empty = cold_fake(leads=[], deals=[], lead_total=0, deal_total=0)
+    with patch_httpx(empty):
+        first = await post_utm(client, session_for(portal))
+    assert first.status_code == 200, first.text
+    assert first.json()["totals"]["leads"]["total"] == 0
+
+    again = cold_fake()
+    with patch_httpx(again):
+        second = await post_utm(client, session_for(portal))
+    assert second.status_code == 200, second.text
+    # Cold again: two round trips, and `from_cache` says so.
+    assert again.rest_count == 2
+    assert second.json()["scan"]["from_cache"] is False
+
+    # And now that the scan has seen rows, the verdict IS remembered.
+    warm = (
+        FakeBitrix()
+        .on("user.current", me())
+        .on(
+            "crm.item.list",
+            Page(items=sample_leads(), total=4),
+            Page(items=sample_deals(), total=2),
+        )
+    )
+    with patch_httpx(warm):
+        third = await post_utm(client, session_for(portal))
+    assert third.status_code == 200, third.text
+    assert warm.rest_count == 1
+    assert third.json()["scan"]["from_cache"] is True

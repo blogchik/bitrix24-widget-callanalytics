@@ -88,7 +88,7 @@ __all__ = [
     "core_names",
     "fields_command",
     "fields_key",
-    "honour_keys",
+    "honour_key",
     "honour_probe_commands",
     "honour_verdict",
     "legacy_of",
@@ -337,10 +337,9 @@ def fields_key(kind: str) -> str:
     return f"fl{_check_kind(kind)[0]}"
 
 
-def honour_keys(kind: str) -> tuple[str, str]:
-    """`(baseline, future)` probe keys for one entity."""
-    letter = _check_kind(kind)[0]
-    return (f"h{letter}0", f"h{letter}1")
+def honour_key(kind: str) -> str:
+    """The probe key for one entity."""
+    return f"h{_check_kind(kind)[0]}"
 
 
 # --- selection and filter ----------------------------------------------------------------
@@ -489,37 +488,54 @@ def fields_command(dialect: EntityDialect) -> tuple[str, str, dict[str, Any]]:
 
 
 def honour_probe_commands(dialect: EntityDialect) -> list[tuple[str, str, dict[str, Any]]]:
-    """Two questions whose answers are known, in the EXACT shape production sends.
+    """ONE question whose answer is known, in the EXACT shape production sends.
 
-    The first is unfiltered and establishes that this viewer can see anything at all. Without
-    it a zero from the second proves nothing, because a viewer with no readable records
-    returns zero for every filter - and caching that as "honoured" would pin an untested
-    verdict on the whole portal for every later viewer.
+    It asks for records created at or past the year 2999. No record can be: an honoured
+    filter answers zero, and any non-zero total means the key was DROPPED - which on this
+    page does not widen the selection, it deletes the period. See the module docblock.
 
-    The second asks for records created at or past the year 2999. An honoured filter answers
-    zero; any non-zero total means the key was DROPPED, which on this page does not widen the
-    selection - it deletes the period. See the module docblock.
+    ---------------------------------------------------------------------------------
+    **There used to be a second, UNFILTERED command here, and removing it was a bug fix
+    rather than a tidy-up.**
+
+    Its job was to prove the viewer can see anything at all, so that a zero from the probe
+    could be told apart from "this viewer reads nothing". That is a real question - but it
+    is a question about whether the verdict may be CACHED, never about whether the filter
+    was honoured, because a dropped key is proved by a non-zero total on its own.
+
+    The cost of asking it that way was not small. `filter_={}` makes Bitrix24 count the
+    WHOLE lead table and the whole deal table, on every cold report, for a number the
+    report then uses only to decide a cache write. It is independent of the period, so
+    narrowing to a single day does not make it cheaper; it repeats on every retry, because
+    a report that failed never cached anything; and it spends the `crm.item.list` operating
+    budget that the deal page shares. On a production portal that is how a page ends up
+    permanently answering `operation_time_limit`.
+
+    The caller now takes the same evidence from the scan it was going to run anyway: if the
+    period selection returned any rows at all, this viewer can see records, so a zero here
+    means the filter held. Same verdict, same safety, two fewer full-table counts.
+    ---------------------------------------------------------------------------------
     """
-    baseline, future = honour_keys(dialect.kind)
     return [
-        (baseline, dialect.method, _list_params(dialect, filter_={}, start=0)),
         (
-            future,
+            honour_key(dialect.kind),
             dialect.method,
             _list_params(dialect, filter_={f">={dialect.created}": _NEVER_ISO}, start=0),
         ),
     ]
 
 
-def honour_verdict(*, baseline: int | None, future: int | None) -> bool | None:
-    """`True` honoured, `False` demote to the legacy dialect, `None` inconclusive.
+def honour_verdict(*, future: int | None) -> bool | None:
+    """`False` demote to the legacy dialect, `True` no evidence the filter was dropped.
 
-    `None` is returned when the baseline is zero or unknown, and the caller MUST NOT cache
-    it. The contract is `deals.py::honour_verdict`'s verbatim, minus the third probe: this
-    page reads neither `closed` nor `movedTime`, so there is no second grouping to prove.
+    `None` means the probe itself did not answer and the caller must decide on other
+    grounds - never that the filter is fine.
+
+    `True` is deliberately NOT "conclusive". A viewer who can read nothing answers zero to
+    every filter, so a zero here is only evidence when something else shows they can read
+    something; the caller gets that from the period scan and uses it to decide whether the
+    verdict may be cached. Keeping the two apart is what let the unfiltered baseline go.
     """
-    if baseline is None or baseline <= 0:
-        return None
     if future is None:
         return None
     return future == 0

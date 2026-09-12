@@ -845,11 +845,30 @@ still says leads exist drops the lead leg on a structurally-absent page-0 error 
 that verdict, so the next report re-probes. Otherwise an administrator turning leads off
 would get an hour of `method_missing` where a fresh reader gets a deals-only report.
 
-#### The honour probe survives being halved
+#### The honour probe, and the unfiltered baseline that had to go
 
-Two commands per entity: an unfiltered baseline (so a zero proves something) and a
-year-2999 selection that must answer zero. The third probe (`closed` + `movedTime`) is gone
-because nothing here reads those fields.
+**One** command per entity: a year-2999 selection that must answer zero. The §4.12 probes
+for `closed` + `movedTime` are gone because nothing here reads those fields.
+
+There was briefly a second command — an UNFILTERED list, to prove the viewer can read
+anything at all, so that a zero from the probe could be told apart from "this viewer reads
+nothing". **It shipped, and it took the page down on the first production portal.**
+`filter: {}` makes Bitrix24 count the WHOLE lead table and the whole deal table. That cost
+is independent of the period, so narrowing to a single day does not reduce it; it repeats on
+every retry, because a report that failed cached nothing; and it spends the `crm.item.list`
+operating budget the deal page shares. The page answered `operation_time_limit` — rendered
+as the §4.11 `retry` state — for as long as the ten-minute window took to drain, and every
+press of "try again" refilled it.
+
+The baseline was never needed to DETECT a dropped filter: no record can be dated the year
+2999, so a non-zero total is proof on its own. It was only ever evidence about whether the
+verdict may be CACHED. That evidence now comes from the scan the report runs anyway — a
+selection that returned rows proves this viewer can read records — so the verdict is
+remembered after the scan rather than after the probe.
+
+The trade is that a period with nothing in it leaves the portal un-cached and the next open
+cold. That is cheap now: the cold path is two field maps and two selections that match
+nothing.
 
 The instinct is that one flat leg is safer than a nested group and the probe can go. It is
 the opposite. Under §4.12 an ignored `createdTime` widened the union to "created in the
@@ -896,6 +915,13 @@ the whole response body to `rest_log`, which here means customer lead rows (§6)
 
 Both counts are named separately in the refusal because the lever differs: a portal drowning
 in leads and one drowning in deals need different advice.
+
+**Every refusal code this page can answer is in `OWN_MESSAGE_CODES`** (`web/src/lib/api.ts`).
+A code that is not there renders the generic "something went wrong" state instead of its own
+sentence, which for `utm_scan_too_large` means dropping the two counts, the cap and the
+period length — the only numbers that turn the refusal into an action. The 503/429 family
+deliberately stays on the mandated `retry` copy, because "narrow this" is not the advice
+there.
 
 #### The bucket ladder — and why it is not the truncation §4.12 forbids
 

@@ -294,29 +294,38 @@ def test_fields_command_asks_the_universal_and_the_legacy_map_alike() -> None:
     assert fields_command(legacy_of(DEAL_ITEM))[1] == "crm.deal.fields"
 
 
-def test_honour_probe_is_two_commands_and_asks_a_question_with_a_known_answer() -> None:
-    """Halved from §4.12's three: nothing here reads `closed`, `movedTime` or `updatedTime`."""
-    commands = honour_probe_commands(DEAL_ITEM)
-    assert len(commands) == 2
-    (_, _, baseline), (_, _, future) = commands
-    assert baseline["filter"] == {}
-    assert future["filter"] == {">=createdTime": "2999-01-01T00:00:00+00:00"}
-    assert "logic" not in repr(future)
+def test_the_honour_probe_is_one_command_and_never_an_unfiltered_scan() -> None:
+    """The regression that took a production portal down, pinned as a shape.
 
+    An UNFILTERED `crm.item.list` makes Bitrix24 count the whole lead table and the whole
+    deal table. It is independent of the period, so narrowing to one day does not make it
+    cheaper; it repeats on every retry, because a failed report caches nothing; and it spends
+    the `crm.item.list` operating budget the deal page shares. The page answered
+    `operation_time_limit` for as long as the window took to drain.
 
-def test_honour_verdict_is_inconclusive_when_the_viewer_can_see_nothing() -> None:
-    """The case that must never be cached.
-
-    A viewer whose CRM rights are "own records only" and who owns nothing returns zero for
-    every filter. Recording that as "honoured" would pin an untested verdict on the whole
-    portal for an hour, and every later viewer would be served from a cache that never saw
-    a single record.
+    So: one command, and its filter is never empty.
     """
-    assert honour_verdict(baseline=0, future=0) is None
-    assert honour_verdict(baseline=None, future=0) is None
-    assert honour_verdict(baseline=5, future=None) is None
-    assert honour_verdict(baseline=5, future=0) is True
-    assert honour_verdict(baseline=5, future=3) is False
+    commands = honour_probe_commands(DEAL_ITEM)
+    assert len(commands) == 1
+    (_, _, future), = commands
+    assert future["filter"] == {">=createdTime": "2999-01-01T00:00:00+00:00"}
+    assert future["filter"] != {}
+    assert "logic" not in repr(future)
+    for dialect in (LEAD_ITEM, DEAL_ITEM, LEAD_LEGACY, DEAL_LEGACY):
+        for _, _, params in honour_probe_commands(dialect):
+            assert params["filter"], "an unfiltered probe counts the whole table"
+
+
+def test_honour_verdict_detects_a_dropped_filter_without_a_baseline() -> None:
+    """A non-zero answer to "created at or past the year 2999" needs no corroboration.
+
+    No record can be. So `False` is proof on its own, which is why the unfiltered baseline
+    could go: it was only ever evidence about whether the verdict may be CACHED, and the
+    caller now takes that from the scan it runs anyway.
+    """
+    assert honour_verdict(future=3) is False
+    assert honour_verdict(future=0) is True
+    assert honour_verdict(future=None) is None
 
 
 # --- normalisation -------------------------------------------------------------------------

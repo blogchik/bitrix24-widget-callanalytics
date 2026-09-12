@@ -114,6 +114,14 @@ const OWN_MESSAGE_CODES: ReadonlySet<string> = new Set([
   'deal_report_failed',
   'viewer_token_required',
   'unsupported_filter',
+  // §4.13, the same argument. `utm_scan_too_large` in particular carries the two counts, the
+  // cap and the period length, and without them the refusal is one nobody can act on - the
+  // generic state page would tell a reader something went wrong and not that their period is
+  // twice too wide.
+  'utm_scan_too_large',
+  'utm_report_failed',
+  'utm_unsupported',
+  'bad_dimension',
 ]);
 
 export interface ErrorPresentation {

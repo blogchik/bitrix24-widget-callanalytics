@@ -349,7 +349,9 @@ async def crm_analytics(
         )
     _log.info(
         "portal: CRM analytics switched",
-        extra={"portal_id": portal.id, "enabled": enabled, "changed": changed},
+        # A constant per branch rather than the parsed body value: nothing the caller sent
+        # reaches the log, whatever `_read_enabled` is later taught to accept.
+        extra={"portal_id": portal.id, "state": "on" if enabled else "off", "changed": changed},
     )
     portal, _ = await _load(principal.portal_id)
     return JSONResponse(crm_block(portal))

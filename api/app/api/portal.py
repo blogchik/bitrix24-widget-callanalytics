@@ -48,7 +48,7 @@ from app.bitrix.oauth import (
 )
 from app.bitrix.placements import bind_all, get_bound_placements
 from app.config import settings
-from app.db.models import Portal, PortalSync
+from app.db.models import CrmLane, Portal, PortalSync
 from app.db.session import control_txn
 from app.logging import get_logger, get_request_id
 from app.security.principal import (
@@ -59,8 +59,10 @@ from app.security.principal import (
 )
 from app.services.portals import (
     decrypt_portal_token,
+    dismiss_crm_notice,
     record_event,
     record_placements,
+    set_crm_analytics,
     store_portal_credential,
 )
 
@@ -171,6 +173,39 @@ async def _load(portal_id: int) -> tuple[Portal, PortalSync | None]:
     return portal, sync
 
 
+def crm_block(portal: Portal) -> dict[str, Any]:
+    """Where CRM analytics stands for this portal - shared by `sync-status` and the switch."""
+    return {
+        "analytics_enabled": portal.crm_opt_out_at is None,
+        "mode": portal.crm_mode,
+        "opted_out_at": _isoformat(portal.crm_opt_out_at),
+        "purge_pending": bool(portal.crm_purge_pending),
+    }
+
+
+async def _crm_lanes(portal_id: int) -> list[dict[str, Any]]:
+    """The mirror's lanes as the settings page shows them: progress and why one waits."""
+    async with control_txn() as session:
+        lanes = (
+            await session.execute(
+                select(CrmLane).where(CrmLane.portal_id == portal_id).order_by(CrmLane.lane)
+            )
+        ).scalars()
+        return [
+            {
+                "lane": lane.lane,
+                "status": lane.status,
+                "progress_done": lane.progress_done,
+                "progress_total": lane.progress_total,
+                "last_clean_at": _isoformat(lane.last_clean_at),
+                "paused_until": _isoformat(lane.paused_until),
+                "block_reason": lane.block_reason,
+                "last_error_code": lane.last_error_code,
+            }
+            for lane in lanes
+        ]
+
+
 # --- GET /portal/sync-status ---------------------------------------------------------
 
 
@@ -266,8 +301,67 @@ async def sync_status(principal: Principal = Depends(get_principal)) -> JSONResp
             "placements": portal.placements or {},
             "capabilities": portal.capabilities or {},
             "recording_mode": settings.recording_mode,
+            # §4.14: the administrator's switch and the mirror's progress, lane by lane.
+            "crm": {**crm_block(portal), "lanes": await _crm_lanes(portal.id)},
         }
     )
+
+
+# --- POST /portal/crm-analytics, POST /portal/crm-notice/dismiss (D-7) ---------------
+
+
+async def _read_enabled(request: Request) -> bool | None:
+    """`{"enabled": true|false}` and nothing else, or None."""
+    raw = await request.body()
+    if not raw or len(raw) > _MAX_BODY_BYTES:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("enabled")
+    return value if isinstance(value, bool) else None
+
+
+@router.post("/portal/crm-analytics")
+async def crm_analytics(
+    request: Request, principal: Principal = Depends(get_principal)
+) -> JSONResponse:
+    """The administrator's CRM analytics switch (D-7, docs/crm-mirror-notice.md sections 2-4).
+
+    Off deletes this portal's CRM mirror (the worker's verified CRM purge, within a tick or two)
+    and closes the Deals and Sources reports, live reads included; calls are untouched. On
+    starts storage again at once. Administrators only, like everything on the settings page.
+    """
+    await _require_admin(principal)
+    enabled = await _read_enabled(request)
+    if enabled is None:
+        return _error("bad_request", 400)
+    portal, _ = await _load(principal.portal_id)
+    if portal.status != _ACTIVE:
+        return _error("portal_inactive", 401)
+
+    async with control_txn() as session:
+        changed = await set_crm_analytics(
+            session, portal.id, enabled=enabled, user_id=principal.user_id
+        )
+    _log.info(
+        "portal: CRM analytics switched",
+        extra={"portal_id": portal.id, "enabled": enabled, "changed": changed},
+    )
+    portal, _ = await _load(principal.portal_id)
+    return JSONResponse(crm_block(portal))
+
+
+@router.post("/portal/crm-notice/dismiss")
+async def dismiss_notice(principal: Principal = Depends(get_principal)) -> JSONResponse:
+    """"Got it" on the informational CRM notice, for this administrator only."""
+    await _require_admin(principal)
+    async with control_txn() as session:
+        await dismiss_crm_notice(session, principal.portal_id, user_id=principal.user_id)
+    return JSONResponse({"notice_visible": False})
 
 
 # --- POST /portal/reauthorize --------------------------------------------------------

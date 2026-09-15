@@ -1211,6 +1211,7 @@ Replaces the live reads of §4.12 and §4.13 one portal at a time. Constraints:
 7. **Employee pickers follow the page.** Call pages list employees with calls; `/deals` and `/utm` list CRM assignees.
 8. **Rollout is per portal and reversible.** `python -m app.tools.crm_mode` moves a portal `off → sync → shadow → mirror`.
    - Every eligible portal, existing or new, starts syncing as soon as the code ships; the owner dropped D-7's 14-day wait on 2026-09-15. Administrators see an informational notice, and a portal whose administrator turned CRM analytics off neither syncs nor serves the Deals and Sources reports, live or mirrored.
+   - Built in M4b: the switch is `POST /api/v1/portal/crm-analytics` (admin only). Off stamps `crm_opt_out_at`, raises the fence (`sync_generation + 1`) and queues `crm_purge_pending`; the tick's purge slot then runs `sync/purge.py::purge_crm_data`, which deletes `CRM_TENANT_TABLES` under tenant context with the same three verification rules as the uninstall purge and keeps calls. On clears the stamp; storage resumes only once the purge has finished. `/me.crm` carries `analytics_enabled` for every viewer and `notice_visible` for administrators, and `python -m app.tools.crm_mode` is the operator's view and mode switch.
    - `shadow` recomputes every successful live report from the mirror in the background and keeps the differences for 30 days.
    - A fleet-wide kill switch stops all CRM REST.
 

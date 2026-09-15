@@ -39,7 +39,7 @@ import {
   Section,
 } from '@/components/AppFrame';
 import StateCard from '@/components/StateCard';
-import { apiFetch, useMe, type Me } from '@/lib/api';
+import { apiFetch, setCrmAnalytics, useMe, type Me } from '@/lib/api';
 import { getAuth, refreshAuth } from '@/lib/bx24';
 import { useCopy, type Copy } from '@/lib/calls';
 import { formatCount, formatDateTime } from '@/lib/format';
@@ -142,6 +142,24 @@ interface PortalStatus {
   last_error_at: string | null;
   placements: Record<string, PlacementState>;
   capabilities: Record<string, unknown>;
+  crm: CrmStatus | null;
+}
+
+/** One CRM mirror lane as `sync-status` reports it (§5.10). */
+interface CrmLaneState {
+  lane: string;
+  status: string | null;
+  progress_done: number | null;
+  progress_total: number | null;
+  block_reason: string | null;
+}
+
+/** The administrator's CRM analytics switch and the mirror's progress (§4.14, D-7). */
+interface CrmStatus {
+  analytics_enabled: boolean | null;
+  opted_out_at: string | null;
+  purge_pending: boolean | null;
+  lanes: CrmLaneState[];
 }
 
 function obj(value: unknown): Record<string, unknown> | null {
@@ -177,6 +195,29 @@ function placementsOf(value: unknown): Record<string, PlacementState> {
     };
   }
   return result;
+}
+
+function crmOf(value: unknown): CrmStatus | null {
+  const record = obj(value);
+  if (!record) {
+    return null;
+  }
+  const lanes = Array.isArray(record.lanes) ? record.lanes : [];
+  return {
+    analytics_enabled: bool(record.analytics_enabled),
+    opted_out_at: str(record.opted_out_at),
+    purge_pending: bool(record.purge_pending),
+    lanes: lanes
+      .map((raw) => obj(raw))
+      .filter((lane): lane is Record<string, unknown> => lane !== null && Boolean(str(lane.lane)))
+      .map((lane) => ({
+        lane: String(lane.lane),
+        status: str(lane.status),
+        progress_done: num(lane.progress_done),
+        progress_total: num(lane.progress_total),
+        block_reason: str(lane.block_reason),
+      })),
+  };
 }
 
 /**
@@ -218,6 +259,7 @@ function normaliseStatus(raw: unknown): PortalStatus {
     last_error_at: str(lastError.at ?? lastError.last_error_at),
     placements: placementsOf(body.placements ?? portal.placements),
     capabilities: obj(body.capabilities ?? portal.capabilities) ?? {},
+    crm: crmOf(body.crm),
   };
 }
 
@@ -291,6 +333,8 @@ export default function SettingsPage() {
   const [reauth, setReauth] = useState<ActionState>({ kind: 'idle' });
   const [rebind, setRebind] = useState<ActionState>({ kind: 'idle' });
   const [reauthNoAuth, setReauthNoAuth] = useState(false);
+  const [crmAction, setCrmAction] = useState<ActionState>({ kind: 'idle' });
+  const [crmConfirming, setCrmConfirming] = useState(false);
 
   /**
    * §4.5: the body is the pair from `BX24.getAuth()` and nothing else.
@@ -333,6 +377,23 @@ export default function SettingsPage() {
     }
   }, [status]);
 
+  /** D-7: off deletes the CRM copy, so it is confirmed first; on needs no confirmation. */
+  const onCrmSwitch = useCallback(
+    async (enabled: boolean) => {
+      setCrmConfirming(false);
+      setCrmAction({ kind: 'busy' });
+      try {
+        await setCrmAnalytics(enabled);
+        setCrmAction({ kind: 'ok' });
+        status.reload();
+        reload();
+      } catch {
+        setCrmAction({ kind: 'failed' });
+      }
+    },
+    [status, reload],
+  );
+
   if (loading) {
     return <LoadingBlock label={t('app.loading')} />;
   }
@@ -357,6 +418,7 @@ export default function SettingsPage() {
     view.reauthorize_soon ?? (tokenAge !== null && tokenAge >= TOKEN_WARN_DAYS);
   const tokenOk = (view.token_status ?? 'ok') === 'ok';
   const zone = me.timezone;
+  const crmOn = view.crm?.analytics_enabled !== false;
 
   return (
     <PageShell
@@ -406,6 +468,74 @@ export default function SettingsPage() {
             value={formatDateTime(view.next_run_at, locale, zone)}
           />
         </FieldList>
+      </Section>
+
+      {/* ------------------------------------------------------------ crm -------- */}
+      <Section title={t('app.settings.crm.section')}>
+        <FieldList>
+          <Field
+            label={t('app.settings.crm.status')}
+            value={
+              crmOn
+                ? t('app.settings.crm.on')
+                : t('app.settings.crm.offSince', {
+                    date: formatDateTime(view.crm?.opted_out_at ?? null, locale, zone),
+                  })
+            }
+          />
+          {view.crm?.purge_pending ? (
+            <Field label={t('app.settings.crm.data')} value={t('app.settings.crm.purging')} />
+          ) : null}
+          {(view.crm?.lanes ?? []).map((lane) => (
+            <Field key={lane.lane} label={lane.lane} value={laneText(lane, t, locale)} />
+          ))}
+        </FieldList>
+        <p className="ca-muted mt-3 text-[13px]">
+          {crmOn ? t('app.settings.crm.onHint') : t('app.settings.crm.offHint')}
+        </p>
+        {crmConfirming ? (
+          <div className="mt-3" role="alertdialog" aria-labelledby="ca-crm-settings-confirm">
+            <p id="ca-crm-settings-confirm" className="font-semibold">
+              {t('app.crmNotice.confirmTitle')}
+            </p>
+            <p className="mt-1 text-[14px]">{t('app.crmNotice.confirmBody')}</p>
+            <div className="ca-actionrow">
+              <button type="button" className="ca-button" onClick={() => void onCrmSwitch(false)}>
+                {t('app.crmNotice.confirmYes')}
+              </button>
+              <button
+                type="button"
+                className="ca-button ca-button-quiet"
+                onClick={() => setCrmConfirming(false)}
+              >
+                {t('app.crmNotice.confirmNo')}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="ca-actionrow">
+            <button
+              type="button"
+              className={crmOn ? 'ca-button ca-button-quiet' : 'ca-button'}
+              disabled={crmAction.kind === 'busy'}
+              onClick={() => (crmOn ? setCrmConfirming(true) : void onCrmSwitch(true))}
+            >
+              {crmAction.kind === 'busy'
+                ? c('app.settings.working')
+                : crmOn
+                  ? t('app.settings.crm.turnOff')
+                  : t('app.settings.crm.turnOn')}
+            </button>
+          </div>
+        )}
+        {crmAction.kind === 'ok' ? (
+          <p className="mt-2 text-[13px]">
+            {crmOn ? t('app.settings.crm.turnedOn') : t('app.settings.crm.turnedOff')}
+          </p>
+        ) : null}
+        {crmAction.kind === 'failed' ? (
+          <p className="mt-2 text-[13px]">{t('app.settings.crm.failed')}</p>
+        ) : null}
       </Section>
 
       {/* ----------------------------------------------------------- token ------- */}
@@ -618,6 +748,16 @@ function merged(me: Me, status: PortalStatus | null): PortalStatus {
     last_error_at: status?.last_error_at ?? null,
     placements: status?.placements ?? {},
     capabilities: status?.capabilities ?? {},
+    crm:
+      status?.crm ??
+      (me.crm
+        ? {
+            analytics_enabled: me.crm.analytics_enabled,
+            opted_out_at: me.crm.opted_out_at ?? null,
+            purge_pending: me.crm.purge_pending ?? null,
+            lanes: [],
+          }
+        : null),
   };
 }
 
@@ -635,6 +775,32 @@ function placementRows(
     }
   }
   return rows;
+}
+
+/**
+ * One lane in a line: loaded, waiting and why, or how far its backfill got.
+ *
+ * The reason is a machine code shown verbatim, like the last error code: it is what an
+ * administrator quotes to support (§8).
+ */
+function laneText(
+  lane: CrmLaneState,
+  t: ReturnType<typeof useTranslations>,
+  locale: string,
+): string {
+  if (lane.status === 'done') {
+    return t('app.settings.crm.laneDone');
+  }
+  if (lane.block_reason) {
+    return t('app.settings.crm.laneBlocked', { reason: lane.block_reason });
+  }
+  if (lane.progress_total !== null && lane.progress_total > 0) {
+    return t('app.settings.crm.laneProgress', {
+      done: formatCount(lane.progress_done ?? 0, locale),
+      total: formatCount(lane.progress_total, locale),
+    });
+  }
+  return lane.status ?? '—';
 }
 
 /** Whole days since a timestamp, or `null` when there is none. */

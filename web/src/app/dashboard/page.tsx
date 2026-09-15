@@ -49,6 +49,7 @@ import Filters, {
 import HourWeekdayHeatmap, { type HourCell } from '@/components/HourWeekdayHeatmap';
 import StateCard from '@/components/StateCard';
 import SummaryCards, { type DashboardSummary } from '@/components/SummaryCards';
+import CrmDataNotice from '@/components/CrmDataNotice';
 import SyncBanner from '@/components/SyncBanner';
 import { ApiError, CODE_SERVER, apiFetch, deniedBodyKey, presentError, useMe } from '@/lib/api';
 import { fitWindow } from '@/lib/bx24';
@@ -171,6 +172,7 @@ export default function DashboardPage() {
         banner={me.data.access === 'own' ? <span>{t('app.ownScopeBanner')}</span> : undefined}
       >
         <SyncBanner sync={me.data.sync} isAdmin={me.data.is_admin} locale={locale} />
+        <CrmDataNotice crm={me.data.crm} isAdmin={me.data.is_admin} onChanged={me.reload} />
 
         {filters ? (
           <Filters

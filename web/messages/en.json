@@ -221,7 +221,25 @@
       "tokenRefreshed": "Last renewed",
       "tokenSection": "Authorisation",
       "tokenStatus": "Token status",
-      "working": "Working..."
+      "working": "Working...",
+      "crm": {
+        "section": "CRM analytics",
+        "status": "Status",
+        "on": "On",
+        "offSince": "Turned off on {date}",
+        "data": "CRM data",
+        "purging": "Being deleted",
+        "onHint": "The app keeps a copy of a minimal set of CRM data, listed in section 2 of the privacy policy.",
+        "offHint": "No CRM data of this portal is stored, and the Deals and Sources reports are unavailable.",
+        "turnOff": "Turn off CRM analytics",
+        "turnOn": "Turn on CRM analytics",
+        "turnedOff": "CRM analytics is off.",
+        "turnedOn": "CRM analytics is on.",
+        "failed": "The setting could not be changed. Please try again.",
+        "laneDone": "Loaded",
+        "laneBlocked": "Waiting: {reason}",
+        "laneProgress": "{done} / {total}"
+      }
     },
     "signedInAs": "Bitrix24 user #{id}",
     "sync": {
@@ -332,6 +350,19 @@
         "utm_content": "Content",
         "utm_term": "Term"
       }
+    },
+    "crmNotice": {
+      "title": "The Deals and Sources reports now work differently",
+      "body": "The app keeps a copy of a minimal set of your portal's CRM data on its server: stages, amounts, responsible employees, dates and UTM tags of deals and leads. Deal and lead titles, client contacts, comments and custom fields are not stored. That is why reports open faster, for any period up to a year, without calling the Bitrix24 API on every open.",
+      "optOut": "If you do not want CRM data stored, turn CRM analytics off and the stored data is deleted. Call reports keep working as they do now.",
+      "privacy": "Privacy policy",
+      "turnOff": "Turn off CRM analytics",
+      "dismiss": "Got it",
+      "confirmTitle": "Turn off CRM analytics?",
+      "confirmBody": "This portal's CRM data will not be stored, and anything already stored will be deleted. The Deals and Sources reports will become unavailable. You can turn analytics back on in the app settings.",
+      "confirmYes": "Turn off",
+      "confirmNo": "Cancel",
+      "failed": "CRM analytics could not be turned off. Please try again."
     }
   },
   "call": {
@@ -367,7 +398,8 @@
     "utm_scan_too_large": "This period has too many leads and deals to read live ({total} of {max_total} over {days} days). Narrow the period, or pick an employee.",
     "utm_report_failed": "Bitrix24 could not answer the traffic-source report. Try again in a moment.",
     "utm_unsupported": "This portal's Bitrix24 does not return UTM tags on leads and deals through the API, so this page cannot be built. The other pages are unaffected.",
-    "bad_dimension": "Unknown breakdown: {dimension}."
+    "bad_dimension": "Unknown breakdown: {dimension}.",
+    "crm_analytics_off": "A portal administrator turned CRM analytics off, so this report is unavailable. It can be turned back on in the app settings."
   },
   "install": {
     "fallback": "Could not reach Bitrix24. Close this window and start the installation again.",
@@ -422,6 +454,10 @@
     "unsupported_portal": {
       "body": "This Bitrix24 did not provide the data the app needs to authorise itself. Installing in this configuration is not supported yet — please contact the app's support.",
       "title": "This Bitrix24 is not supported"
+    },
+    "crm_off": {
+      "title": "CRM analytics is turned off",
+      "body": "A portal administrator turned CRM analytics off, so this report is unavailable. It can be turned back on in the app settings."
     }
   }
 }

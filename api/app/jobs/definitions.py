@@ -107,13 +107,14 @@ from app.sync.lease import (
     heartbeat,
     release_lease,
 )
-from app.sync.purge import outside_incomplete_cooldown, purge_portal_data
+from app.sync.purge import outside_incomplete_cooldown, purge_crm_data, purge_portal_data
 from app.sync.purge import purge_crm_contexts as _purge_crm_context_rows
 from app.sync.purge import purge_rest_log as _purge_rest_log_rows
 from app.sync.rescan import run_id_window_rescan, run_record_recheck, run_refresh_requested
 
 __all__ = [
     "JOBS",
+    "purge_crm",
     "purge_crm_contexts",
     "purge_portal",
     "purge_rest_log",
@@ -1662,6 +1663,15 @@ async def _run_purge(portal_id: int) -> None:
         log.exception("purge: job crashed", extra={"portal_id": portal_id})
 
 
+async def _run_crm_purge(portal_id: int) -> None:
+    try:
+        await purge_crm(portal_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("crm purge: job crashed", extra={"portal_id": portal_id})
+
+
 async def tick() -> None:
     """The 15 s heartbeat of §5.9: lease what is due, dispatch it, then one purge.
 
@@ -1697,6 +1707,28 @@ async def tick() -> None:
     if pending is not None:
         portal_id = int(pending)
         _spawn(_purging, portal_id, _run_purge(portal_id), "purge_portal")
+        return
+
+    # (c) the same slot for a CRM-only purge (an administrator turned CRM analytics off),
+    # after uninstalls: an uninstall owes every table, and a portal that is both waiting for
+    # the whole-portal purge and for this one is emptied by the whole-portal one.
+    async with control_txn() as session:
+        crm_pending = (
+            await session.execute(
+                select(Portal.id)
+                .outerjoin(PortalSync, PortalSync.portal_id == Portal.id)
+                .where(
+                    Portal.crm_purge_pending.is_(True),
+                    Portal.purge_pending.is_(False),
+                    outside_incomplete_cooldown(),
+                )
+                .order_by(Portal.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if crm_pending is not None:
+        portal_id = int(crm_pending)
+        _spawn(_purging, portal_id, _run_crm_purge(portal_id), "purge_crm")
 
 
 async def purge_portal(portal_id: int) -> None:
@@ -1721,6 +1753,11 @@ async def purge_portal(portal_id: int) -> None:
             "bodies_redacted": outcome.bodies_redacted,
         },
     )
+
+
+async def purge_crm(portal_id: int) -> None:
+    """Delete one portal's CRM mirror after CRM analytics was turned off, verified (§5.12)."""
+    await purge_crm_data(portal_id)
 
 
 async def purge_rest_log() -> None:
@@ -1803,6 +1840,7 @@ JOBS: Final[dict[str, Callable[..., Awaitable[None]]]] = {
     "tick": tick,
     "sync_portal": sync_portal,
     "purge_portal": purge_portal,
+    "purge_crm": purge_crm,
     "purge_rest_log": purge_rest_log,
     "purge_crm_contexts": purge_crm_contexts,
     "sweep_inferred_uninstalls": sweep_inferred_uninstalls,

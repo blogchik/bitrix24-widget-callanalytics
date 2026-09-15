@@ -71,6 +71,9 @@ class CrmStub:
         self.malformed: set[tuple[int, int]] = set()
         self.operating = 0.0
         self.last_time: dict[str, Any] | None = None
+        #: How the portal shifts a datetime filter (S-A.10): `>=updatedTime: v` selects from
+        #: `v - filter_shift`, as a portal whose token user sits that far east of the server.
+        self.filter_shift = dt.timedelta(0)
 
     # -- client surface ----------------------------------------------------------------
 
@@ -134,8 +137,7 @@ class CrmStub:
         page = [{field: row[field] for field in select if field in row} for row in rows[:PAGE]]
         return page, total
 
-    @staticmethod
-    def _matches(row: Mapping[str, Any], filter: Mapping[str, Any]) -> bool:
+    def _matches(self, row: Mapping[str, Any], filter: Mapping[str, Any]) -> bool:
         item_id = _id_of(row)
         for key, value in filter.items():
             if key == ">id" and not item_id > int(value):
@@ -147,7 +149,8 @@ class CrmStub:
             if key == "@id" and item_id not in {int(v) for v in value}:
                 return False
             if key == ">=updatedTime" and not (
-                dt.datetime.fromisoformat(row["updatedTime"]) >= dt.datetime.fromisoformat(value)
+                dt.datetime.fromisoformat(row["updatedTime"])
+                >= dt.datetime.fromisoformat(value) - self.filter_shift
             ):
                 return False
         return True

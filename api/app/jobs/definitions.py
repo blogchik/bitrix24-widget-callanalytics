@@ -93,6 +93,7 @@ from app.services.portals import (
 from app.sync import budgets as method_budgets
 from app.sync import (
     crm_backfill,
+    crm_clock,
     crm_dict,
     crm_dirty_refresh,
     crm_lanes,
@@ -1104,9 +1105,92 @@ async def _phase_crm_sweep(visit: _Visit) -> None:
         )
 
 
+async def _resume_sweep_parked_before_the_clock(visit: _Visit, name: str) -> None:
+    """Unpark a sweep that was parked for a shifted filter, not an ignored one.
+
+    Before `crm_clock` a sweep sent its bound unshifted, and on a portal whose installer sits
+    east of the server the wider answer read as an ignored filter (S-A.10). Those lanes carry no
+    measured shift in their cursor; a lane parked by this code always does.
+    """
+    lane = visit.lanes.get(name)
+    if (
+        not visit.crm_active
+        or lane is None
+        or lane.status != crm_lanes.PARKED
+        or lane.block_reason != _FILTER_UNSUPPORTED
+        or "shift_seconds" in lane.cursor
+    ):
+        return
+    visit.lanes[name] = replace(
+        lane,
+        status=crm_lanes.ACTIVE,
+        due_at=_utcnow(),
+        cursor={},
+        block_reason=None,
+        last_error_code=None,
+        last_error_at=None,
+    )
+    await _save_lanes(visit, name)
+    log.info(
+        "crm: a sweep parked before its filter clock existed is resumed",
+        extra={"portal_id": visit.portal_id, "lane": name},
+    )
+
+
+async def _measure_sweep_clock(
+    visit: _Visit,
+    name: str,
+    client: BitrixClient,
+    cursor: crm_sweep.SweepCursor,
+    dialect: MirrorDialect,
+) -> tuple[bool, dict[str, Any] | None] | None:
+    """Measure how the portal shifts a datetime filter before the next sweep page (`crm_clock`).
+
+    None stops the lane for this visit (an error was charged to it). `(False, None)`: nothing is
+    mirrored to measure against yet, so the sweep runs wide. `(True, time_block)`: the cursor
+    now carries a measurement, stored.
+    """
+    reference = await crm_clock.reference_record(
+        visit.portal_id, dialect.entity_type_id, now=_utcnow()
+    )
+    if reference is None:
+        return False, None
+    measured = await crm_clock.measure(client, dialect, *reference)
+    visit.crm_batches -= measured.batches
+    now = _utcnow()
+    if measured.error is not None:
+        errors = _crm_lane_errors(visit, [measured.error])
+        if errors:
+            _lane_trouble(visit, name, errors, now=now)
+            await _save_lanes(visit, name)
+        return None
+
+    shift = None if measured.shift is None else int(measured.shift.total_seconds())
+    if shift is None:
+        log.warning(
+            "crm: the portal's filter clock could not be measured; the sweep stays as it was",
+            extra={"portal_id": visit.portal_id, "lane": name, "reason": measured.reason},
+        )
+        shift = cursor.shift_seconds
+    elif shift != cursor.shift_seconds:
+        log.info(
+            "crm: filter clock measured",
+            extra={"portal_id": visit.portal_id, "lane": name, "shift_seconds": shift},
+        )
+    calibrated = replace(cursor, shift_seconds=shift, calibrated_at=now)
+    if shift != cursor.shift_seconds:
+        # A different bound mid-pass could leave a gap beside the pages already read, so the
+        # pass starts again from its watermark.
+        calibrated = replace(calibrated, after_id=0, pass_started=None)
+    visit.lanes[name] = replace(visit.lanes[name], cursor=calibrated.to_json())
+    await _save_lanes(visit, name)
+    return True, measured.time_block
+
+
 async def _run_crm_sweep(
     visit: _Visit, name: str, item: MirrorDialect, legacy: MirrorDialect
 ) -> None:
+    await _resume_sweep_parked_before_the_clock(visit, name)
     lane = _crm_lane_ready(visit, name)
     if lane is None:
         return
@@ -1126,6 +1210,16 @@ async def _run_crm_sweep(
             dialect = _dialect(cursor.dialect, item, legacy)
             if not await _crm_within_share(visit, name, dialect.method, CRM_SWEEP_SHARE):
                 return
+            if crm_clock.due(cursor.calibrated_at, now=_utcnow()):
+                outcome = await _measure_sweep_clock(visit, name, client, cursor, dialect)
+                if outcome is None:
+                    return
+                measured, clock_block = outcome
+                if measured:
+                    visit.more = True
+                    if visit.crm_batches <= 0 or not await pace(clock_block):
+                        return
+                    continue
             read_at = _utcnow()
             batch = await client.batch([crm_sweep.command(cursor, dialect, overlap=overlap)], halt=0)
             visit.crm_batches -= 1
@@ -1153,7 +1247,23 @@ async def _run_crm_sweep(
                     await _save_lanes(visit, name)
                 return
             if step.violation is not None:
-                visit.lanes[name] = crm_lanes.parked(current, _FILTER_UNSUPPORTED, now=now)
+                if cursor.shift_seconds is not None and not crm_clock.fresh(cursor.calibrated_at, now=now):
+                    # A measured shift that stopped holding - a zone rule changed, or the token
+                    # user did - is measured again before the lane gives up.
+                    remeasure = replace(cursor, calibrated_at=None, after_id=0, pass_started=None)
+                    visit.lanes[name] = replace(current, cursor=remeasure.to_json())
+                    await _save_lanes(visit, name)
+                    log.info(
+                        "crm: a sweep disagreed with its filter clock; measuring again",
+                        extra={"portal_id": visit.portal_id, "lane": name, "detail": step.violation},
+                    )
+                    visit.more = True
+                    return
+                # Parked with its cursor, so it is never mistaken for a lane parked before the
+                # filter clock existed.
+                visit.lanes[name] = crm_lanes.parked(
+                    replace(current, cursor=cursor.to_json()), _FILTER_UNSUPPORTED, now=now
+                )
                 await _save_lanes(visit, name)
                 log.warning(
                     "crm: the portal ignored a sweep filter; lane parked",

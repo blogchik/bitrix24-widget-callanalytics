@@ -180,6 +180,9 @@ class Settings(BaseSettings):
     crm_reconcile_interval_sec: int = Field(default=86_400, ge=3_600)
     #: How often every mirrored record is read again, for edits that do not bump updatedTime.
     crm_patrol_interval_sec: int = Field(default=7 * 86_400, ge=86_400)
+    #: How often each sweep re-measures how its portal shifts a datetime filter
+    #: (`sync/crm_clock.py`): the shift follows the token user's zone and two zones' rules.
+    crm_clock_interval_sec: int = Field(default=86_400, ge=3_600)
     #: Mirror reports (`GET /deals`, `GET /utm`) the api process lets Postgres run at once.
     crm_report_concurrency: int = Field(default=4, ge=1)
     #: How old the sweeps' last completed pass may be before a mirror report says its data is

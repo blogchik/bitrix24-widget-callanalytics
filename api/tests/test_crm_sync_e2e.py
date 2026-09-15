@@ -283,6 +283,26 @@ async def test_a_429_on_crm_item_list_blocks_only_that_method(
     assert fake.method_calls["crm.item.list"] == 1, "a blocked method is skipped, not retried"
 
 
+async def test_the_lanes_leave_the_live_reports_their_share_of_crm_item_list(
+    crm_portal: tuple[SeededPortal, CrmBitrix],
+) -> None:
+    """The live Deals and Sources reports spend the same crm.item.list accumulator. Past 0.6
+    of the limit (sweeps) and 0.5 (backfills) the lanes rest until the baskets reset, instead
+    of taking the whole allowance and answering those readers operation_time_limit."""
+    seeded, fake = crm_portal
+    fake.operating_for["crm.item.list"] = 300.0  # past 0.6 x 480 = 288, short of 0.8 x 480
+    await _drive(seeded.portal_id, visits=4)
+
+    assert fake.method_calls["crm.item.list"] == 1, "one request learns the accumulator, then rest"
+    lanes = await _lanes(seeded.portal_id)
+    for name in ("lead.sweep", "deal.backfill", "lead.backfill"):
+        assert lanes[name]["paused_until"] > datetime.now(UTC), name
+        assert lanes[name]["failures"] == 0 and lanes[name]["block_reason"] is None, name
+    sync = await _sync_row(seeded.portal_id)
+    assert int(sync["throttle_hits"]) == 0 and int(sync["consecutive_failures"]) == 0
+    assert await _count_calls(seeded.portal_id) == CALLS
+
+
 async def test_crm_off_and_the_kill_switch_each_mean_no_crm_request(
     crm_portal: tuple[SeededPortal, CrmBitrix],
 ) -> None:

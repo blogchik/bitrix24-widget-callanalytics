@@ -42,6 +42,7 @@ __all__ = [
     "load_lanes",
     "next_wake",
     "parked",
+    "resting",
     "store_lanes",
     "succeeded",
     "unavailable",
@@ -193,6 +194,11 @@ def unavailable(
         last_error_code=code,
         last_error_at=now,
     )
+
+
+def resting(lane: Lane, until: dt.datetime) -> Lane:
+    """Wait for an operating-time budget to refill: not a failure, no reason, only a time."""
+    return replace(lane, paused_until=until)
 
 
 def parked(lane: Lane, reason: str, *, now: dt.datetime) -> Lane:

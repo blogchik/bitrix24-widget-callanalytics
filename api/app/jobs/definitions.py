@@ -190,6 +190,13 @@ _CRM_UNAVAILABLE: Final[tuple[type[BitrixError], ...]] = (
     MethodNotFound,
 )
 
+#: Shares of a method's operating limit the CRM lanes may spend (§5.10). Until the mirror
+#: replaces them, the live Deals and Sources reports spend the same `crm.item.list` budget under
+#: the same application, and a backfill that took all of it would answer their readers
+#: `operation_time_limit` - which is how the live report failed on production once (b8393bd).
+CRM_SWEEP_SHARE: Final[float] = 0.6
+CRM_BACKFILL_SHARE: Final[float] = 0.5
+
 #: `(sweep lane, backfill lane, universal dialect, legacy dialect)` per mirrored entity.
 _CRM_ENTITIES: Final[tuple[tuple[str, str, MirrorDialect, MirrorDialect], ...]] = (
     (crm_lanes.DEAL_SWEEP, crm_lanes.DEAL_BACKFILL, DEAL_ITEM, DEAL_LEGACY),
@@ -963,6 +970,28 @@ async def _save_lanes(visit: _Visit, *names: str) -> None:
         await fenced_update(session, visit.fence, {})
 
 
+async def _crm_within_share(visit: _Visit, name: str, method: str, share: float) -> bool:
+    """Whether a lane may send another batch on `method`; if not, it rests until the reset.
+
+    Read from the method's own accumulator (`sync_method_budgets`), which counts the live
+    reports' requests too - the same application, the same method. Resting is not failing:
+    the lane keeps its streak and its reason, and comes back when the baskets have drained.
+    """
+    budget = visit.method_budgets.get(method)
+    if budget is None or budget.operating_seconds is None:
+        return True
+    now = _utcnow()
+    reset_at = budget.operating_reset_at
+    if reset_at is not None and reset_at <= now:
+        return True
+    if float(budget.operating_seconds) < share * budget.state().operating_limit_s:
+        return True
+    until = (reset_at or now) + dt.timedelta(seconds=throttle.RESET_GRACE_SECONDS)
+    visit.lanes[name] = crm_lanes.resting(visit.lanes[name], until)
+    await _save_lanes(visit, name)
+    return False
+
+
 def _dialect(name: str, item: MirrorDialect, legacy: MirrorDialect) -> MirrorDialect:
     return legacy if name == crm_backfill.DIALECT_LEGACY else item
 
@@ -1039,6 +1068,8 @@ async def _run_crm_sweep(
     method = _dialect(start.dialect, item, legacy).method
     if method in visit.stopped_methods or _method_blocked(visit, method):
         return
+    if not await _crm_within_share(visit, name, method, CRM_SWEEP_SHARE):
+        return
     overlap = dt.timedelta(seconds=settings.crm_sweep_overlap_sec)
 
     async def run(client: BitrixClient) -> None:
@@ -1047,6 +1078,8 @@ async def _run_crm_sweep(
             current = visit.lanes[name]
             cursor = crm_sweep.SweepCursor.from_json(current.cursor, now=_utcnow())
             dialect = _dialect(cursor.dialect, item, legacy)
+            if not await _crm_within_share(visit, name, dialect.method, CRM_SWEEP_SHARE):
+                return
             read_at = _utcnow()
             batch = await client.batch([crm_sweep.command(cursor, dialect, overlap=overlap)], halt=0)
             visit.crm_batches -= 1
@@ -1122,6 +1155,8 @@ async def _run_crm_backfill(
     method = _dialect(crm_backfill.BackfillCursor.from_json(lane.cursor).dialect, item, legacy).method
     if method in visit.stopped_methods or _method_blocked(visit, method):
         return
+    if not await _crm_within_share(visit, name, method, CRM_BACKFILL_SHARE):
+        return
 
     async def run(client: BitrixClient) -> None:
         pace = _pacer(visit)
@@ -1129,6 +1164,8 @@ async def _run_crm_backfill(
             current = visit.lanes[name]
             cursor = crm_backfill.BackfillCursor.from_json(current.cursor)
             dialect = _dialect(cursor.dialect, item, legacy)
+            if not await _crm_within_share(visit, name, dialect.method, CRM_BACKFILL_SHARE):
+                return
             read_at = _utcnow()
             rows: list[crm_items.ItemRow] = []
             rejected: list[tuple[int | None, str]] = []

@@ -36,6 +36,8 @@ from typing import Final, NamedTuple
 
 import pytest
 
+from app.db.tenancy import TENANT_TABLES as REGISTERED_TENANT_TABLES
+
 APP_ROOT: Final[Path] = Path(__file__).resolve().parents[1] / "app"
 
 
@@ -81,8 +83,9 @@ GUARDED_COLUMNS: Final[frozenset[str]] = frozenset(
     {"access_token_enc", "refresh_token_enc", "client_endpoint"}
 )
 
-#: The FORCED-RLS tables of §3.
-TENANT_TABLES: Final[tuple[str, ...]] = ("calls", "employees", "crm_contexts")
+#: The FORCED-RLS tables of §3, from the one registry (`app/db/tenancy.py`): a customer
+#: table added there is covered by the DML rule below without editing this file.
+TENANT_TABLES: Final[tuple[str, ...]] = REGISTERED_TENANT_TABLES
 
 _DML_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)\b(?:insert\s+into|update|delete\s+from)\s+(?:only\s+)?\"?"

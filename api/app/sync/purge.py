@@ -46,8 +46,9 @@ from sqlalchemy.sql import Select, func
 from sqlalchemy.sql.selectable import NamedFromClause
 
 from app.config import settings
-from app.db.models import Call, CrmContext, Employee, Portal, PortalSync, RestLog
+from app.db.models import Base, CrmContext, Portal, PortalSync, RestLog
 from app.db.session import control_txn, tenant_txn
+from app.db.tenancy import TENANT_TABLES
 from app.logging import get_logger
 from app.services.portals import record_event
 
@@ -77,12 +78,11 @@ CRM_CONTEXT_MAX_AGE_DAYS: Final[int] = 30
 #: database. The retry stays automatic, it is just paced.
 INCOMPLETE_RETRY_SECONDS: Final[int] = 3600
 
-#: The three FORCED-RLS tables of §3, in a fixed order so the audit counts are
-#: comparable between runs.
-_TENANT_TABLES: Final[tuple[Table, ...]] = (
-    cast("Table", Call.__table__),
-    cast("Table", Employee.__table__),
-    cast("Table", CrmContext.__table__),
+#: Every FORCED-RLS table, straight from the one registry (`app/db/tenancy.py`) and in its
+#: fixed order, so the audit counts are comparable between runs and a customer table added
+#: there is purged on uninstall without anyone remembering to edit this module.
+_TENANT_TABLES: Final[tuple[Table, ...]] = tuple(
+    Base.metadata.tables[name] for name in TENANT_TABLES
 )
 
 #: Guard against an unbounded loop if a delete keeps reporting rows it never removes.

@@ -73,13 +73,15 @@ Bitrix24 Marketplace application: one deployment serves many portals, reads only
 │   │   │   ├── engine.py                  # async engine on DATABASE_URL (ca_app role)
 │   │   │   ├── session.py                 # tenant_txn(portal_id): one transaction with SET LOCAL app.portal_id,
 │   │   │   │                              # re-issued for every transaction; control_txn() for portals/portal_sync/rest_log
-│   │   │   └── models.py                  # SQLAlchemy 2.x mapped classes mirroring §3
+│   │   │   ├── models.py                  # SQLAlchemy 2.x mapped classes mirroring §3
+│   │   │   └── tenancy.py                 # the one list of FORCED-RLS tables; check_tenancy (CI schema gate)
 │   │   ├── api/                       # /api/v1: session, dashboard, filters, calls, hours,
 │   │   │                              # deals (§4.12), utm (§4.13), record, portal
 │   │   ├── bitrix/                    # client, oauth, crm, statistic, users, deals (§4.12),
 │   │   │                              # utm (§4.13) - pure command builders, no HTTP
 │   │   ├── services/                  # stats, calls_repo, crm_context, employees, portals,
 │   │   │                              # deal_stats (§4.12), utm_stats (§4.13)
+│   │   ├── tools/                     # `python -m app.tools.check_tenancy`: CI asserts the catalog matches db/tenancy.py
 │   │   ├── security/
 │   │   │   ├── crypto.py                  # AES-256-GCM envelope: key_id||nonce||ct||tag, AAD=member_id:column
 │   │   │   ├── session_token.py           # JWT HS256 issue/verify (session) + short-lived playback URL token

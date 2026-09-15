@@ -105,23 +105,13 @@ jobs:
         run: docker compose run --rm -T api python -m alembic upgrade head
 
       - name: Verify the schema the migration produced
-        # The three properties the whole tenancy model rests on. Cheap to assert, and a
-        # migration that silently drops one would otherwise only surface as a data leak.
-        run: |
-          docker compose exec -T postgres psql -U postgres -d callanalytics -tAc "
-            SELECT CASE WHEN count(*) = 3 THEN 'ok' ELSE 'MISSING RLS' END
-              FROM pg_class
-             WHERE relname IN ('calls','employees','crm_contexts')
-               AND relrowsecurity AND relforcerowsecurity;
-          " | grep -q '^ok$'
-          docker compose exec -T postgres psql -U postgres -tAc "
-            SELECT CASE WHEN NOT rolbypassrls THEN 'ok' ELSE 'ca_app CAN BYPASS RLS' END
-              FROM pg_roles WHERE rolname = 'ca_app';
-          " | grep -q '^ok$'
-          docker compose exec -T postgres psql -U postgres -d callanalytics -tAc "
-            SELECT CASE WHEN count(*) = 3 THEN 'ok' ELSE 'MISSING POLICIES' END
-              FROM pg_policies WHERE schemaname = 'public';
-          " | grep -q '^ok$'
+        # The properties the whole tenancy model rests on, asserted against the one list
+        # in app/db/tenancy.py rather than a hard-coded count: every portal_id table is
+        # registered, every customer table is FORCED with its app.portal_id policy, no
+        # control-plane table has RLS, indexes lead with portal_id, and the runtime role
+        # cannot bypass any of it. A migration that silently drops one would otherwise
+        # only surface as a data leak - or as a table the uninstall purge never empties.
+        run: docker compose run --rm -T api python -m app.tools.check_tenancy
 
       - name: Migrations are reversible
         # `downgrade()` is written in every revision and is almost never run, which is

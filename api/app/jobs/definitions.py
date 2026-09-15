@@ -83,8 +83,10 @@ from app.services.portals import (
     record_placements,
     set_token_status,
 )
+from app.sync import budgets as method_budgets
 from app.sync import throttle
 from app.sync.backfill import run_backfill
+from app.sync.budgets import MethodBudget
 from app.sync.employees_refresh import run_employees_refresh
 from app.sync.head_fetch import run_head_fetch
 from app.sync.incremental import run_incremental
@@ -275,12 +277,21 @@ class _Visit:
     next_run_at: dt.datetime | None
     consecutive_failures: int
 
-    #: Set by the operating-time guard; when present it replaces the "clean visit"
-    #: decision at close time, so a soft-limit stop cannot be counted as a clean visit.
+    #: Set by the statistics operating-time guard; when present it replaces the "clean
+    #: visit" decision at close time, so a soft-limit stop cannot count as a clean visit.
     decision: throttle.ThrottleDecision | None = None
     #: `operating_*` observed mid-visit that no phase committed.
     pending: dict[str, Any] = field(default_factory=dict)
-    stop: bool = False
+    #: `sync_method_budgets` as loaded at open and updated during the visit (§5.6): the
+    #: operating-time state of every method except `voximplant.statistic.get`.
+    method_budgets: dict[str, MethodBudget] = field(default_factory=dict)
+    #: Methods whose phases are over for this visit - a soft limit, a 429, or a phase that
+    #: reported it stopped. Other methods go on: each spends a budget of its own.
+    stopped_methods: set[str] = field(default_factory=set)
+    #: Methods that made at least one request in this visit.
+    used_methods: set[str] = field(default_factory=set)
+    #: Methods whose budget row this visit changed.
+    touched_methods: set[str] = field(default_factory=set)
     #: The first non-terminal, non-throttle Bitrix24 failure of the visit. Reported at
     #: the exit so §5.6's "after 10 consecutive failures pause 6 h" can count it, but
     #: never aborts the visit: a failed page is re-read next time (§5.2 prefix rule).
@@ -352,6 +363,7 @@ async def _open_visit(portal_id: int, correlation_id: uuid.UUID) -> _Visit | Non
 
         fence = Fence(portal_id=portal_id, owner=WORKER_ID, generation=int(sync.sync_generation))
         await fenced_update(session, fence, {"run_started_at": func.now()})
+        budgets = await method_budgets.load_budgets(session, portal_id)
 
     return _Visit(
         portal_id=portal_id,
@@ -375,16 +387,32 @@ async def _open_visit(portal_id: int, correlation_id: uuid.UUID) -> _Visit | Non
         last_error_at=sync.last_error_at,
         next_run_at=sync.next_run_at,
         consecutive_failures=int(sync.consecutive_failures or 0),
+        method_budgets=budgets,
     )
 
 
 def _observe(visit: _Visit, block: Any) -> None:
-    """Fold one `time{}` block into the operating-time guard (§5.6).
+    """Fold one `time{}` block into the guard of the method that answered it (§5.6).
 
     Recorded even when the guard does not fire: `operating_seconds` is the evidence
     `throttle.on_operation_time_limit` needs to decide whether a 429 was *ours* at all,
     and a portal that never records it would have every foreign 429 attributed to it.
+
+    Per method, because Bitrix24 accounts operating time per method and `time.operating`
+    is that method's own accumulator (docs/spike-crm-mirror.md, S-A.6). The statistics
+    keep `portal_sync.operating_*`; every other method has its own `sync_method_budgets`
+    row, so a slow `user.get` can no longer park the call sync.
     """
+    if visit.method and visit.method != STATISTIC_METHOD:
+        budget = visit.method_budgets.get(visit.method) or MethodBudget(method=visit.method)
+        updated, stop = method_budgets.observe(budget, block)
+        if updated != budget:
+            visit.method_budgets[visit.method] = updated
+            visit.touched_methods.add(visit.method)
+        if stop:
+            visit.stopped_methods.add(visit.method)
+        return
+
     decision = throttle.observe_time_block(visit.state, block)
     updates = decision.updates
     if "operating_seconds" in updates or "operating_reset_at" in updates:
@@ -397,7 +425,7 @@ def _observe(visit: _Visit, block: Any) -> None:
         visit.pending["operating_reset_at"] = visit.state.operating_reset_at
     if decision.stop_visit:
         visit.decision = decision
-        visit.stop = True
+        visit.stopped_methods.add(STATISTIC_METHOD)
 
 
 def _pacer(visit: _Visit) -> Callable[[dict[str, Any] | None], Awaitable[bool]]:
@@ -419,7 +447,7 @@ def _pacer(visit: _Visit) -> Callable[[dict[str, Any] | None], Awaitable[bool]]:
 
     async def pace(time_block: dict[str, Any] | None) -> bool:
         _observe(visit, time_block)
-        if visit.stop:
+        if visit.method in visit.stopped_methods:
             return False
         await heartbeat(visit.fence)
         await throttle.get_pacer(visit.portal_id).wait()
@@ -455,6 +483,8 @@ async def _with_client[T](
                 return await fn(client)
             finally:
                 # Even an error response carries the `time{}` block the guard needs.
+                if client.last_time is not None:
+                    visit.used_methods.add(method)
                 _observe(visit, client.last_time)
 
     try:
@@ -512,8 +542,10 @@ def _absorb(
     not theirs. Three outcomes:
 
     * **terminal** - park the portal (§5.8); every further request would fail anyway;
-    * **429 / 503** - the shared bucket is empty, so the rest of this visit would only
-      deepen the block; raise and let `sync/throttle.py` choose the delay (§5.6);
+    * **503, or a 429 on the statistics** - the shared bucket or the call sync's budget is
+      empty, so the rest of this visit would only deepen the block; raise and let
+      `sync/throttle.py` choose the delay (§5.6). A 429 on any other method parks only
+      that method (`_block_method`), because it spends a budget of its own;
     * **anything else** - one page failed. Its rows are re-read next visit from the
       committed cursor, so the visit continues; the error is remembered for the
       failure counter and nothing else.
@@ -537,11 +569,28 @@ def _absorb(
             # double the exponent for a per-command 503 and not for a whole-request one).
             raise error
         if isinstance(error, OperationTimeLimit):
+            if visit.method and visit.method != STATISTIC_METHOD:
+                _block_method(visit, visit.method, error)
+                continue
             raise error
         if visit.soft_error is None:
             visit.soft_error = error
     if stopped:
-        visit.stop = True
+        visit.stopped_methods.add(visit.method or STATISTIC_METHOD)
+
+
+def _block_method(visit: _Visit, method: str, error: BitrixError) -> None:
+    """A 429 on a method other than the statistics: that method waits, the visit goes on."""
+    budget = visit.method_budgets.get(method) or MethodBudget(method=method)
+    visit.method_budgets[method] = method_budgets.on_operation_time_limit(budget, error)
+    visit.touched_methods.add(method)
+    visit.stopped_methods.add(method)
+
+
+def _method_blocked(visit: _Visit, method: str) -> bool:
+    """Whether a previous visit left `method` waiting for its operating-time baskets."""
+    budget = visit.method_budgets.get(method)
+    return budget is not None and budget.blocked(_utcnow())
 
 
 # ---------------------------------------------------------------------------- phases
@@ -810,16 +859,17 @@ async def _phase_daily_probe(visit: _Visit) -> None:
 
 
 #: §5.9's order, exactly: refresh_requested -> head_fetch -> incremental -> backfill ->
-#: rescan -> recheck -> employees -> app.info + user.admin.
-_PHASES: Final[tuple[Callable[[_Visit], Awaitable[None]], ...]] = (
-    _phase_refresh_requested,
-    _phase_head_fetch,
-    _phase_incremental,
-    _phase_backfill,
-    _phase_rescan,
-    _phase_recheck,
-    _phase_employees,
-    _phase_daily_probe,
+#: rescan -> recheck -> employees -> app.info + user.admin. Each phase is paired with the
+#: method whose budget it spends, which is what lets a stop skip a phase and not a visit.
+_PHASES: Final[tuple[tuple[str, Callable[[_Visit], Awaitable[None]]], ...]] = (
+    (STATISTIC_METHOD, _phase_refresh_requested),
+    (STATISTIC_METHOD, _phase_head_fetch),
+    (STATISTIC_METHOD, _phase_incremental),
+    (STATISTIC_METHOD, _phase_backfill),
+    (STATISTIC_METHOD, _phase_rescan),
+    (STATISTIC_METHOD, _phase_recheck),
+    (USER_GET, _phase_employees),
+    (APP_INFO_METHOD, _phase_daily_probe),
 )
 
 
@@ -1010,10 +1060,22 @@ async def _close_visit(
         if key not in _RELEASE_OWNED
     }
 
+    # The other methods' budgets: every row this visit changed, and every method that made
+    # a request and was not stopped counts a clean visit towards its limit's recovery.
+    clean = error is None and terminal is None
+    budget_rows: list[MethodBudget] = []
+    for method in sorted((visit.touched_methods | visit.used_methods) - {STATISTIC_METHOD}):
+        budget = visit.method_budgets.get(method) or MethodBudget(method=method)
+        if clean and method in visit.used_methods and method not in visit.stopped_methods:
+            budget = method_budgets.on_clean_visit(budget)
+        budget_rows.append(budget)
+
     try:
         async with control_txn() as session:
-            if rate_updates:
+            if rate_updates or budget_rows:
                 await fenced_update(session, visit.fence, rate_updates)
+            if budget_rows:
+                await method_budgets.store_budgets(session, visit.portal_id, budget_rows)
             if decision.operating_limit_s is not None:
                 # `portals.capabilities` is written through its owning service so the
                 # install-time probe results survive the merge (§4.3 step 5).
@@ -1069,10 +1131,19 @@ async def sync_portal(portal_id: int) -> None:
         terminal: str | None = None
         audited = False
         try:
-            for phase in _PHASES:
-                if visit.stop:
-                    break
-                await phase(visit)
+            for method, phase in _PHASES:
+                if method in visit.stopped_methods or _method_blocked(visit, method):
+                    # Skip the phase, never `break`: a statistics soft limit must not cost
+                    # the daily admin re-verification, which spends another budget (§5.6).
+                    continue
+                try:
+                    await phase(visit)
+                except OperationTimeLimit as exc:
+                    # A whole-request 429 raised by the client. On the statistics it parks
+                    # the portal as before; on any other method only that method waits.
+                    if method == STATISTIC_METHOD:
+                        raise
+                    _block_method(visit, method, exc)
             error = visit.soft_error
         except FenceLost:
             # The lease or the generation moved: an uninstall, a reinstall, or another
@@ -1107,11 +1178,14 @@ def _spawn(
     portal_id: int,
     coro: Any,
     label: str,
+    *,
+    on_done: Callable[[asyncio.Task[None]], None] | None = None,
 ) -> None:
     """Start a background task, keep a reference, and drop it when it finishes.
 
     The reference is not cosmetic: asyncio keeps only a weak reference to a running
     task, so a fire-and-forget `create_task` can be garbage collected mid-visit.
+    `on_done` runs after the registry entry is gone, so it sees the slot as free.
     """
     if portal_id in registry:
         coro.close()
@@ -1119,12 +1193,72 @@ def _spawn(
     task = asyncio.create_task(coro, name=f"{label}:{portal_id}")
     registry[portal_id] = task
     task.add_done_callback(lambda _task: registry.pop(portal_id, None))
+    if on_done is not None:
+        task.add_done_callback(on_done)
 
 
 async def _run_sync(portal_id: int) -> None:
     """The semaphore wrapper. `sync_portal` never raises, but a cancel still can."""
     async with _dispatch_semaphore():
         await sync_portal(portal_id)
+
+
+#: Refill tasks in flight; the reference keeps them alive (see `_spawn`).
+_refills: set[asyncio.Task[None]] = set()
+_dispatch_lock: asyncio.Lock | None = None
+_dispatch_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _dispatch_guard() -> asyncio.Lock:
+    """One lease-and-dispatch at a time in this process, rebuilt per loop like the semaphore."""
+    global _dispatch_lock, _dispatch_lock_loop
+    loop = asyncio.get_running_loop()
+    if _dispatch_lock is None or _dispatch_lock_loop is not loop:
+        _dispatch_lock = asyncio.Lock()
+        _dispatch_lock_loop = loop
+    return _dispatch_lock
+
+
+async def _dispatch_due() -> None:
+    """Lease as many due portals as there are free slots, and start them (§5.9 tick (a)).
+
+    Only as many as there are free slots, and that is a correctness rule: a leased portal
+    that is not dispatched sits idle until its lease expires and is then charged a
+    `consecutive_failures` it did not earn. The lock keeps the tick and a refill from
+    leasing the same free slot twice.
+    """
+    async with _dispatch_guard():
+        free = settings.global_portal_concurrency - len(_inflight)
+        if free <= 0:
+            return
+        for fence in await acquire_leases(free, WORKER_ID):
+            _spawn(
+                _inflight, fence.portal_id, _run_sync(fence.portal_id), "sync_portal", on_done=_refill
+            )
+
+
+def _refill(task: asyncio.Task[None]) -> None:
+    """A visit ended, so its slot is free now: lease the next due portal without the tick.
+
+    Without this a slot freed a second after a tick stays empty for fourteen more, which
+    caps the whole worker at `GLOBAL_PORTAL_CONCURRENCY` visits per tick however short they
+    are. A cancelled visit refills nothing: cancellation means the worker is stopping.
+    """
+    if task.cancelled():
+        return
+    refill = asyncio.get_running_loop().create_task(_refill_safely(), name="sync_refill")
+    _refills.add(refill)
+    refill.add_done_callback(_refills.discard)
+
+
+async def _refill_safely() -> None:
+    try:
+        await _dispatch_due()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # The tick retries in at most 15 s; a refill must never become an unhandled error.
+        log.exception("sync: slot refill failed")
 
 
 async def _run_purge(portal_id: int) -> None:
@@ -1144,10 +1278,7 @@ async def tick() -> None:
     its lease expires and is then charged a `consecutive_failures` it did not earn, and
     ten of those park a healthy tenant for six hours.
     """
-    free = settings.global_portal_concurrency - len(_inflight)
-    if free > 0:
-        for fence in await acquire_leases(free, WORKER_ID):
-            _spawn(_inflight, fence.portal_id, _run_sync(fence.portal_id), "sync_portal")
+    await _dispatch_due()
 
     # (b) one portal at a time: the purge is a long series of 10 000-row deletes
     # against tables the api reads, and a second one would only add lock contention.

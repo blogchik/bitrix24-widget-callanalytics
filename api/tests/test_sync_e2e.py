@@ -92,6 +92,12 @@ class FilteringBitrix:
         #: Sub-command keys that must fail once, to exercise the contiguous-prefix rule.
         self.fail_offsets: set[int] = set()
         self._failed: set[int] = set()
+        #: `time.operating` a method reports on every sub-command (§5.6 per-method budgets).
+        self.operating_for: dict[str, float] = {}
+        #: A Bitrix24 error code a method answers on every sub-command.
+        self.method_errors: dict[str, str] = {}
+        #: Sub-commands received per method, statistics included.
+        self.method_calls: dict[str, int] = {}
 
     # -- transport -----------------------------------------------------------------
 
@@ -144,8 +150,12 @@ class FilteringBitrix:
         for key, raw in commands.items():
             method, _, query = raw.partition("?")
             cmd_params = dict(parse_qsl(unquote_plus(query), keep_blank_values=True))
-            times[key] = _time()
             method = method.strip().lower()
+            self.method_calls[method] = self.method_calls.get(method, 0) + 1
+            times[key] = _time(self.operating_for.get(method, 0.2))
+            if method in self.method_errors:
+                errors[key] = {"error": self.method_errors[method], "error_description": "scripted"}
+                continue
 
             if method == "voximplant.statistic.get":
                 start = int(cmd_params.get("start", 0) or 0)
@@ -174,7 +184,7 @@ class FilteringBitrix:
                     "result_next": nexts,
                     "result_time": times,
                 },
-                "time": _time(),
+                "time": _time(max((t["operating"] for t in times.values()), default=0.2)),
             },
         )
 
@@ -508,3 +518,71 @@ async def test_every_exchange_is_logged_without_secrets(
     blob = json.dumps([dict(r) for r in rows])
     for secret in ("e2e-access", "e2e-refresh", seeded.access, seeded.refresh):
         assert secret not in blob, f"{secret!r} leaked into rest_log"
+
+
+# --------------------------------------------------------------------------------------
+# §5.6 per method: one method's budget never parks another
+# --------------------------------------------------------------------------------------
+
+
+async def _budgets(portal_id: int) -> dict[str, dict[str, Any]]:
+    async with control_txn() as session:
+        rows = (
+            await session.execute(
+                text("SELECT * FROM sync_method_budgets WHERE portal_id = :pid"),
+                {"pid": portal_id},
+            )
+        ).mappings().all()
+    return {row["method"]: dict(row) for row in rows}
+
+
+async def test_a_429_on_user_get_parks_only_the_employee_refresh(
+    portal_and_bitrix,  # type: ignore[no-untyped-def]
+) -> None:
+    """Before budgets went per method, this raised out of the visit and throttled the
+    call sync: `throttle_hits` climbed and `batch_pages` halved over a display-name miss."""
+    seeded, fake = portal_and_bitrix
+    fake.method_errors["user.get"] = "OPERATION_TIME_LIMIT"
+    await _drive(seeded.portal_id, visits=8)
+
+    assert await _count_calls(seeded.portal_id) == TOTAL_CALLS, "the call sync must not wait"
+    sync = await _sync_row(seeded.portal_id)
+    assert int(sync["throttle_hits"]) == 0 and int(sync["batch_pages"]) == 20
+    budget = (await _budgets(seeded.portal_id))["user.get"]
+    assert budget["blocked_until"] is not None and budget["blocked_until"] > datetime.now(UTC)
+    assert int(budget["throttle_hits"]) == 1, (
+        "later visits must skip a blocked method, not hit its limit again"
+    )
+
+
+async def test_a_slow_user_get_does_not_throttle_the_call_sync(
+    portal_and_bitrix,  # type: ignore[no-untyped-def]
+) -> None:
+    """`time.operating` is per method: user.get's accumulator is not the statistics'."""
+    seeded, fake = portal_and_bitrix
+    fake.operating_for["user.get"] = 450.0  # past 0.8 x 480 - for user.get alone
+    await _drive(seeded.portal_id, visits=8)
+
+    assert await _count_calls(seeded.portal_id) == TOTAL_CALLS
+    sync = await _sync_row(seeded.portal_id)
+    assert int(sync["throttle_hits"]) == 0
+    assert float(sync["operating_seconds"]) < 1, "portal_sync.operating_* is the statistics' own"
+    budget = (await _budgets(seeded.portal_id))["user.get"]
+    assert float(budget["operating_seconds"]) == 450.0
+    assert budget["blocked_until"] is not None
+
+
+async def test_a_statistics_soft_limit_still_runs_the_daily_admin_check(
+    portal_and_bitrix,  # type: ignore[no-untyped-def]
+) -> None:
+    """The visit used to `break` on the first stop, and the admin re-verification runs last:
+    a portal at its statistics limit every visit would never have its installer re-checked."""
+    seeded, fake = portal_and_bitrix
+    fake.operating_for["voximplant.statistic.get"] = 450.0
+    await _drive(seeded.portal_id, visits=1)
+
+    assert fake.method_calls.get("app.info") == 1 and fake.method_calls.get("user.admin") == 1
+    sync = await _sync_row(seeded.portal_id)
+    assert sync["last_appinfo_at"] is not None
+    # The statistics still park on their own limit: the fake's baskets reset in 2027.
+    assert sync["next_run_at"] > datetime.now(UTC) + timedelta(days=1)

@@ -116,12 +116,15 @@ from app.db.models import Employee, Portal
 from app.db.session import tenant_txn
 from app.logging import get_logger
 from app.security.principal import Principal
+from app.services import crm_repo
 from app.services.stats import CallFilters, FilterError, parse_filters
 from app.sync.throttle import read_time_block
 
 __all__ = [
+    "MIRROR_DIALECT",
     "DealReportError",
     "load_deal_report",
+    "load_deal_report_mirror",
     "parse_deal_filters",
     "reset_deal_caches",
     "reset_deal_report_rate_limit",
@@ -279,7 +282,9 @@ def _charge_report(portal_id: int, user_id: int) -> bool:
 # --- filters -----------------------------------------------------------------------------
 
 
-def parse_deal_filters(params: QueryParams, principal: Principal) -> CallFilters:
+def parse_deal_filters(
+    params: QueryParams, principal: Principal, *, mirror: bool = False
+) -> CallFilters:
     """The shared filter vocabulary, narrowed to what a deal scan can honour (§4.12).
 
     Two differences from `parse_filters`, both of them refusals:
@@ -289,7 +294,8 @@ def parse_deal_filters(params: QueryParams, principal: Principal) -> CallFilters
       offending parameter rather than served an answer to a different question.
     * the period cap is `DEAL_REPORT_MAX_PERIOD_DAYS`, not `MAX_PERIOD_DAYS`. A live REST
       scan cannot honestly offer a year inside the SPA's thirty-second fetch timeout, and
-      the other two pages keep their 366 days because they read Postgres.
+      the other two pages keep their 366 days because they read Postgres. So does this one
+      once it reads the mirror (`mirror=True`, §4.14 constraint 1).
 
     `employee` is kept: it maps cleanly onto `@assignedById` and is the cheapest cost lever
     a user has when a period is refused as too large.
@@ -300,7 +306,7 @@ def parse_deal_filters(params: QueryParams, principal: Principal) -> CallFilters
                 raise FilterError("unsupported_filter", filter=names[0])
 
     filters = parse_filters(params, principal)
-    if filters.days > settings.deal_report_max_period_days:
+    if not mirror and filters.days > settings.deal_report_max_period_days:
         raise FilterError("period_too_long", max_days=settings.deal_report_max_period_days)
     return filters
 
@@ -319,18 +325,18 @@ class _Measures:
     unknown_stage: int = 0
     cells: dict[str, int] = field(default_factory=dict)
 
-    def add(self, *, semantic: str, column: str | None) -> None:
-        self.total += 1
+    def add(self, *, semantic: str, column: str | None, count: int = 1) -> None:
+        self.total += count
         if semantic == "S":
-            self.won += 1
+            self.won += count
         elif semantic == "F":
-            self.lost += 1
+            self.lost += count
         else:
-            self.in_progress += 1
+            self.in_progress += count
         if column is None:
-            self.unknown_stage += 1
+            self.unknown_stage += count
         else:
-            self.cells[column] = self.cells.get(column, 0) + 1
+            self.cells[column] = self.cells.get(column, 0) + count
 
     def merge(self, other: _Measures) -> None:
         self.total += other.total
@@ -995,12 +1001,12 @@ def _build_response(
     *,
     filters: CallFilters,
     dictionary: _Dictionary,
-    dialect: Dialect,
+    list_dialect: str,
     groups: Mapping[int | None, _Group],
     labels: Mapping[int, Mapping[str, Any]],
     folded: int,
     deals_total: int,
-    budget: _Budget,
+    rest_requests: int,
     from_cache: bool,
     assigned_to: Sequence[int],
 ) -> dict[str, Any]:
@@ -1062,9 +1068,9 @@ def _build_response(
             "stage_dictionary_failed": list(dictionary.failed),
             "stage_dictionary_truncated": list(dictionary.truncated),
             "funnels_hidden": hidden,
-            "list_dialect": dialect.name,
+            "list_dialect": list_dialect,
             "dictionary_dialect": dictionary.dialect,
-            "rest_requests": budget.requests,
+            "rest_requests": rest_requests,
             "from_cache": from_cache,
         },
     }
@@ -1153,12 +1159,12 @@ async def _report(
     return _build_response(
         filters=filters,
         dictionary=dictionary,
-        dialect=dialect,
+        list_dialect=dialect.name,
         groups=groups,
         labels=labels,
         folded=folded,
         deals_total=deals_total,
-        budget=budget,
+        rest_requests=budget.requests,
         from_cache=from_cache,
         assigned_to=assigned_to,
     )
@@ -1210,3 +1216,94 @@ async def load_deal_report(
             portal_gate.release()
     finally:
         gate.release()
+
+
+# --- the mirror (§4.14) ----------------------------------------------------------------------
+
+#: `scan.list_dialect` and `scan.dictionary_dialect` of a report built from Postgres.
+MIRROR_DIALECT: Final[str] = "mirror"
+
+
+def _fold_counts(
+    counts: Sequence[crm_repo.StageCount], *, known: Mapping[str, Stage]
+) -> dict[int | None, _Group]:
+    """`_fold` for grouped counts: the same columns, the same outcomes, the same rows.
+
+    `counts` arrive ordered by their smallest deal id, so a stage the dictionary does not know
+    becomes a column in the order the live read, paging by id, would have met it.
+    """
+    groups: dict[int | None, _Group] = {}
+    for count in counts:
+        group = groups.get(count.category_id)
+        if group is None:
+            group = _Group(category_id=count.category_id)
+            groups[count.category_id] = group
+
+        category_id = count.category_id
+        column = stage_key(category_id, count.stage_id) if category_id is not None else None
+        if column is not None and column not in known and column not in group.extra_columns:
+            group.extra_columns[column] = count.stage_id
+
+        operator = count.assigned_by_id
+        if operator is not None and operator <= 0:
+            operator = None
+        measures = group.rows.get(operator)
+        if measures is None:
+            measures = _Measures()
+            group.rows[operator] = measures
+        measures.add(semantic=count.semantic, column=column, count=count.deals)
+        group.subtotal.add(semantic=count.semantic, column=column, count=count.deals)
+    return groups
+
+
+async def load_deal_report_mirror(
+    principal: Principal, portal: Portal, filters: CallFilters
+) -> dict[str, Any]:
+    """`GET /api/v1/deals`: the same report, from Postgres (§4.14).
+
+    No viewer token, no Bitrix24 request and no deal cap: the refusal ladder above exists
+    because every deal cost REST, and here none does. What replaces it is one admission gate
+    in front of Postgres and a statement of coverage, because a mirror still loading history
+    must say so rather than draw a short report as a complete one.
+    """
+    scope = crm_repo.crm_scope(principal)
+    gate = crm_repo.report_gate()
+    try:
+        await asyncio.wait_for(gate.acquire(), _ADMIT_WAIT_S)
+    except TimeoutError:
+        raise DealReportError("retry", 503, retry_after=5) from None
+    try:
+        coverage = await crm_repo.coverage(portal.id)
+        if not coverage.deals_available:
+            raise DealReportError(crm_repo.MIRROR_UNAVAILABLE, 409, reason=coverage.deal_reason)
+        funnels, stages = await crm_repo.deal_dictionary(portal.id)
+        # An administrator's own employee filter. Everyone else is pinned by `crm_scope`.
+        assigned_to = filters.employees
+        counts = await crm_repo.deal_stage_counts(
+            portal.id, filters, scope=scope, employees=assigned_to
+        )
+    finally:
+        gate.release()
+
+    dictionary = _Dictionary(
+        funnels=tuple(funnels), stages=stages, failed=(), truncated=(), dialect=MIRROR_DIALECT
+    )
+    groups = _fold_counts(counts, known=_stage_index(dictionary))
+    deals = sum(count.deals for count in counts)
+    operators = {uid for group in groups.values() for uid in group.rows if uid is not None}
+    labels = await _employee_labels(portal.id, operators)
+
+    body = _build_response(
+        filters=filters,
+        dictionary=dictionary,
+        list_dialect=MIRROR_DIALECT,
+        groups=groups,
+        labels=labels,
+        folded=deals,
+        deals_total=deals,
+        rest_requests=0,
+        from_cache=False,
+        assigned_to=assigned_to,
+    )
+    body.update(coverage.wire(now=dt.datetime.now(dt.UTC)))
+    return body

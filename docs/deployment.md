@@ -768,6 +768,31 @@ Worth a look, beyond the list above:
 | Reserved offline batches | `crm_offline_batches` in state `reserved` | older than an hour |
 | Visibility alarm | `portals.crm_visibility_alarm_at` | set at all: the installer credential stopped seeing records |
 
+#### Promoting a portal's reports to the mirror (from milestone M9a)
+
+A portal syncs its CRM from the first release that ships the worker, but its Deals and Sources
+pages keep reading Bitrix24 live until an operator promotes it. Each step is reversible, and
+each one is `python -m app.tools.crm_mode` run inside the api container:
+
+```bash
+DC="docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.tunnel.yml"
+$DC exec api python -m app.tools.crm_mode status PORTAL_ID
+```
+
+1. **Wait for the history.** `status` counts the lanes that are done. `deal.backfill` must be
+   done before `mirror` is accepted, and `lead.backfill` too unless the portal refuses leads.
+2. **Shadow.** `$DC exec api python -m app.tools.crm_mode set PORTAL_ID shadow`. Every live
+   report an administrator opens is recomputed from Postgres after it is sent, and the api log
+   gets one line per report: `docker logs callanalytics-api-1 2>&1 | grep crm_shadow`. The line
+   carries `equal`, how many rows differ and both totals. A record edited within the last sweep
+   interval (five minutes) differs without being a defect; `data_as_of` on the line says how far
+   the mirror had got.
+3. **Mirror.** When the comparisons agree, `set PORTAL_ID mirror`. `/me.crm.read` turns `mirror`
+   for that portal's administrators on their next page load, and their pages GET the report with
+   no Bitrix24 request and periods up to 366 days. Other viewers keep the live report until M8.
+4. **Back out** with `set PORTAL_ID shadow` (or `sync`). An open page whose next report is
+   refused with `crm_mirror_unavailable` reads `/me` again and returns to the live path.
+
 ---
 
 ## Configuration reference

@@ -187,7 +187,7 @@ async def test_me_tells_every_viewer_and_only_undismissed_administrators_see_the
     employee = (
         await client.get(ME_PATH, headers=_headers(portal, user_id=EMPLOYEE, is_admin=False))
     ).json()["crm"]
-    assert employee == {"analytics_enabled": True, "mode": "sync", "notice_visible": False}
+    assert employee == {"analytics_enabled": True, "mode": "sync", "read": "live", "notice_visible": False}
 
     for _ in range(2):
         dismissed = await client.post(DISMISS_PATH, headers=_headers(portal))

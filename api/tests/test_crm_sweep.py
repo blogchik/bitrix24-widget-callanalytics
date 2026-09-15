@@ -7,13 +7,14 @@ cannot have produced moves nothing.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.bitrix.client import BatchResult, CommandResult
 from app.bitrix.crm_items import DEAL_ITEM, parse_timestamp
 from app.bitrix.errors import AccessDenied, BitrixError
-from app.sync.crm_sweep import INITIAL_LOOKBACK, KEY, SweepCursor, apply
+from app.sync.crm_sweep import INITIAL_LOOKBACK, KEY, SweepCursor, apply, bound, command
 from tests.fixtures.crm import deal_row
 
 NOW = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
@@ -93,3 +94,38 @@ def test_a_fresh_cursor_reaches_back_an_hour_and_round_trips() -> None:
     assert cursor == SweepCursor(dialect="item", since=NOW - INITIAL_LOOKBACK)
     started = SweepCursor(dialect="legacy", since=SINCE, after_id=9, pass_started=NOW)
     assert SweepCursor.from_json(started.to_json(), now=NOW) == started
+
+
+# --- the filter clock (S-A.10) ------------------------------------------------------------------
+
+
+def test_a_measured_shift_moves_the_bound_the_sweep_sends() -> None:
+    cursor = SweepCursor(dialect="item", since=SINCE, shift_seconds=7200, calibrated_at=NOW)
+
+    _key, _method, params = command(cursor, DEAL_ITEM, overlap=OVERLAP)
+
+    assert parse_timestamp(params["filter"][">=updatedTime"]) == SINCE - OVERLAP + timedelta(hours=2)
+
+
+def test_an_unmeasured_sweep_sends_its_bound_early_and_accepts_the_wide_answer() -> None:
+    cursor = SweepCursor(dialect="item", since=datetime(2026, 9, 15, 12, 0, tzinfo=UTC))
+    nineteen_hours_early = _answer([deal_row(3, updatedTime="2026-09-14T20:00:00+03:00")])
+
+    assert bound(cursor, overlap=OVERLAP) == cursor.since - OVERLAP - timedelta(hours=14)
+    assert _apply(cursor, nineteen_hours_early).violation is None, (
+        "a row an unmeasured shift can explain is not an ignored filter"
+    )
+    measured = replace(cursor, shift_seconds=0, calibrated_at=NOW)
+    assert _apply(measured, nineteen_hours_early).violation is not None
+    five_days_early = _answer([deal_row(4, updatedTime="2026-09-10T10:00:00+03:00")])
+    assert _apply(cursor, five_days_early).violation is not None
+
+
+def test_the_measured_shift_outlives_a_pass_and_a_round_trip() -> None:
+    cursor = SweepCursor(dialect="item", since=SINCE, shift_seconds=-13500, calibrated_at=NOW)
+
+    step = _apply(cursor, _answer([deal_row(5)]))
+
+    assert step.pass_complete
+    assert (step.cursor.shift_seconds, step.cursor.calibrated_at) == (-13500, NOW)
+    assert SweepCursor.from_json(step.cursor.to_json(), now=NOW) == step.cursor

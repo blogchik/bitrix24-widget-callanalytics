@@ -363,6 +363,11 @@
       "confirmYes": "Turn off",
       "confirmNo": "Cancel",
       "failed": "CRM analytics could not be turned off. Please try again."
+    },
+    "crmCoverage": {
+      "loading": "CRM history is still loading ({percent}%). The report may be incomplete for earlier dates.",
+      "stale": "CRM data was last updated {time}. Later changes are not in the report yet.",
+      "neverSynced": "CRM data has not been synchronised yet, so the report may be incomplete."
     }
   },
   "call": {
@@ -399,7 +404,8 @@
     "utm_report_failed": "Bitrix24 could not answer the traffic-source report. Try again in a moment.",
     "utm_unsupported": "This portal's Bitrix24 does not return UTM tags on leads and deals through the API, so this page cannot be built. The other pages are unaffected.",
     "bad_dimension": "Unknown breakdown: {dimension}.",
-    "crm_analytics_off": "A portal administrator turned CRM analytics off, so this report is unavailable. It can be turned back on in the app settings."
+    "crm_analytics_off": "A portal administrator turned CRM analytics off, so this report is unavailable. It can be turned back on in the app settings.",
+    "crm_mirror_unavailable": "The way this report is built has changed. Reload the page."
   },
   "install": {
     "fallback": "Could not reach Bitrix24. Close this window and start the installation again.",

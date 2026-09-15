@@ -125,6 +125,9 @@ const OWN_MESSAGE_CODES: ReadonlySet<string> = new Set([
   // §4.14 / D-7: an administrator turned CRM analytics off. The pages check `/me` first and
   // render their own state; this sentence is the floor for any caller that did not.
   'crm_analytics_off',
+  // §4.14: the portal's report path changed under an open page. The page reads `/me` again
+  // once; this sentence is what remains if the new answer still points at the same path.
+  'crm_mirror_unavailable',
 ]);
 
 export interface ErrorPresentation {
@@ -376,12 +379,42 @@ export interface Me {
 export interface MeCrm {
   analytics_enabled: boolean;
   mode?: string | null;
+  /**
+   * Which path the Deals and Sources pages take for this viewer: `mirror` is a tokenless GET
+   * answered from Postgres, `live` the POST that asks Bitrix24 on the viewer's own token.
+   */
+  read?: 'mirror' | 'live' | null;
   /** An administrator who has not dismissed the informational notice. It gates nothing. */
   notice_visible?: boolean | null;
   /** Admin-only. */
   opted_out_at?: string | null;
   /** Admin-only: the CRM copy is still being deleted. */
   purge_pending?: boolean | null;
+}
+
+/** How much of the portal the CRM mirror holds (§4.14 constraint 4). */
+export interface CrmCoverage {
+  /** Not yet pinned to a date: the backfill reads newest records first. Always null today. */
+  window_from: string | null;
+  history_complete: boolean;
+  progress_pct: number;
+}
+
+/** Why a mirror report may be missing recent changes. */
+export interface CrmStale {
+  /** The last completed sweep; null when no sweep has finished yet. */
+  since: string | null;
+  reason: string;
+}
+
+/**
+ * What a report answered from the CRM mirror carries beside the live report's body. Absent on
+ * a live report, which is why every field is optional.
+ */
+export interface MirrorReportMeta {
+  data_as_of?: string | null;
+  coverage?: CrmCoverage | null;
+  stale?: CrmStale | null;
 }
 
 /**

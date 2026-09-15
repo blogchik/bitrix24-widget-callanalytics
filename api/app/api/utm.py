@@ -22,6 +22,9 @@ true for a reason of its own:
   same REST as one that names five. The page says so in its own copy; the point of parsing
   it at the edge is that an unknown name is the caller's bug and is worth a 400 before a
   single Bitrix24 command is sent.
+* **`GET` is the same report from the CRM mirror (§4.14).** No body and no token, because
+  nothing is asked of Bitrix24. It answers only where `crm_repo.serves_mirror` says this
+  viewer's page reads Postgres; everywhere else the `POST` is still the report.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ import uuid
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
+from starlette.background import BackgroundTask
 
 from app.api.viewer_token import read_viewer_access_token
 from app.db.models import Portal
@@ -43,8 +47,14 @@ from app.security.principal import (
     get_principal,
     require_data_access,
 )
+from app.services import crm_repo, crm_shadow
 from app.services.stats import FilterError
-from app.services.utm_stats import UtmReportError, load_utm_report, parse_utm_filters
+from app.services.utm_stats import (
+    UtmReportError,
+    load_utm_report,
+    load_utm_report_mirror,
+    parse_utm_filters,
+)
 
 __all__ = ["router"]
 
@@ -133,6 +143,53 @@ async def utm(request: Request, principal: Principal = Depends(get_principal)) -
     except UtmReportError as exc:
         _log.info(
             "utm: report refused",
+            extra={
+                "portal_id": principal.portal_id,
+                "user_id": principal.user_id,
+                "code": exc.code,
+            },
+        )
+        return exc.as_response()
+
+    background = None
+    if crm_shadow.shadows(portal, principal):
+        # Recomputed from the mirror after this response is sent; see `api/deals.py`.
+        background = BackgroundTask(
+            crm_shadow.compare_utm, principal, portal, filters, dimensions, report
+        )
+    return JSONResponse(report, background=background)
+
+
+@router.get("/utm", dependencies=[Depends(require_data_access)])
+async def utm_from_mirror(
+    request: Request, principal: Principal = Depends(get_principal)
+) -> JSONResponse:
+    """The report from the CRM mirror: no body, no viewer token, periods up to 366 days.
+
+    Answered only where `crm_repo.serves_mirror` holds - the same test `/me.crm.read` reports.
+    A page opened before the portal's mode changed gets **409 `crm_mirror_unavailable`**,
+    reads `/me` again and takes the live path.
+    """
+    try:
+        filters, dimensions = parse_utm_filters(request.query_params, principal, mirror=True)
+    except FilterError as exc:
+        _log.info(
+            "utm: filter rejected",
+            extra={"portal_id": principal.portal_id, "code": exc.code},
+        )
+        return exc.as_response()
+
+    portal = await _active_portal(principal.portal_id)
+    if portal.crm_opt_out_at is not None:
+        return JSONResponse({"code": "crm_analytics_off"}, status_code=409)
+    if not crm_repo.serves_mirror(portal, principal):
+        return JSONResponse({"code": crm_repo.MIRROR_UNAVAILABLE}, status_code=409)
+
+    try:
+        report = await load_utm_report_mirror(principal, portal, filters, dimensions)
+    except UtmReportError as exc:
+        _log.info(
+            "utm: mirror report refused",
             extra={
                 "portal_id": principal.portal_id,
                 "user_id": principal.user_id,

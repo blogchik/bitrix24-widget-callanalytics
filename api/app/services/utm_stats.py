@@ -53,7 +53,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Final
 
@@ -111,12 +111,14 @@ from app.config import settings
 from app.db.models import Portal
 from app.logging import get_logger
 from app.security.principal import Principal
+from app.services import crm_repo
 from app.services.stats import CallFilters, FilterError, parse_filters, resolve_timezone
 from app.sync.throttle import read_time_block
 
 __all__ = [
     "UtmReportError",
     "load_utm_report",
+    "load_utm_report_mirror",
     "parse_utm_filters",
     "reset_utm_caches",
     "reset_utm_report_rate_limit",
@@ -271,7 +273,7 @@ def _charge_report(portal_id: int, user_id: int) -> bool:
 
 
 def parse_utm_filters(
-    params: QueryParams, principal: Principal
+    params: QueryParams, principal: Principal, *, mirror: bool = False
 ) -> tuple[CallFilters, tuple[str, ...]]:
     """The shared filter vocabulary, narrowed to what a UTM scan can honour (§4.13).
 
@@ -283,6 +285,7 @@ def parse_utm_filters(
       from `parse_deal_filters`, which made the same choice for the same reason.)
     * the period cap is `UTM_REPORT_MAX_PERIOD_DAYS`, not `MAX_PERIOD_DAYS`. A live REST scan
       of two entities cannot honestly offer a year inside the SPA's thirty-second timeout.
+      The mirror can (`mirror=True`, §4.14 constraint 1).
     * `dimensions` selects which tags form the composite key. It narrows the FOLD, never the
       SCAN - the same pages are fetched either way - so it is a response-size control rather
       than a cost control, and the page says so.
@@ -296,7 +299,7 @@ def parse_utm_filters(
                 raise FilterError("unsupported_filter", filter=names[0])
 
     filters = parse_filters(params, principal)
-    if filters.days > settings.utm_report_max_period_days:
+    if not mirror and filters.days > settings.utm_report_max_period_days:
         raise FilterError("period_too_long", max_days=settings.utm_report_max_period_days)
 
     requested: list[str] = []
@@ -326,14 +329,14 @@ class _Measures:
     won: int = 0
     lost: int = 0
 
-    def add(self, semantic: str) -> None:
-        self.total += 1
+    def add(self, semantic: str, count: int = 1) -> None:
+        self.total += count
         if semantic == "S":
-            self.won += 1
+            self.won += count
         elif semantic == "F":
-            self.lost += 1
+            self.lost += count
         else:
-            self.in_progress += 1
+            self.in_progress += count
 
     def merge(self, other: _Measures) -> None:
         self.total += other.total
@@ -1178,7 +1181,7 @@ def _build_response(
     dimensions: Sequence[str],
     capability: _Capability,
     scan: _Scan,
-    budget: _Budget,
+    rest_requests: int,
     from_cache: bool,
     assigned_to: Sequence[int],
 ) -> dict[str, Any]:
@@ -1236,7 +1239,7 @@ def _build_response(
             "value_max_chars": settings.utm_value_max_chars,
             "combinations": len(rows),
             "collapsed": list(collapsed),
-            "rest_requests": budget.requests,
+            "rest_requests": rest_requests,
             "from_cache": from_cache,
         },
     }
@@ -1344,7 +1347,7 @@ async def _report(
         dimensions=chosen,
         capability=capability,
         scan=scan,
-        budget=budget,
+        rest_requests=budget.requests,
         from_cache=from_cache,
         assigned_to=assigned_to,
     )
@@ -1399,3 +1402,104 @@ async def load_utm_report(
             portal_gate.release()
     finally:
         gate.release()
+
+
+# --- the mirror (§4.14) ----------------------------------------------------------------------
+
+#: The dialects a mirror report names in `scan.<entity>.dialect`. Everything else about them
+#: is the universal spelling the worker read the records in.
+_MIRROR_LEAD: Final[EntityDialect] = replace(LEAD_ITEM, name="mirror")
+_MIRROR_DEAL: Final[EntityDialect] = replace(DEAL_ITEM, name="mirror")
+
+
+def _scan_from_counts(
+    counts: Sequence[crm_repo.UtmCount], days: Mapping[dt.date, Mapping[int, int]]
+) -> _Scan:
+    """`_fold` for grouped counts, into the accumulator `_build_response` already reads.
+
+    Amounts are the deal's own currency only: Bitrix24 does not return the account-currency
+    pair to list calls (docs/spike-crm-mirror.md), so the worker never stored it and
+    `_amounts` takes the native column exactly as it does for a live build without the pair.
+    """
+    scan = _Scan()
+    for count in counts:
+        kind = KIND_LEAD if count.entity_type_id == crm_repo.LEAD else KIND_DEAL
+        scan.folded[kind] += count.records
+        scan.totals[kind] += count.records
+        if any(value != BUCKET_NONE for value in count.utm):
+            scan.tagged[kind] += count.records
+
+        entry = scan.raw.get(count.utm)
+        if entry is None:
+            entry = _Acc()
+            scan.raw[count.utm] = entry
+
+        if kind == KIND_LEAD:
+            entry.leads.add(count.semantic, count.records)
+            continue
+        entry.deals.add(count.semantic, count.records)
+        entry.deals_from_lead += count.from_lead
+        scan.amount_rows += count.amount_rows
+        scan.rows_without_amount += count.records - count.amount_rows
+        entry.amount_native += count.amount
+        scan.native_currencies.update(count.currencies)
+
+    for day, per_entity in days.items():
+        scan.days[day] = [per_entity.get(crm_repo.LEAD, 0), per_entity.get(crm_repo.DEAL, 0)]
+    return scan
+
+
+async def load_utm_report_mirror(
+    principal: Principal,
+    portal: Portal,
+    filters: CallFilters,
+    dimensions: Sequence[str],
+) -> dict[str, Any]:
+    """`GET /api/v1/utm`: the same report, from Postgres (§4.14).
+
+    What the live read learns from a probe, the mirror learns from its lanes: leads are
+    available when the lead lanes read them, and a portal that refuses leads degrades to
+    deals-only exactly as `_capability` degrades it.
+    """
+    scope = crm_repo.crm_scope(principal)
+    gate = crm_repo.report_gate()
+    try:
+        await asyncio.wait_for(gate.acquire(), _ADMIT_WAIT_S)
+    except TimeoutError:
+        raise UtmReportError("retry", 503, retry_after=5) from None
+    try:
+        coverage = await crm_repo.coverage(portal.id)
+        if not coverage.deals_available:
+            raise UtmReportError(crm_repo.MIRROR_UNAVAILABLE, 409, reason=coverage.deal_reason)
+        entity_type_ids = (
+            (crm_repo.LEAD, crm_repo.DEAL) if coverage.leads_available else (crm_repo.DEAL,)
+        )
+        assigned_to = filters.employees
+        counts = await crm_repo.utm_counts(
+            portal.id, filters, entity_type_ids=entity_type_ids, scope=scope, employees=assigned_to
+        )
+        days = await crm_repo.utm_days(
+            portal.id, filters, entity_type_ids=entity_type_ids, scope=scope, employees=assigned_to
+        )
+    finally:
+        gate.release()
+
+    capability = _Capability(
+        lead=_MIRROR_LEAD if coverage.leads_available else None,
+        deal=_MIRROR_DEAL,
+        lead_reason="" if coverage.leads_available else coverage.lead_reason,
+        deal_reason="",
+        dimensions=DIMENSIONS,
+    )
+    chosen = tuple(name for name in dimensions if name in capability.dimensions)
+    body = _build_response(
+        filters=filters,
+        dimensions=chosen or capability.dimensions,
+        capability=capability,
+        scan=_scan_from_counts(counts, days),
+        rest_requests=0,
+        from_cache=False,
+        assigned_to=assigned_to,
+    )
+    body.update(coverage.wire(now=dt.datetime.now(dt.UTC)))
+    return body

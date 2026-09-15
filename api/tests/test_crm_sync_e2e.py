@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -113,6 +113,9 @@ class CrmBitrix(FilteringBitrix):
             1: {item_id: _lead(item_id) for item_id in range(1, LEADS + 1)},
         }
         self.selected: set[str] = set()
+        #: S-A.10: `>=updatedTime: v` selects from `v - filter_shift`, as a portal whose token
+        #: user sits that far east of the server does.
+        self.filter_shift = timedelta(0)
 
     def _dispatch(self, method: str, params: dict[str, str]) -> Any:
         if method == "crm.item.list":
@@ -144,7 +147,7 @@ class CrmBitrix(FilteringBitrix):
         if exact:
             ids = [i for i in ids if i in exact]
         if ">=updatedTime" in flat:
-            since = _instant(flat[">=updatedTime"])
+            since = _instant(flat[">=updatedTime"]) - self.filter_shift
             ids = [i for i in ids if _instant(table[i]["updatedTime"]) >= since]
         if params.get("order[id]", "ASC").upper() == "DESC":
             ids.reverse()
@@ -244,6 +247,69 @@ async def test_an_edit_reaches_the_mirror_through_the_sweep(
             )
         ).one()
     assert tuple(stage) == ("WON", "S")
+
+
+async def _sweep_now(portal_id: int) -> None:
+    async with control_txn() as session:
+        await session.execute(
+            text(
+                "UPDATE crm_lanes SET due_at = now() - interval '1 second' "
+                "WHERE portal_id = :pid AND lane LIKE '%.sweep'"
+            ),
+            {"pid": portal_id},
+        )
+
+
+@pytest.mark.parametrize("shift_hours", [2, -2])
+async def test_an_edit_arrives_whichever_way_the_portal_shifts_its_date_filter(
+    crm_portal: tuple[SeededPortal, CrmBitrix], shift_hours: int
+) -> None:
+    """S-A.10. East of the server an unmeasured sweep over-reads and used to park; west of it,
+    it under-reads and would skip this edit with nothing to show for it."""
+    seeded, fake = crm_portal
+    fake.filter_shift = timedelta(hours=shift_hours)
+    await _mirror(seeded.portal_id)
+
+    # The watermark is the fake's server clock, 2026-09-07T10:00Z. An edit backdated two hours
+    # before it is what an eastward shift returns to an unmeasured bound; an edit thirty minutes
+    # after it is what a westward shift hides from one.
+    fake.tables[2][8].update(updatedTime="2026-09-07T11:00:00+03:00")
+    fake.tables[2][7].update(stageId="WON", stageSemanticId="S", updatedTime="2026-09-07T13:30:00+03:00")
+    await _sweep_now(seeded.portal_id)
+    await _drive(seeded.portal_id, visits=1)
+
+    lane = (await _lanes(seeded.portal_id))["deal.sweep"]
+    assert lane["status"] != "parked", lane
+    assert lane["cursor"]["shift_seconds"] == shift_hours * 3600
+    async with tenant_txn(seeded.portal_id) as session:
+        stage = (
+            await session.execute(
+                text("SELECT stage_id, stage_semantic FROM crm_items WHERE entity_type_id = 2 AND id = 7")
+            )
+        ).one()
+    assert tuple(stage) == ("WON", "S")
+
+
+async def test_a_sweep_parked_before_the_filter_clock_existed_resumes(
+    crm_portal: tuple[SeededPortal, CrmBitrix],
+) -> None:
+    seeded, _fake = crm_portal
+    await _mirror(seeded.portal_id)
+    async with control_txn() as session:
+        await session.execute(
+            text(
+                "UPDATE crm_lanes SET status = 'parked', block_reason = 'filter_unsupported', "
+                "last_error_code = 'filter_unsupported', cursor = '{}'::jsonb, due_at = now() "
+                "WHERE portal_id = :pid AND lane = 'deal.sweep'"
+            ),
+            {"pid": seeded.portal_id},
+        )
+
+    await _drive(seeded.portal_id, visits=1)
+
+    lane = (await _lanes(seeded.portal_id))["deal.sweep"]
+    assert lane["status"] != "parked" and lane["block_reason"] is None
+    assert lane["cursor"]["shift_seconds"] == 0, "resumed, then measured on the same visit"
 
 
 async def test_a_deletion_nobody_signalled_reaches_the_mirror_through_reconciliation(

@@ -64,6 +64,7 @@ from app.security.principal import (
     get_principal,
 )
 from app.security.session_token import TokenError, issue_session, verify_session
+from app.services import crm_repo
 from app.services.access import decide_access
 from app.services.crm_context import resolve_crm_context, store_crm_context
 
@@ -216,6 +217,9 @@ async def me(principal: Principal = Depends(get_principal)) -> JSONResponse:
         "crm": {
             "analytics_enabled": portal.crm_opt_out_at is None,
             "mode": portal.crm_mode,
+            # Which path this viewer's Deals and Sources pages take (§4.14): `mirror` is a
+            # tokenless GET from Postgres, `live` the POST that asks Bitrix24.
+            "read": "mirror" if crm_repo.serves_mirror(portal, principal) else "live",
             # The notice informs and gates nothing; an administrator sees it until dismissed.
             "notice_visible": bool(
                 principal.is_admin

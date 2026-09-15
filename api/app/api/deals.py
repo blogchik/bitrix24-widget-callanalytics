@@ -16,6 +16,9 @@ Three things about this module are decisions rather than mechanics:
   read.** It decides exactly one thing here and the docstring below says which: a user
   Bitrix24 refused telephony to gets no analytics page from this app at all. Which DEALS
   they may see is decided by Bitrix24, on their own token, inside the service.
+* **`GET` is the same report from the CRM mirror (§4.14).** No body and no token, because
+  nothing is asked of Bitrix24. It answers only where `crm_repo.serves_mirror` says this
+  viewer's page reads Postgres; everywhere else the `POST` above is still the report.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import uuid
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
+from starlette.background import BackgroundTask
 
 from app.api.viewer_token import read_viewer_access_token
 from app.db.models import Portal
@@ -37,7 +41,13 @@ from app.security.principal import (
     get_principal,
     require_data_access,
 )
-from app.services.deal_stats import DealReportError, load_deal_report, parse_deal_filters
+from app.services import crm_repo, crm_shadow
+from app.services.deal_stats import (
+    DealReportError,
+    load_deal_report,
+    load_deal_report_mirror,
+    parse_deal_filters,
+)
 from app.services.stats import FilterError
 
 __all__ = ["router"]
@@ -129,6 +139,52 @@ async def deals(request: Request, principal: Principal = Depends(get_principal))
     except DealReportError as exc:
         _log.info(
             "deals: report refused",
+            extra={
+                "portal_id": principal.portal_id,
+                "user_id": principal.user_id,
+                "code": exc.code,
+            },
+        )
+        return exc.as_response()
+
+    background = None
+    if crm_shadow.shadows(portal, principal):
+        # Recomputed from the mirror after this response is sent; whatever that does, this
+        # viewer already has their report.
+        background = BackgroundTask(crm_shadow.compare_deals, principal, portal, filters, report)
+    return JSONResponse(report, background=background)
+
+
+@router.get("/deals", dependencies=[Depends(require_data_access)])
+async def deals_from_mirror(
+    request: Request, principal: Principal = Depends(get_principal)
+) -> JSONResponse:
+    """The report from the CRM mirror: no body, no viewer token, periods up to 366 days.
+
+    Answered only where `crm_repo.serves_mirror` holds - the same test `/me.crm.read` reports.
+    A page opened before the portal's mode changed gets **409 `crm_mirror_unavailable`**,
+    reads `/me` again and takes the live path.
+    """
+    try:
+        filters = parse_deal_filters(request.query_params, principal, mirror=True)
+    except FilterError as exc:
+        _log.info(
+            "deals: filter rejected",
+            extra={"portal_id": principal.portal_id, "code": exc.code},
+        )
+        return exc.as_response()
+
+    portal = await _active_portal(principal.portal_id)
+    if portal.crm_opt_out_at is not None:
+        return JSONResponse({"code": "crm_analytics_off"}, status_code=409)
+    if not crm_repo.serves_mirror(portal, principal):
+        return JSONResponse({"code": crm_repo.MIRROR_UNAVAILABLE}, status_code=409)
+
+    try:
+        report = await load_deal_report_mirror(principal, portal, filters)
+    except DealReportError as exc:
+        _log.info(
+            "deals: mirror report refused",
             extra={
                 "portal_id": principal.portal_id,
                 "user_id": principal.user_id,

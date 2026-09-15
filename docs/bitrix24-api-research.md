@@ -192,6 +192,8 @@ table is `docs/spike-crm-mirror.md` (spike S-A). The spikes still open are liste
   - impact: every mirror list is a keyset walk, and nothing reads `total` or `next`.
 - [measured] (B2 · Keyset on this portal) `>id` with `start:-1` works on `crm.item.list` and on the legacy `crm.deal.list` / `crm.lead.list`, ascending and descending; `total` and `next` come back `null`, not 0.
 - [measured] (B3 · Filters that are honoured) `>=updatedTime`, the three-leg OR (created, or updated, or closed and moved), `@id` with 50 ids, and `order {updatedTime, id}` all constrain the result.
+- [measured] (B3a · How a datetime filter is read) The value's UTC offset is parsed, but the effective bound moves by the token user's zone offset from the server's: two hours on the measured portal. Rendered timestamps are correct.
+  - impact: the sweep measures the shift per portal and sends its bound moved by it (`sync/crm_clock.py`); until it is measured the bound goes 14 hours early. A live report's period filter carries the viewer's shift.
 - [measured] (B4 · Fields a real portal returns) `opportunityAccount` and `accountCurrencyId` are never returned by `crm.item.list`, even when selected; `contactIds` is a list; `closed` is `"Y"` / `"N"`; the envelope carries `time.date_start` with a UTC offset.
   - impact: money is stored in each deal's own currency only, and a deal's contacts need no second call.
 - [measured] (B5 · A missing record) `crm.item.get` for a missing id answers the error code `NOT_FOUND`. Legacy `crm.deal.get` answers "Not found" with no code.

@@ -175,6 +175,11 @@ class Settings(BaseSettings):
     #: The widest id range a backfill plans. Narrower on a small portal, so its whole
     #: history is walked in parallel ranges instead of one long stream.
     crm_backfill_range_max: int = Field(default=20_000, ge=50)
+    #: How often each entity's ids are reconciled against the portal (§5.12) - the backstop
+    #: that turns a deletion nobody signalled into a tombstone within a day.
+    crm_reconcile_interval_sec: int = Field(default=86_400, ge=3_600)
+    #: How often every mirrored record is read again, for edits that do not bump updatedTime.
+    crm_patrol_interval_sec: int = Field(default=7 * 86_400, ge=86_400)
 
     # ---- Modes ----
     recording_mode: Literal["off", "proxy"] = "off"

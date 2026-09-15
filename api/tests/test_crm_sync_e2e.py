@@ -27,7 +27,7 @@ from app.services.portals import mark_uninstalled
 from app.sync import crm_backfill
 from tests.conftest import TENANT_TABLES
 from tests.fixtures.bitrix import SeededPortal, delete_portal, patch_httpx, seed_portal
-from tests.test_sync_e2e import FilteringBitrix, _count_calls, _drive, _sync_row
+from tests.test_sync_e2e import Answer, FilteringBitrix, _count_calls, _drive, _sync_row
 
 pytestmark = pytest.mark.asyncio
 
@@ -117,13 +117,16 @@ class CrmBitrix(FilteringBitrix):
     def _dispatch(self, method: str, params: dict[str, str]) -> Any:
         if method == "crm.item.list":
             return self._items(params)
+        if method == "crm.item.get":
+            row = self.tables[int(params["entityTypeId"])].get(int(params["id"]))
+            return Answer(error="NOT_FOUND") if row is None else Answer(result={"item": row})
         if method == "crm.category.list":
             return {"categories": _CATEGORIES}
         if method == "crm.status.list":
             return _STATUSES.get(params.get("filter[ENTITY_ID]", ""), [])
         return super()._dispatch(method, params)
 
-    def _items(self, params: dict[str, str]) -> dict[str, Any]:
+    def _items(self, params: dict[str, str]) -> Any:
         table = self.tables[int(params["entityTypeId"])]
         ids = sorted(table)
         flat = {
@@ -147,7 +150,11 @@ class CrmBitrix(FilteringBitrix):
             ids.reverse()
         select = [value for key, value in params.items() if key.startswith("select[")]
         self.selected.update(select)
-        return {"items": [{name: table[i][name] for name in select if name in table[i]} for i in ids[:50]]}
+        page = {"items": [{name: table[i][name] for name in select if name in table[i]} for i in ids[:50]]}
+        # `start: -1` switches the count off; `start: 0` is the reconciliation's count probe.
+        if int(params.get("start", "0") or 0) >= 0:
+            return Answer(result=page, total=len(ids))
+        return page
 
 
 @pytest_asyncio.fixture()
@@ -237,6 +244,48 @@ async def test_an_edit_reaches_the_mirror_through_the_sweep(
             )
         ).one()
     assert tuple(stage) == ("WON", "S")
+
+
+async def test_a_deletion_nobody_signalled_reaches_the_mirror_through_reconciliation(
+    crm_portal: tuple[SeededPortal, CrmBitrix],
+) -> None:
+    """No change signal exists yet (M6). A deleted deal is found by the daily reconciliation,
+    confirmed by crm.item.get NOT_FOUND, and tombstoned: its values gone, its id kept."""
+    seeded, fake = crm_portal
+    await _mirror(seeded.portal_id)
+    del fake.tables[2][9]
+    async with control_txn() as session:
+        await session.execute(
+            text(
+                "UPDATE crm_lanes SET due_at = now() - interval '1 second' "
+                "WHERE portal_id = :pid AND lane LIKE '%.reconcile'"
+            ),
+            {"pid": seeded.portal_id},
+        )
+
+    for _ in range(6):
+        await _drive(seeded.portal_id, visits=1)
+        deleted = await _count(
+            seeded.portal_id,
+            "SELECT count(*) FROM crm_items WHERE entity_type_id = 2 AND id = 9 AND deleted_at IS NOT NULL",
+        )
+        if deleted:
+            break
+
+    async with tenant_txn(seeded.portal_id) as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT delete_reason, stage_id, contact_ids, opportunity FROM crm_items "
+                    "WHERE entity_type_id = 2 AND id = 9"
+                )
+            )
+        ).one()
+    assert tuple(row) == ("not_found", None, None, None), "decision 29: every value NULL, id kept"
+    live = "SELECT count(*) FROM crm_items WHERE entity_type_id = 2 AND deleted_at IS NULL"
+    assert await _count(seeded.portal_id, live) == DEALS - 1, "exactly one deal, and the right one"
+    assert fake.method_calls.get("crm.item.get", 0) >= 1, "absence from a list is never proof"
+    assert await _count(seeded.portal_id, "SELECT count(*) FROM crm_dirty") == 0
 
 
 async def test_a_crm_refusal_stays_on_its_lanes_and_the_calls_still_sync(

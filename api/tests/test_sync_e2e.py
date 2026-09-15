@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 from urllib.parse import parse_qsl
@@ -41,6 +42,15 @@ BASE_TS: Final[datetime] = datetime(2026, 8, 1, 9, 0, tzinfo=UTC)
 # --------------------------------------------------------------------------------------
 # a Bitrix24 that actually filters
 # --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Answer:
+    """What `_dispatch` returns when a command needs more than a result: a total or an error."""
+
+    result: Any = None
+    total: int | None = None
+    error: str | None = None
 
 
 def _row(bx_id: int) -> dict[str, Any]:
@@ -174,7 +184,16 @@ class FilteringBitrix:
                 if nxt is not None:
                     nexts[key] = nxt
             else:
-                results[key] = self._dispatch(method, cmd_params)
+                answer = self._dispatch(method, cmd_params)
+                if isinstance(answer, Answer):
+                    if answer.error is not None:
+                        errors[key] = {"error": answer.error, "error_description": "scripted"}
+                    else:
+                        results[key] = answer.result
+                        if answer.total is not None:
+                            totals[key] = answer.total
+                else:
+                    results[key] = answer
 
         return httpx.Response(
             200,

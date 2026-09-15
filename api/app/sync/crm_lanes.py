@@ -25,12 +25,17 @@ from app.db.models import CrmLane
 __all__ = [
     "ACTIVE",
     "DEAL_BACKFILL",
+    "DEAL_PATROL",
+    "DEAL_RECONCILE",
     "DEAL_SWEEP",
     "DICT",
+    "DIRTY",
     "DONE",
     "FAILURES_BEFORE_PAUSE",
     "LANES",
     "LEAD_BACKFILL",
+    "LEAD_PATROL",
+    "LEAD_RECONCILE",
     "LEAD_SWEEP",
     "PARKED",
     "PENDING",
@@ -49,14 +54,30 @@ __all__ = [
 ]
 
 DICT: Final[str] = "dict"
+DIRTY: Final[str] = "dirty"
 DEAL_SWEEP: Final[str] = "deal.sweep"
 LEAD_SWEEP: Final[str] = "lead.sweep"
 DEAL_BACKFILL: Final[str] = "deal.backfill"
 LEAD_BACKFILL: Final[str] = "lead.backfill"
+DEAL_RECONCILE: Final[str] = "deal.reconcile"
+LEAD_RECONCILE: Final[str] = "lead.reconcile"
+DEAL_PATROL: Final[str] = "deal.patrol"
+LEAD_PATROL: Final[str] = "lead.patrol"
 
-#: Every lane a CRM-enabled portal has, in the order a visit runs them: names first, then
-#: what changed, then history.
-LANES: Final[tuple[str, ...]] = (DICT, DEAL_SWEEP, LEAD_SWEEP, DEAL_BACKFILL, LEAD_BACKFILL)
+#: Every lane a CRM-enabled portal has, in the order a visit runs them: names first, then what
+#: changed and what is queued, then history, then the checks that need the history.
+LANES: Final[tuple[str, ...]] = (
+    DICT,
+    DEAL_SWEEP,
+    LEAD_SWEEP,
+    DIRTY,
+    DEAL_BACKFILL,
+    LEAD_BACKFILL,
+    DEAL_RECONCILE,
+    LEAD_RECONCILE,
+    DEAL_PATROL,
+    LEAD_PATROL,
+)
 
 PENDING: Final[str] = "pending"
 ACTIVE: Final[str] = "active"

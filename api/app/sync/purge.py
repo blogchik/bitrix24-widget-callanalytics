@@ -46,7 +46,16 @@ from sqlalchemy.sql import Select, func
 from sqlalchemy.sql.selectable import NamedFromClause
 
 from app.config import settings
-from app.db.models import Base, CrmContext, CrmLane, Portal, PortalSync, RestLog
+from app.db.models import (
+    CRM_ITEM_DATA_COLUMNS,
+    Base,
+    CrmContext,
+    CrmItem,
+    CrmLane,
+    Portal,
+    PortalSync,
+    RestLog,
+)
 from app.db.session import control_txn, tenant_txn
 from app.db.tenancy import CRM_TENANT_TABLES, TENANT_TABLES
 from app.logging import get_logger
@@ -59,6 +68,7 @@ __all__ = [
     "outside_incomplete_cooldown",
     "purge_crm_contexts",
     "purge_crm_data",
+    "purge_crm_retention",
     "purge_portal_data",
     "purge_rest_log",
     "redact_on_clean",
@@ -71,6 +81,13 @@ CHUNK_ROWS: Final[int] = 10_000
 
 #: §5.7 does not apply here; §6 fixes 30 days for the resolved-CRM cache.
 CRM_CONTEXT_MAX_AGE_DAYS: Final[int] = 30
+
+#: Privacy policy section 5 (G0 Q4): a deleted record's id is kept this long, then forgotten.
+CRM_TOMBSTONE_DAYS: Final[int] = 35
+
+#: Privacy policy section 5: a record the installer can no longer read loses its values after
+#: this long (§5.12 hides it from reports after 7 days already).
+CRM_UNREADABLE_EVICT_DAYS: Final[int] = 30
 
 #: A `purge_incomplete` leaves `purge_pending = true`, and §5.9's tick picks purge work
 #: with `SELECT id FROM portals WHERE purge_pending LIMIT 1` on every visit. Without a
@@ -585,3 +602,53 @@ async def purge_crm_contexts() -> int:
     if removed:
         log.info("crm_contexts purge", extra={"deleted": removed, "cutoff": cutoff.isoformat()})
     return removed
+
+
+async def purge_crm_retention() -> tuple[int, int]:
+    """Daily CRM mirror retention (§5.12, privacy policy section 5): `(forgotten, evicted)`.
+
+    * a tombstone older than 35 days is deleted outright - the id has done its job of keeping
+      an old page from re-importing the record;
+    * a live record unreadable for 30 days loses its values and becomes an `evicted` tombstone,
+      which a later successful read may restore and which is itself forgotten 35 days later.
+
+    Portal by portal under tenant context, for the reason `purge_crm_contexts` gives.
+    """
+    now = dt.datetime.now(dt.UTC)
+    forget_before = now - dt.timedelta(days=CRM_TOMBSTONE_DAYS)
+    evict_before = now - dt.timedelta(days=CRM_UNREADABLE_EVICT_DAYS)
+    table = cast("Table", CrmItem.__table__)
+    evicted_values: dict[str, Any] = dict.fromkeys(CRM_ITEM_DATA_COLUMNS)
+    evicted_values.update(deleted_at=now, delete_reason="evicted", content_changed_at=now)
+
+    forgotten = 0
+    evicted = 0
+    for portal_id in await _portal_ids():
+        for _ in range(_MAX_CHUNKS):
+            async with tenant_txn(portal_id) as session:
+                result = await session.execute(
+                    _chunk_delete(
+                        table,
+                        portal_id,
+                        extra=lambda victim: victim.c.deleted_at < forget_before,
+                    )
+                )
+            rows = int(cast("CursorResult[Any]", result).rowcount or 0)
+            forgotten += rows
+            if rows == 0:
+                break
+        async with tenant_txn(portal_id) as session:
+            result = await session.execute(
+                update(CrmItem)
+                .where(
+                    CrmItem.portal_id == portal_id,
+                    CrmItem.deleted_at.is_(None),
+                    CrmItem.unreadable_since < evict_before,
+                )
+                .values(**evicted_values)
+                .execution_options(synchronize_session=False)
+            )
+        evicted += int(cast("CursorResult[Any]", result).rowcount or 0)
+    if forgotten or evicted:
+        log.info("crm retention", extra={"forgotten": forgotten, "evicted": evicted})
+    return forgotten, evicted

@@ -33,6 +33,8 @@ from app.bitrix.utm import DIMENSIONS
 from app.db.models import CRM_ITEM_DATA_COLUMNS, CrmItem
 from app.db.session import tenant_txn
 from app.logging import get_logger
+from app.services import crm_dirty
+from app.services.crm_dirty import DirtyId
 from app.services.employees import upsert_placeholders
 from app.services.portals import record_event
 from app.sync.crm_lanes import Lane, store_lanes
@@ -185,8 +187,13 @@ async def upsert_items(
     read_at: dt.datetime,
     lanes: Sequence[Lane] = (),
     rejected: Sequence[Rejection] = (),
+    consume: Sequence[DirtyId] = (),
 ) -> ItemsWritten:
     """Upsert `rows`, placeholder their assignees, store `lanes`, all behind the fence.
+
+    `consume` is the dirty marks these rows answer; they are deleted in the same transaction
+    (`services/crm_dirty.py::consume`, guarded by `seq`), so a crash re-reads them rather than
+    losing the mark.
 
     Raises `FenceLost` when the lease or `sync_generation` moved; nothing is committed then -
     which is what keeps a run that outlived an uninstall or an opt-out from re-inserting rows
@@ -224,6 +231,8 @@ async def upsert_items(
             )
         if all_rejects:
             await _record_rejections(session, portal_id, all_rejects)
+        if consume:
+            await crm_dirty.consume(session, portal_id, consume)
         if lanes:
             await store_lanes(session, portal_id, lanes)
         await fenced_update(session, fence, {})

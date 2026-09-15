@@ -129,7 +129,8 @@ Bitrix24 Marketplace application: one deployment serves many portals, reads only
 │   │   │   ├── calls_repo.py              # ALL reads of `calls`; scope_filter(principal) applied in exactly one place
 │   │   │   ├── stats.py                   # SQL aggregation (GROUPING SETS) in the viewer's timezone
 │   │   │   ├── employees.py               # cache reads; placeholder upsert; viewer upsert from user.current
-│   │   │   └── crm_context.py             # resolve + cache deal/lead/contact/company → entity keys and activity ids
+│   │   │   ├── crm_context.py             # resolve + cache deal/lead/contact/company → entity keys and activity ids
+│   │   │   └── crm_dirty.py               # the dirty queue: mark, due, seq-guarded consume, back-off and hold
 │   │   ├── sync/
 │   │   │   ├── throttle.py                # per-portal pacing, backoff, Retry-After, operating-time guard (floored)
 │   │   │   ├── budgets.py                 # sync_method_budgets: the same guard per (portal, method), statistics excepted
@@ -140,6 +141,16 @@ Bitrix24 Marketplace application: one deployment serves many portals, reads only
 │   │   │   ├── backfill.py                # backward cursor (<low_id), resumable
 │   │   │   ├── rescan.py                  # persisted rescan_from_id, recheck budget, refresh_requested rows
 │   │   │   ├── employees_refresh.py       # user.get for placeholder/stale ids
+│   │   │   ├── crm_lanes.py               # CRM lanes: schedule, cursor, per-lane back-off (§5.10)
+│   │   │   ├── crm_ranges.py              # newest-first id ranges walked by keyset; filter-honoured guard
+│   │   │   ├── crm_fetch.py               # the mirror's three reads: ranges, @id, crm.item.get confirmation
+│   │   │   ├── crm_backfill.py            # backfill cursor: planned ranges, contiguous `covered`
+│   │   │   ├── crm_sweep.py               # updatedTime sweep: server-clock watermark taken at pass start
+│   │   │   ├── crm_dict.py                # funnels + stages with names; removed only after two reads a day apart
+│   │   │   ├── crm_upsert.py              # crm_items upsert: read_at version guard, tombstone rules, quarantine
+│   │   │   ├── crm_dirty_refresh.py       # re-read queued ids, confirm absences, delete behind two guards
+│   │   │   ├── crm_deletes.py             # tombstones (decision 29) and unreadable marks
+│   │   │   ├── crm_reconcile.py           # daily count-and-split comparison; marks ids, deletes nothing
 │   │   │   └── purge.py                   # purge_portal_data (tenant txn, verified), purge_rest_log, redact_on_clean
 │   │   └── jobs/
 │   │       ├── protocol.py                # JobBackend Protocol: schedule_periodic(name, seconds), run_now(name, **kw)
@@ -1204,6 +1215,7 @@ Replaces the live reads of §4.12 and §4.13 one portal at a time. Constraints:
 7. **Employee pickers follow the page.** Call pages list employees with calls; `/deals` and `/utm` list CRM assignees.
 8. **Rollout is per portal and reversible.** `python -m app.tools.crm_mode` moves a portal `off → sync → shadow → mirror`.
    - Every eligible portal, existing or new, starts syncing as soon as the code ships; the owner dropped D-7's 14-day wait on 2026-09-15. Administrators see an informational notice, and a portal whose administrator turned CRM analytics off neither syncs nor serves the Deals and Sources reports, live or mirrored.
+   - Built in M4b: the switch is `POST /api/v1/portal/crm-analytics` (admin only). Off stamps `crm_opt_out_at`, raises the fence (`sync_generation + 1`) and queues `crm_purge_pending`; the tick's purge slot then runs `sync/purge.py::purge_crm_data`, which deletes `CRM_TENANT_TABLES` under tenant context with the same three verification rules as the uninstall purge and keeps calls. On clears the stamp; storage resumes only once the purge has finished. `/me.crm` carries `analytics_enabled` for every viewer and `notice_visible` for administrators, and `python -m app.tools.crm_mode` is the operator's view and mode switch.
    - `shadow` recomputes every successful live report from the mirror in the background and keeps the differences for 30 days.
    - A fleet-wide kill switch stops all CRM REST.
 
@@ -1281,6 +1293,22 @@ Terminal states set `token_status` and `next_run_at='infinity'`: OAuth `invalid_
 
 ### 5.10 CRM mirror: lanes and budgets (decision 26; built from milestone M4)
 - **Lanes** per portal, each with its own due time, cursor and failure state, all inside the one portal lease: `dict` (funnels, stages, field maps, hourly), `window` (a 366-day bootstrap of the deals' created ∨ updated ∨ closed-and-moved legs, newest window first, so a report is correct before the full history lands), `backfill` (disjoint id ranges newest first, each walked by the keyset `>id`, ascending, `start:-1`), `sweep` (`>=updatedTime` from the server-clock watermark minus an overlap, keyset inside), `history` (`crm.stagehistory.list` keyset `>ID` plus a trailing `CREATED_TIME` window), `signals` and `dirty` (§5.11), `reconcile` and `patrol` (§5.12). A park, a 429 or a crash on one lane never moves another lane or the call sync.
+- **Built so far** (milestones M4b and M7), run in `jobs/definitions.py` after the statistics phases and before the employee refresh, so assignees get names in the same visit:
+  - `dict`;
+  - `deal.sweep` / `lead.sweep`;
+  - `dirty`;
+  - `deal.backfill` / `lead.backfill`;
+  - `deal.reconcile` / `lead.reconcile`, daily, once the backfill is done;
+  - `deal.patrol` / `lead.patrol`, the backfill walk restarted weekly, first due a cycle after the backfill;
+  - the daily `purge_crm_retention`.
+
+  Failures stay on their lane:
+  - a lane refused by the portal (CRM or leads off, no such method) retries daily;
+  - a fault backs off 60 s doubling to an hour, then six hours after ten;
+  - a lane past its share of the method's operating limit rests until the reset;
+  - a code defect is caught per lane and never reaches `portal_sync.consecutive_failures`.
+
+  `window`, `history` and `signals` arrive with their milestones.
 - **Budgets**: every CRM method is accounted in `sync_method_budgets` (decision 27). Light lanes may use 0.8 of the learned limit, sweep and dictionaries 0.6, heavy lanes (window, backfill, reconcile, patrol) 0.5; while a portal still serves the live reports, heavy lanes on `crm.item.list` also leave the live pages their headroom.
 - **Extraction facts** are measured, not assumed: docs/spike-crm-mirror.md (S-A) — keyset and `@id` behaviour, `total`/`next` null under `start:-1`, the `operating` accumulator, and the fields a real portal returns (`opportunityAccount` is not one of them, so money is native only).
 - **Freshness targets**: an edit visible within 5 minutes at p95 where offline events are available and 10 minutes without; a deletion within 5 minutes, or 24 hours if its signal was lost; a funnel move within 30 minutes; a dictionary rename within 60 minutes; an edit that does not bump `updatedTime` within the patrol cycle.

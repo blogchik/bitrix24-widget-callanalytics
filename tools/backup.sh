@@ -24,16 +24,25 @@ set -euo pipefail
 
 DEST="${1:-/var/backups/callanalytics}"
 KEEP_DAYS="${BACKUP_KEEP_DAYS:-14}"
-COMPOSE="${COMPOSE:-docker compose}"
+# A command plus its arguments, word-split below on purpose. The default is the production
+# file set `deploy/ci-deploy.sh` runs. It used to be expanded quoted, which asked the shell
+# for one program literally named "docker compose" - so this script failed on every run and
+# the production host had no backup at all until 2026-09-15.
+COMPOSE="${COMPOSE:-docker compose -f docker-compose.yml -f docker-compose.prod.yml}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${DEST}/callanalytics-${STAMP}.sql.gz"
 
+# The compose files are relative to the checkout, whatever directory cron starts in.
+cd "$(dirname "$0")/.."
 mkdir -p "$DEST"
+# A failed dump must not leave a `.partial` behind for the next reader to mistake.
+trap 'rm -f "${OUT}.partial"' EXIT
 
 # --format=plain piped through gzip: restoring is `gunzip -c | psql`, which needs no
 # tool version match. The database is small (metadata only, no audio), so the custom
 # format's selective restore is not worth the coupling.
-"$COMPOSE" exec -T postgres \
+# shellcheck disable=SC2086
+$COMPOSE exec -T postgres \
     pg_dump -U postgres -d callanalytics --no-owner --no-privileges \
     | gzip -9 > "${OUT}.partial"
 

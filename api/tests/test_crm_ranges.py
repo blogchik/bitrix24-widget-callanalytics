@@ -141,3 +141,17 @@ def test_a_refused_row_is_reported_and_the_cursor_follows_the_readable_ids() -> 
     assert outcome.clean and [row.id for row in outcome.rows] == [3, 9]
     assert outcome.rejected == [(None, "missing or non-positive id")]
     assert outcome.streams[0].cursor == 9 and outcome.streams[0].done
+
+
+def test_a_full_page_ending_on_the_last_id_of_its_range_finishes_it() -> None:
+    """A range read to its last id by a full page is done: the next command would ask for
+    ids above hi - 1 and below hi, a range with no ids, which the builder refuses."""
+    streams = [RangeStream(lo=11, hi=61, cursor=10)]
+    sent = range_commands(DEAL_ITEM, streams, max_commands=5)
+    batch = answer(sent, {0: list(range(11, 61))})
+
+    outcome = apply_range_batch(DEAL_ITEM, streams, sent, batch, utm_max_chars=120)
+
+    assert outcome.streams[0].cursor == 60
+    assert outcome.streams[0].done
+    assert range_commands(DEAL_ITEM, outcome.streams, max_commands=5) == []

@@ -50,14 +50,20 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Final
 
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
+from app.bitrix import crm_items
 from app.bitrix.client import BatchResult, BitrixClient
+from app.bitrix.crm_items import DEAL_ITEM, DEAL_LEGACY, LEAD_ITEM, LEAD_LEGACY, MirrorDialect
+from app.bitrix.deals import CRM_STATUS_LIST
 from app.bitrix.errors import (
     AccessDenied,
     BitrixError,
+    EntityTypeNotSupported,
     ExpiredToken,
     InsufficientScope,
+    IntranetUserOnly,
     InvalidGrant,
     MethodNotFound,
     NoAuthFound,
@@ -74,9 +80,10 @@ from app.bitrix.oauth import CredentialUnavailable, MemberIdMismatch, with_porta
 from app.bitrix.statistic import STATISTIC_METHOD
 from app.bitrix.users import USER_ADMIN, USER_GET, parse_admin_flag
 from app.config import settings
-from app.db.models import Portal, PortalSync
-from app.db.session import control_txn
+from app.db.models import AppFlag, Portal, PortalSync
+from app.db.session import control_txn, tenant_txn
 from app.logging import get_logger, set_request_id
+from app.services import crm_dirty
 from app.services.portals import (
     mark_uninstalled,
     record_event,
@@ -84,9 +91,20 @@ from app.services.portals import (
     set_token_status,
 )
 from app.sync import budgets as method_budgets
-from app.sync import throttle
+from app.sync import (
+    crm_backfill,
+    crm_dict,
+    crm_dirty_refresh,
+    crm_lanes,
+    crm_reconcile,
+    crm_sweep,
+    throttle,
+)
 from app.sync.backfill import run_backfill
 from app.sync.budgets import MethodBudget
+from app.sync.crm_fetch import fetch_ranges
+from app.sync.crm_ranges import RangeStream
+from app.sync.crm_upsert import upsert_items
 from app.sync.employees_refresh import run_employees_refresh
 from app.sync.head_fetch import run_head_fetch
 from app.sync.incremental import run_incremental
@@ -99,14 +117,17 @@ from app.sync.lease import (
     heartbeat,
     release_lease,
 )
-from app.sync.purge import outside_incomplete_cooldown, purge_portal_data
+from app.sync.purge import outside_incomplete_cooldown, purge_crm_data, purge_portal_data
 from app.sync.purge import purge_crm_contexts as _purge_crm_context_rows
+from app.sync.purge import purge_crm_retention as _purge_crm_retention_rows
 from app.sync.purge import purge_rest_log as _purge_rest_log_rows
 from app.sync.rescan import run_id_window_rescan, run_record_recheck, run_refresh_requested
 
 __all__ = [
     "JOBS",
+    "purge_crm",
     "purge_crm_contexts",
+    "purge_crm_retention",
     "purge_portal",
     "purge_rest_log",
     "sweep_inferred_uninstalls",
@@ -167,6 +188,64 @@ _RELEASE_OWNED: Final[frozenset[str]] = frozenset(
 #: One sweep must not mark a thousand portals uninstalled in a single burst; the job is
 #: daily and the remainder is picked up tomorrow (durable state, §5.9).
 _SWEEP_LIMIT: Final[int] = 200
+
+#: The `app_flags` row whose `enabled = false` stops every CRM request the worker makes.
+CRM_MIRROR_FLAG: Final[str] = "crm_mirror"
+
+#: CRM refusals the portal decides rather than faults: CRM or leads switched off, a build
+#: without the method. The lane asks again tomorrow (`crm_lanes.unavailable`).
+_CRM_UNAVAILABLE: Final[tuple[type[BitrixError], ...]] = (
+    AccessDenied,
+    UserAccessError,
+    EntityTypeNotSupported,
+    IntranetUserOnly,
+    MethodNotFound,
+)
+
+#: Shares of a method's operating limit the CRM lanes may spend (§5.10). Until the mirror
+#: replaces them, the live Deals and Sources reports spend the same `crm.item.list` budget under
+#: the same application, and a backfill that took all of it would answer their readers
+#: `operation_time_limit` - which is how the live report failed on production once (b8393bd).
+CRM_SWEEP_SHARE: Final[float] = 0.6
+CRM_BACKFILL_SHARE: Final[float] = 0.5
+
+@dataclass(frozen=True)
+class _CrmEntity:
+    """One mirrored entity: its lanes and its two REST spellings."""
+
+    sweep: str
+    backfill: str
+    reconcile: str
+    patrol: str
+    item: MirrorDialect
+    legacy: MirrorDialect
+
+
+#: The mirrored entities, deals first.
+_CRM_ENTITIES: Final[tuple[_CrmEntity, ...]] = (
+    _CrmEntity(
+        sweep=crm_lanes.DEAL_SWEEP,
+        backfill=crm_lanes.DEAL_BACKFILL,
+        reconcile=crm_lanes.DEAL_RECONCILE,
+        patrol=crm_lanes.DEAL_PATROL,
+        item=DEAL_ITEM,
+        legacy=DEAL_LEGACY,
+    ),
+    _CrmEntity(
+        sweep=crm_lanes.LEAD_SWEEP,
+        backfill=crm_lanes.LEAD_BACKFILL,
+        reconcile=crm_lanes.LEAD_RECONCILE,
+        patrol=crm_lanes.LEAD_PATROL,
+        item=LEAD_ITEM,
+        legacy=LEAD_LEGACY,
+    ),
+)
+
+#: Lanes that mean nothing until their entity's history is loaded, and the lane that loads it.
+_CRM_PREREQUISITES: Final[dict[str, str]] = {
+    **{entity.reconcile: entity.backfill for entity in _CRM_ENTITIES},
+    **{entity.patrol: entity.backfill for entity in _CRM_ENTITIES},
+}
 
 
 # ------------------------------------------------------------------ dispatch registry
@@ -304,6 +383,13 @@ class _Visit:
     query_limit_hits: int = 0
     #: A phase reported it still had work; come back in seconds, not minutes.
     more: bool = False
+    #: CRM lanes run in this visit: the portal mirrors CRM, its administrator has not turned
+    #: CRM analytics off, and the fleet kill switch is on (§4.14).
+    crm_active: bool = False
+    #: `crm_lanes` as loaded at open and advanced during the visit (§5.10).
+    lanes: dict[str, crm_lanes.Lane] = field(default_factory=dict)
+    #: CRM batches this visit may still send (`CRM_BATCHES_PER_VISIT`).
+    crm_batches: int = 0
 
     @property
     def backfilling(self) -> bool:
@@ -364,6 +450,8 @@ async def _open_visit(portal_id: int, correlation_id: uuid.UUID) -> _Visit | Non
         fence = Fence(portal_id=portal_id, owner=WORKER_ID, generation=int(sync.sync_generation))
         await fenced_update(session, fence, {"run_started_at": func.now()})
         budgets = await method_budgets.load_budgets(session, portal_id)
+        crm_active = await _crm_active(session, portal)
+        lanes = await crm_lanes.ensure_lanes(session, portal_id, _utcnow()) if crm_active else {}
 
     return _Visit(
         portal_id=portal_id,
@@ -388,7 +476,24 @@ async def _open_visit(portal_id: int, correlation_id: uuid.UUID) -> _Visit | Non
         next_run_at=sync.next_run_at,
         consecutive_failures=int(sync.consecutive_failures or 0),
         method_budgets=budgets,
+        crm_active=crm_active,
+        lanes=lanes,
+        crm_batches=settings.crm_batches_per_visit,
     )
+
+
+async def _crm_active(session: AsyncSession, portal: Portal) -> bool:
+    """Whether this visit mirrors CRM: the portal's mode, its administrator's switch, the fleet's.
+
+    A missing flag row reads as off: the switch exists to stop requests, and a row an operator
+    deleted is more likely a mistake to be noticed than an instruction to carry on.
+    """
+    if portal.crm_mode == "off" or portal.crm_opt_out_at is not None or portal.crm_purge_pending:
+        return False
+    enabled = (
+        await session.execute(select(AppFlag.enabled).where(AppFlag.name == CRM_MIRROR_FLAG))
+    ).scalar_one_or_none()
+    return bool(enabled)
 
 
 def _observe(visit: _Visit, block: Any) -> None:
@@ -858,9 +963,675 @@ async def _phase_daily_probe(visit: _Visit) -> None:
         visit.token_admin_verified_at = now
 
 
-#: §5.9's order, exactly: refresh_requested -> head_fetch -> incremental -> backfill ->
-#: rescan -> recheck -> employees -> app.info + user.admin. Each phase is paired with the
-#: method whose budget it spends, which is what lets a stop skip a phase and not a visit.
+# ----------------------------------------------------------------------- CRM mirror
+
+
+def _crm_lane_errors(visit: _Visit, errors: Sequence[BitrixError]) -> list[BitrixError]:
+    """The CRM command errors that belong to the lane, after the portal-wide ones are raised.
+
+    A dead credential or a deleted portal is the portal's state (§5.8) and a 503 empties the
+    bucket every lane shares, so those end the visit exactly as they do for the statistics. A
+    429 parks the method (§5.6). Everything else - a refused lead list, a build without the
+    method, one failed page - stays on the lane, so the call sync's failure counter never
+    hears about it (§5.10).
+    """
+    remaining: list[BitrixError] = []
+    for error in errors:
+        terminal = _terminal_for(visit, error)
+        if terminal is not None:
+            raise _TerminalStop(terminal, error)
+        if isinstance(error, QueryLimitExceeded):
+            raise error
+        if isinstance(error, OperationTimeLimit):
+            _block_method(visit, visit.method, error)
+            continue
+        remaining.append(error)
+    return remaining
+
+
+def _lane_trouble(
+    visit: _Visit,
+    name: str,
+    errors: Sequence[BitrixError],
+    *,
+    now: dt.datetime,
+    cursor: dict[str, Any] | None = None,
+) -> None:
+    """Back a lane off for its first error: a day for a refusal, escalating for a fault."""
+    lane = visit.lanes[name]
+    first = errors[0]
+    if isinstance(first, _CRM_UNAVAILABLE):
+        code = first.code or type(first).__name__
+        visit.lanes[name] = crm_lanes.unavailable(lane, code, now=now, cursor=cursor)
+    else:
+        visit.lanes[name] = crm_lanes.failed(lane, first, now=now, cursor=cursor)
+
+
+async def _save_lanes(visit: _Visit, *names: str) -> None:
+    """Store lanes that moved without rows - a failure, a park, a demotion - behind the fence."""
+    async with control_txn() as session:
+        await crm_lanes.store_lanes(session, visit.portal_id, [visit.lanes[name] for name in names])
+        await fenced_update(session, visit.fence, {})
+
+
+async def _crm_within_share(visit: _Visit, name: str, method: str, share: float) -> bool:
+    """Whether a lane may send another batch on `method`; if not, it rests until the reset.
+
+    Read from the method's own accumulator (`sync_method_budgets`), which counts the live
+    reports' requests too - the same application, the same method. Resting is not failing:
+    the lane keeps its streak and its reason, and comes back when the baskets have drained.
+    """
+    budget = visit.method_budgets.get(method)
+    if budget is None or budget.operating_seconds is None:
+        return True
+    now = _utcnow()
+    reset_at = budget.operating_reset_at
+    if reset_at is not None and reset_at <= now:
+        return True
+    if float(budget.operating_seconds) < share * budget.state().operating_limit_s:
+        return True
+    until = (reset_at or now) + dt.timedelta(seconds=throttle.RESET_GRACE_SECONDS)
+    visit.lanes[name] = crm_lanes.resting(visit.lanes[name], until)
+    await _save_lanes(visit, name)
+    return False
+
+
+def _dialect(name: str, item: MirrorDialect, legacy: MirrorDialect) -> MirrorDialect:
+    return legacy if name == crm_backfill.DIALECT_LEGACY else item
+
+
+def _crm_lane_ready(visit: _Visit, name: str) -> crm_lanes.Lane | None:
+    lane = visit.lanes.get(name)
+    if not visit.crm_active or lane is None or visit.crm_batches <= 0:
+        return None
+    return lane if lane.runnable(_utcnow()) else None
+
+
+async def _guarded_crm(visit: _Visit, name: str, work: Awaitable[None]) -> None:
+    """Run one CRM lane so that a defect in its code backs off the lane and nothing else.
+
+    Portal-wide outcomes still leave: a terminal credential state, a lost fence and a Bitrix24
+    error the visit handles (a 503, a whole-request 429, a transport failure). Anything else is
+    a bug in this module's own code, and charging it to `portal_sync.consecutive_failures`
+    would pause the call sync for six hours over a CRM planner exception (§5.10).
+    """
+    try:
+        await work
+    except (_TerminalStop, FenceLost, BitrixError):
+        raise
+    except Exception:
+        log.exception("crm: lane raised", extra={"portal_id": visit.portal_id, "lane": name})
+        lane = visit.lanes.get(name)
+        if lane is not None:
+            visit.lanes[name] = crm_lanes.failed(lane, None, now=_utcnow(), reason="internal_error")
+            await _save_lanes(visit, name)
+
+
+async def _phase_crm_dict(visit: _Visit) -> None:
+    """§5.10: funnel and stage names, hourly, read with the installer's credential (G0 Q1)."""
+    await _guarded_crm(visit, crm_lanes.DICT, _run_crm_dict(visit))
+
+
+async def _run_crm_dict(visit: _Visit) -> None:
+    lane = _crm_lane_ready(visit, crm_lanes.DICT)
+    if lane is None:
+        return
+    dictionary = await _with_client(
+        visit,
+        CRM_STATUS_LIST,
+        lambda client: crm_dict.read_dictionary(client, pace=_pacer(visit)),
+    )
+    visit.crm_batches -= dictionary.batches
+    errors = _crm_lane_errors(visit, dictionary.errors)
+    now = _utcnow()
+    if errors:
+        _lane_trouble(visit, crm_lanes.DICT, errors, now=now)
+    elif dictionary.complete:
+        visit.lanes[crm_lanes.DICT] = crm_lanes.succeeded(
+            lane, now=now, due_at=now + dt.timedelta(seconds=settings.crm_dict_interval_sec)
+        )
+    # Otherwise a stop or a 429 interrupted the read: the lane stays due for the next visit.
+    await crm_dict.store_dictionary(
+        visit.fence, dictionary, now=now, lanes=[visit.lanes[crm_lanes.DICT]]
+    )
+
+
+async def _phase_crm_sweep(visit: _Visit) -> None:
+    """§5.10: re-read what changed, deals then leads, every CRM_SWEEP_INTERVAL_SEC."""
+    for entity in _CRM_ENTITIES:
+        await _guarded_crm(
+            visit, entity.sweep, _run_crm_sweep(visit, entity.sweep, entity.item, entity.legacy)
+        )
+
+
+async def _run_crm_sweep(
+    visit: _Visit, name: str, item: MirrorDialect, legacy: MirrorDialect
+) -> None:
+    lane = _crm_lane_ready(visit, name)
+    if lane is None:
+        return
+    start = crm_sweep.SweepCursor.from_json(lane.cursor, now=_utcnow())
+    method = _dialect(start.dialect, item, legacy).method
+    if method in visit.stopped_methods or _method_blocked(visit, method):
+        return
+    if not await _crm_within_share(visit, name, method, CRM_SWEEP_SHARE):
+        return
+    overlap = dt.timedelta(seconds=settings.crm_sweep_overlap_sec)
+
+    async def run(client: BitrixClient) -> None:
+        pace = _pacer(visit)
+        while visit.crm_batches > 0:
+            current = visit.lanes[name]
+            cursor = crm_sweep.SweepCursor.from_json(current.cursor, now=_utcnow())
+            dialect = _dialect(cursor.dialect, item, legacy)
+            if not await _crm_within_share(visit, name, dialect.method, CRM_SWEEP_SHARE):
+                return
+            read_at = _utcnow()
+            batch = await client.batch([crm_sweep.command(cursor, dialect, overlap=overlap)], halt=0)
+            visit.crm_batches -= 1
+            step = crm_sweep.apply(
+                cursor,
+                dialect,
+                batch,
+                overlap=overlap,
+                now=read_at,
+                utm_max_chars=settings.utm_value_max_chars,
+            )
+            now = _utcnow()
+            if step.error is not None:
+                if isinstance(step.error, MethodNotFound) and cursor.dialect == crm_backfill.DIALECT_ITEM:
+                    demoted = replace(
+                        cursor, dialect=crm_backfill.DIALECT_LEGACY, after_id=0, pass_started=None
+                    )
+                    visit.lanes[name] = replace(current, cursor=demoted.to_json())
+                    await _save_lanes(visit, name)
+                    visit.more = True
+                    return
+                errors = _crm_lane_errors(visit, [step.error])
+                if errors:
+                    _lane_trouble(visit, name, errors, now=now)
+                    await _save_lanes(visit, name)
+                return
+            if step.violation is not None:
+                visit.lanes[name] = crm_lanes.parked(current, _FILTER_UNSUPPORTED, now=now)
+                await _save_lanes(visit, name)
+                log.warning(
+                    "crm: the portal ignored a sweep filter; lane parked",
+                    extra={"portal_id": visit.portal_id, "lane": name, "detail": step.violation},
+                )
+                return
+            if step.pass_complete:
+                advanced = crm_lanes.succeeded(
+                    current,
+                    now=now,
+                    due_at=now + dt.timedelta(seconds=settings.crm_sweep_interval_sec),
+                    cursor=step.cursor.to_json(),
+                )
+            else:
+                advanced = replace(current, status=crm_lanes.ACTIVE, cursor=step.cursor.to_json())
+            visit.lanes[name] = advanced
+            await upsert_items(
+                visit.fence,
+                step.rows,
+                read_at=read_at,
+                lanes=[advanced],
+                rejected=[(dialect.entity_type_id, item_id, reason) for item_id, reason in step.rejected],
+            )
+            if step.pass_complete:
+                return
+            visit.more = True
+            if not await pace(step.time_block):
+                return
+
+    await _with_client(visit, method, run)
+
+
+async def _phase_crm_backfill(visit: _Visit) -> None:
+    """§5.10: newest-first history, deals then leads, until CRM_BATCHES_PER_VISIT is spent."""
+    for entity in _CRM_ENTITIES:
+        await _guarded_crm(
+            visit,
+            entity.backfill,
+            _run_crm_backfill(visit, entity.backfill, entity.item, entity.legacy),
+        )
+
+
+async def _run_crm_backfill(
+    visit: _Visit,
+    name: str,
+    item: MirrorDialect,
+    legacy: MirrorDialect,
+    *,
+    share: float = CRM_BACKFILL_SHARE,
+    repeat_after: dt.timedelta | None = None,
+) -> None:
+    """Walk an entity's id ranges newest first; `repeat_after` makes the walk a patrol cycle."""
+    lane = _crm_lane_ready(visit, name)
+    if lane is None:
+        return
+    method = _dialect(crm_backfill.BackfillCursor.from_json(lane.cursor).dialect, item, legacy).method
+    if method in visit.stopped_methods or _method_blocked(visit, method):
+        return
+    if not await _crm_within_share(visit, name, method, share):
+        return
+
+    async def run(client: BitrixClient) -> None:
+        pace = _pacer(visit)
+        while visit.crm_batches > 0:
+            current = visit.lanes[name]
+            cursor = crm_backfill.BackfillCursor.from_json(current.cursor)
+            dialect = _dialect(cursor.dialect, item, legacy)
+            if not await _crm_within_share(visit, name, dialect.method, share):
+                return
+            read_at = _utcnow()
+            rows: list[crm_items.ItemRow] = []
+            rejected: list[tuple[int | None, str]] = []
+            command_errors: list[BitrixError] = []
+            time_block: dict[str, Any] | None = None
+
+            if not cursor.headed:
+                batch = await client.batch([crm_items.high_id_command(dialect, "hi")], halt=0)
+                visit.crm_batches -= 1
+                answer = batch.commands[0] if batch.commands else None
+                time_block = throttle.merge_time_blocks(
+                    [batch.time, None if answer is None else answer.time]
+                )
+                high_id = None
+                if answer is not None and answer.error is not None:
+                    command_errors = [answer.error]
+                elif answer is not None:
+                    high_id = crm_backfill.read_high_id(answer.result, dialect)
+                if not command_errors and high_id is None:
+                    command_errors = [classify(None, description="hi: unexpected result shape")]
+                if high_id is not None:
+                    cursor = crm_backfill.headed(
+                        cursor,
+                        high_id,
+                        commands=settings.crm_batch_commands,
+                        max_width=settings.crm_backfill_range_max,
+                    )
+            else:
+                cursor = crm_backfill.plan(cursor, streams=settings.crm_batch_commands)
+                if cursor.open:
+                    outcome = await fetch_ranges(
+                        client,
+                        dialect,
+                        cursor.open,
+                        max_commands=settings.crm_batch_commands,
+                        utm_max_chars=settings.utm_value_max_chars,
+                    )
+                    if outcome is not None:
+                        visit.crm_batches -= 1
+                        time_block = outcome.time_block
+                        if outcome.filter_violation is not None:
+                            visit.lanes[name] = crm_lanes.parked(
+                                current, _FILTER_UNSUPPORTED, now=_utcnow()
+                            )
+                            await _save_lanes(visit, name)
+                            log.warning(
+                                "crm: the portal ignored a backfill filter; lane parked",
+                                extra={
+                                    "portal_id": visit.portal_id,
+                                    "lane": name,
+                                    "detail": outcome.filter_violation,
+                                },
+                            )
+                            return
+                        cursor = crm_backfill.settle(cursor, outcome.streams)
+                        rows, rejected = outcome.rows, outcome.rejected
+                        command_errors = [error for _index, error in outcome.errors]
+
+            now = _utcnow()
+            if (
+                command_errors
+                and all(isinstance(error, MethodNotFound) for error in command_errors)
+                and cursor.dialect == crm_backfill.DIALECT_ITEM
+            ):
+                # Same ids in either dialect, so the ranges already walked stay walked.
+                demoted = replace(cursor, dialect=crm_backfill.DIALECT_LEGACY)
+                visit.lanes[name] = replace(current, cursor=demoted.to_json())
+                await _save_lanes(visit, name)
+                visit.more = True
+                return
+            errors = _crm_lane_errors(visit, command_errors)
+            done, total = cursor.progress
+            if errors:
+                _lane_trouble(visit, name, errors, now=now, cursor=cursor.to_json())
+                advanced = replace(visit.lanes[name], progress_done=done, progress_total=total)
+            elif command_errors:
+                # Only 429s: the method is parked, the progress made is kept, the lane stays due.
+                advanced = replace(
+                    current,
+                    status=crm_lanes.ACTIVE,
+                    cursor=cursor.to_json(),
+                    progress_done=done,
+                    progress_total=total,
+                )
+            elif cursor.finished and repeat_after is not None:
+                # A patrol cycle is over; the next starts from a fresh head after the interval.
+                advanced = crm_lanes.succeeded(
+                    current,
+                    now=now,
+                    due_at=now + repeat_after,
+                    cursor=crm_backfill.BackfillCursor(dialect=cursor.dialect).to_json(),
+                    progress_done=done,
+                    progress_total=total,
+                )
+            else:
+                advanced = crm_lanes.succeeded(
+                    current,
+                    now=now,
+                    due_at=now,
+                    cursor=cursor.to_json(),
+                    status=crm_lanes.DONE if cursor.finished else crm_lanes.ACTIVE,
+                    progress_done=done,
+                    progress_total=total,
+                )
+            visit.lanes[name] = advanced
+            await upsert_items(
+                visit.fence,
+                rows,
+                read_at=read_at,
+                lanes=[advanced],
+                rejected=[(dialect.entity_type_id, item_id, reason) for item_id, reason in rejected],
+            )
+            if cursor.finished or command_errors:
+                return
+            visit.more = True
+            if not await pace(time_block):
+                return
+
+    await _with_client(visit, method, run)
+
+
+def _entity_dialect(visit: _Visit, entity: _CrmEntity) -> MirrorDialect:
+    """The dialect the entity's backfill already learned: legacy after a MethodNotFound."""
+    lane = visit.lanes.get(entity.backfill)
+    name = (
+        crm_backfill.BackfillCursor.from_json(lane.cursor).dialect
+        if lane is not None
+        else crm_backfill.DIALECT_ITEM
+    )
+    return _dialect(name, entity.item, entity.legacy)
+
+
+def _crm_next_wake(visit: _Visit) -> dt.datetime | None:
+    """The earliest lane that could do work, skipping those still waiting for their history.
+
+    A reconcile or patrol lane is due from the moment it is created, and counting it before its
+    backfill is done would bring every visit of a portal still loading history - or of one
+    whose leads are off - forward to two seconds for work the lane will refuse.
+    """
+    ready: list[crm_lanes.Lane] = []
+    for lane in visit.lanes.values():
+        prerequisite = _CRM_PREREQUISITES.get(lane.name)
+        if prerequisite is not None:
+            gate = visit.lanes.get(prerequisite)
+            if gate is None or gate.status != crm_lanes.DONE:
+                continue
+        ready.append(lane)
+    return crm_lanes.next_wake(ready)
+
+
+async def _phase_crm_dirty(visit: _Visit) -> None:
+    """§5.12: re-read queued ids, confirm what is missing, tombstone behind the guards."""
+    await _guarded_crm(visit, crm_lanes.DIRTY, _run_crm_dirty(visit))
+
+
+async def _run_crm_dirty(visit: _Visit) -> None:
+    lane = _crm_lane_ready(visit, crm_lanes.DIRTY)
+    if lane is None:
+        return
+    verified = visit.token_admin_verified_at
+    allow_deletes = (
+        verified is not None and _utcnow() - verified <= crm_dirty_refresh.ADMIN_FRESHNESS
+    )
+    backlog = False
+    for entity in _CRM_ENTITIES:
+        dialect = _entity_dialect(visit, entity)
+        method = dialect.method
+        if visit.crm_batches <= 0:
+            backlog = True
+            break
+        if method in visit.stopped_methods or _method_blocked(visit, method):
+            continue
+        if not await _crm_within_share(visit, crm_lanes.DIRTY, method, CRM_SWEEP_SHARE):
+            return
+        async with tenant_txn(visit.portal_id) as session:
+            items = await crm_dirty.due(
+                session,
+                visit.portal_id,
+                dialect.entity_type_id,
+                now=_utcnow(),
+                limit=crm_dirty_refresh.MAX_IDS_PER_PASS,
+            )
+        if not items:
+            continue
+
+        async def refresh(
+            client: BitrixClient,
+            dialect: MirrorDialect = dialect,
+            items: list[crm_dirty.DirtyId] = items,
+        ) -> crm_dirty_refresh.RefreshOutcome:
+            return await crm_dirty_refresh.refresh(
+                client,
+                dialect,
+                items,
+                utm_max_chars=settings.utm_value_max_chars,
+                pace=_pacer(visit),
+                max_batches=visit.crm_batches,
+                now=_utcnow(),
+            )
+
+        outcome = await _with_client(visit, method, refresh)
+        visit.crm_batches -= outcome.batches
+        await upsert_items(
+            visit.fence,
+            outcome.rows,
+            read_at=outcome.read_at,
+            consume=outcome.present,
+            rejected=[(dialect.entity_type_id, item_id, reason) for item_id, reason in outcome.rejected],
+        )
+        await crm_dirty_refresh.store_refresh(
+            visit.fence,
+            dialect.entity_type_id,
+            outcome,
+            allow_deletes=allow_deletes,
+            now=_utcnow(),
+        )
+        # Stored first, judged second: a 503 or a dead credential still ends the visit, but
+        # not before what this pass learned is kept. Lane-local errors are the deferred ids.
+        _crm_lane_errors(visit, outcome.errors)
+        backlog = backlog or len(items) >= crm_dirty_refresh.MAX_IDS_PER_PASS
+
+    now = _utcnow()
+    due_at = now if backlog else now + dt.timedelta(seconds=settings.crm_sweep_interval_sec)
+    visit.lanes[crm_lanes.DIRTY] = crm_lanes.succeeded(lane, now=now, due_at=due_at)
+    await _save_lanes(visit, crm_lanes.DIRTY)
+    visit.more = visit.more or backlog
+
+
+async def _phase_crm_reconcile(visit: _Visit) -> None:
+    """§5.12: once a day, find the ids on which the mirror and the portal disagree."""
+    for entity in _CRM_ENTITIES:
+        await _guarded_crm(visit, entity.reconcile, _run_crm_reconcile(visit, entity))
+
+
+async def _run_crm_reconcile(visit: _Visit, entity: _CrmEntity) -> None:
+    name = entity.reconcile
+    lane = _crm_lane_ready(visit, name)
+    backfill = visit.lanes.get(entity.backfill)
+    if lane is None or backfill is None or backfill.status != crm_lanes.DONE:
+        return
+    dialect = _entity_dialect(visit, entity)
+    method = dialect.method
+    if method in visit.stopped_methods or _method_blocked(visit, method):
+        return
+    if not await _crm_within_share(visit, name, method, CRM_BACKFILL_SHARE):
+        return
+    interval = dt.timedelta(seconds=settings.crm_reconcile_interval_sec)
+
+    initial = crm_reconcile.ReconcileCursor.from_json(lane.cursor)
+    if not initial.started:
+        async with tenant_txn(visit.portal_id) as session:
+            high_id = await crm_reconcile.local_high_id(session, dialect.entity_type_id)
+        now = _utcnow()
+        if high_id == 0:
+            visit.lanes[name] = crm_lanes.succeeded(lane, now=now, due_at=now + interval, cursor={})
+            await _save_lanes(visit, name)
+            return
+        started = crm_reconcile.start(initial, high_id, ranges=settings.crm_batch_commands)
+        visit.lanes[name] = replace(lane, status=crm_lanes.ACTIVE, cursor=started.to_json())
+
+    async def run(client: BitrixClient) -> None:
+        pace = _pacer(visit)
+        while visit.crm_batches > 0:
+            current = visit.lanes[name]
+            state = crm_reconcile.ReconcileCursor.from_json(current.cursor)
+            if state.finished:
+                now = _utcnow()
+                visit.lanes[name] = crm_lanes.succeeded(
+                    current, now=now, due_at=now + interval, cursor={}, progress_done=state.marked
+                )
+                await _save_lanes(visit, name)
+                return
+            if not await _crm_within_share(visit, name, method, CRM_BACKFILL_SHARE):
+                return
+
+            local_only: set[int] = set()
+            remote_only: set[int] = set()
+            command_errors: list[BitrixError] = []
+            time_block: dict[str, Any] | None = None
+            if state.queue:
+                ranges = list(state.queue[: settings.crm_batch_commands])
+                commands = crm_reconcile.count_commands(dialect, ranges)
+                batch = await client.batch(commands, halt=0)
+                visit.crm_batches -= 1
+                time_block = throttle.merge_time_blocks(
+                    [batch.time, *(answer.time for answer in batch.commands)]
+                )
+                remote, command_errors = crm_reconcile.read_counts(batch, commands)
+                if remote is not None:
+                    async with tenant_txn(visit.portal_id) as session:
+                        local = await crm_reconcile.local_counts(
+                            session, dialect.entity_type_id, ranges
+                        )
+                    state = crm_reconcile.after_counts(state, ranges, local, remote)
+            else:
+                leaves = state.leaves[: settings.crm_batch_commands]
+                streams = [RangeStream(lo=lo, hi=hi, cursor=after) for lo, hi, after in leaves]
+                outcome = await fetch_ranges(
+                    client,
+                    dialect,
+                    streams,
+                    max_commands=len(streams),
+                    utm_max_chars=settings.utm_value_max_chars,
+                    ids_only=True,
+                )
+                if outcome is not None:
+                    visit.crm_batches -= 1
+                    time_block = outcome.time_block
+                    if outcome.filter_violation is not None:
+                        visit.lanes[name] = crm_lanes.parked(current, _FILTER_UNSUPPORTED, now=_utcnow())
+                        await _save_lanes(visit, name)
+                        log.warning(
+                            "crm: the portal ignored a reconcile filter; lane parked",
+                            extra={
+                                "portal_id": visit.portal_id,
+                                "lane": name,
+                                "detail": outcome.filter_violation,
+                            },
+                        )
+                        return
+                    failed = {index for index, _error in outcome.errors}
+                    command_errors = [error for _index, error in outcome.errors]
+                    remaining: list[tuple[int, int, int]] = []
+                    async with tenant_txn(visit.portal_id) as session:
+                        for index, (before, after) in enumerate(
+                            zip(streams, outcome.streams, strict=True)
+                        ):
+                            if index in failed:
+                                remaining.append((before.lo, before.hi, before.cursor))
+                                continue
+                            upto = after.hi - 1 if after.done else after.cursor
+                            listed = {row.id for row in outcome.rows if before.cursor < row.id <= upto}
+                            stored = await crm_reconcile.local_ids(
+                                session, dialect.entity_type_id, after_id=before.cursor, upto=upto
+                            )
+                            local_only |= stored - listed
+                            remote_only |= listed - stored
+                            if not after.done:
+                                remaining.append((after.lo, after.hi, after.cursor))
+                    state = replace(
+                        state,
+                        leaves=tuple(remaining) + state.leaves[len(leaves) :],
+                        marked=state.marked + len(local_only) + len(remote_only),
+                    )
+                else:
+                    state = replace(state, leaves=state.leaves[len(leaves) :])
+
+            lane_errors = _crm_lane_errors(visit, command_errors)
+            now = _utcnow()
+            if lane_errors:
+                _lane_trouble(visit, name, lane_errors, now=now, cursor=state.to_json())
+            else:
+                visit.lanes[name] = replace(current, status=crm_lanes.ACTIVE, cursor=state.to_json())
+            to_store = [visit.lanes[name]]
+            dirty = visit.lanes.get(crm_lanes.DIRTY)
+            if (local_only or remote_only) and dirty is not None:
+                visit.lanes[crm_lanes.DIRTY] = replace(dirty, due_at=now)
+                to_store.append(visit.lanes[crm_lanes.DIRTY])
+            await crm_reconcile.store_marks(
+                visit.fence,
+                dialect.entity_type_id,
+                local_only=local_only,
+                remote_only=remote_only,
+                now=now,
+                lanes=to_store,
+            )
+            if command_errors:
+                return
+            visit.more = True
+            if not await pace(time_block):
+                return
+
+    await _with_client(visit, method, run)
+
+
+async def _phase_crm_patrol(visit: _Visit) -> None:
+    """§5.12: re-read every mirrored record on a weekly cycle, for edits that bump nothing."""
+    for entity in _CRM_ENTITIES:
+        await _guarded_crm(visit, entity.patrol, _run_crm_patrol(visit, entity))
+
+
+async def _run_crm_patrol(visit: _Visit, entity: _CrmEntity) -> None:
+    lane = _crm_lane_ready(visit, entity.patrol)
+    backfill = visit.lanes.get(entity.backfill)
+    if lane is None or backfill is None or backfill.status != crm_lanes.DONE:
+        return
+    interval = dt.timedelta(seconds=settings.crm_patrol_interval_sec)
+    if lane.last_clean_at is None and not lane.cursor:
+        # The backfill has just read everything; the first patrol is owed a cycle after it.
+        first = (backfill.last_clean_at or _utcnow()) + interval
+        if first > _utcnow():
+            visit.lanes[entity.patrol] = replace(lane, due_at=first)
+            await _save_lanes(visit, entity.patrol)
+            return
+    await _run_crm_backfill(
+        visit,
+        entity.patrol,
+        entity.item,
+        entity.legacy,
+        share=CRM_BACKFILL_SHARE,
+        repeat_after=interval,
+    )
+
+
+#: §5.9's order, extended by the CRM mirror: refresh_requested -> head_fetch -> incremental ->
+#: backfill -> rescan -> recheck -> CRM dictionary -> CRM sweeps -> CRM backfills -> employees
+#: -> app.info + user.admin. The CRM lanes run before the employee refresh so an assignee they
+#: placeholder is named in the same visit. Each phase is paired with the method whose budget it
+#: spends, which is what lets a stop skip a phase and not a visit.
 _PHASES: Final[tuple[tuple[str, Callable[[_Visit], Awaitable[None]]], ...]] = (
     (STATISTIC_METHOD, _phase_refresh_requested),
     (STATISTIC_METHOD, _phase_head_fetch),
@@ -868,6 +1639,12 @@ _PHASES: Final[tuple[tuple[str, Callable[[_Visit], Awaitable[None]]], ...]] = (
     (STATISTIC_METHOD, _phase_backfill),
     (STATISTIC_METHOD, _phase_rescan),
     (STATISTIC_METHOD, _phase_recheck),
+    (CRM_STATUS_LIST, _phase_crm_dict),
+    (crm_items.CRM_ITEM_LIST, _phase_crm_sweep),
+    (crm_items.CRM_ITEM_LIST, _phase_crm_dirty),
+    (crm_items.CRM_ITEM_LIST, _phase_crm_backfill),
+    (crm_items.CRM_ITEM_LIST, _phase_crm_reconcile),
+    (crm_items.CRM_ITEM_LIST, _phase_crm_patrol),
     (USER_GET, _phase_employees),
     (APP_INFO_METHOD, _phase_daily_probe),
 )
@@ -1045,6 +1822,12 @@ async def _close_visit(
         due = now + dt.timedelta(seconds=BACKFILL_YIELD_SECONDS)
     else:
         due = now + dt.timedelta(seconds=settings.sync_interval_sec)
+    if visit.crm_active:
+        # A CRM lane due sooner - a sweep, a lane whose back-off ends - brings the visit
+        # forward; the statistics phases stay behind their own due checks when it comes.
+        wake = _crm_next_wake(visit)
+        if wake is not None and wake < due:
+            due = max(wake, now + dt.timedelta(seconds=BACKFILL_YIELD_SECONDS))
 
     if visit.decision is not None:
         decision = visit.decision  # the operating-time guard already decided
@@ -1270,6 +2053,15 @@ async def _run_purge(portal_id: int) -> None:
         log.exception("purge: job crashed", extra={"portal_id": portal_id})
 
 
+async def _run_crm_purge(portal_id: int) -> None:
+    try:
+        await purge_crm(portal_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("crm purge: job crashed", extra={"portal_id": portal_id})
+
+
 async def tick() -> None:
     """The 15 s heartbeat of §5.9: lease what is due, dispatch it, then one purge.
 
@@ -1305,6 +2097,28 @@ async def tick() -> None:
     if pending is not None:
         portal_id = int(pending)
         _spawn(_purging, portal_id, _run_purge(portal_id), "purge_portal")
+        return
+
+    # (c) the same slot for a CRM-only purge (an administrator turned CRM analytics off),
+    # after uninstalls: an uninstall owes every table, and a portal that is both waiting for
+    # the whole-portal purge and for this one is emptied by the whole-portal one.
+    async with control_txn() as session:
+        crm_pending = (
+            await session.execute(
+                select(Portal.id)
+                .outerjoin(PortalSync, PortalSync.portal_id == Portal.id)
+                .where(
+                    Portal.crm_purge_pending.is_(True),
+                    Portal.purge_pending.is_(False),
+                    outside_incomplete_cooldown(),
+                )
+                .order_by(Portal.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if crm_pending is not None:
+        portal_id = int(crm_pending)
+        _spawn(_purging, portal_id, _run_crm_purge(portal_id), "purge_crm")
 
 
 async def purge_portal(portal_id: int) -> None:
@@ -1331,6 +2145,11 @@ async def purge_portal(portal_id: int) -> None:
     )
 
 
+async def purge_crm(portal_id: int) -> None:
+    """Delete one portal's CRM mirror after CRM analytics was turned off, verified (§5.12)."""
+    await purge_crm_data(portal_id)
+
+
 async def purge_rest_log() -> None:
     """Daily `rest_log` retention (§6). `config.py` refuses a window below 3 days."""
     await _purge_rest_log_rows()
@@ -1339,6 +2158,11 @@ async def purge_rest_log() -> None:
 async def purge_crm_contexts() -> None:
     """Daily `crm_contexts` retention (§6), portal by portal because of RLS."""
     await _purge_crm_context_rows()
+
+
+async def purge_crm_retention() -> None:
+    """Daily CRM mirror retention (§5.12): forget old tombstones, evict the long unreadable."""
+    await _purge_crm_retention_rows()
 
 
 async def sweep_inferred_uninstalls() -> None:
@@ -1411,7 +2235,9 @@ JOBS: Final[dict[str, Callable[..., Awaitable[None]]]] = {
     "tick": tick,
     "sync_portal": sync_portal,
     "purge_portal": purge_portal,
+    "purge_crm": purge_crm,
     "purge_rest_log": purge_rest_log,
     "purge_crm_contexts": purge_crm_contexts,
+    "purge_crm_retention": purge_crm_retention,
     "sweep_inferred_uninstalls": sweep_inferred_uninstalls,
 }

@@ -411,3 +411,19 @@ async def test_cursor_values_land_with_the_rows(
     for column, value in cursor.items():
         assert sync[column] == value
     assert bx_ids(await call_rows(portal.portal_id, "bx_id")) == [80, 81]
+
+
+async def test_a_value_too_long_for_its_column_is_quarantined_not_raised(
+    leased: tuple[SeededPortal, Fence],
+) -> None:
+    """asyncpg reports `value too long for type character varying` as a bare DBAPIError,
+    not DataError, so a check on the type alone let this row fail the whole visit - on every
+    visit, since the next one re-reads the same page (`row_fault`)."""
+    portal, fence = leased
+    rows = parsed(raw_row(30), raw_row(31), raw_row(32))
+    rows[1]["phone_number"] = "9" * 300  # phone_number is varchar(128)
+
+    result = await upsert_calls(fence, rows)
+
+    assert result.quarantined == 1
+    assert bx_ids(await call_rows(portal.portal_id, "bx_id")) == [30, 32]

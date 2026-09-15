@@ -15,8 +15,8 @@ the release ships, whether or not an administrator has seen the notice. This rep
 
 | Portal | Who sees it | Where |
 | --- | --- | --- |
-| Installed before the CRM mirror release | Administrators only | A banner until dismissed, and a block in settings |
-| Installed after the release | The installing administrator | Install screen and settings |
+| Installed before the CRM mirror release | Administrators only | A banner on the dashboard until each one dismisses it, and a block in settings |
+| Installed after the release | Administrators only | The same banner and settings block. The install page closes the slider at once, so text there would flash past unread; section 5 is the short form for places with one line of room |
 
 Employees who are not administrators see nothing new.
 
@@ -101,7 +101,7 @@ Employees who are not administrators see nothing new.
 > CRM analytics is on. The app keeps a copy of a minimal set of CRM data, listed in
 > section 2 of the privacy policy. [Turn off CRM analytics]
 
-## 5. Install screen (new installs)
+## 5. Short form (one line of room)
 
 **ru**
 

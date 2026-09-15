@@ -211,9 +211,23 @@ async def me(principal: Principal = Depends(get_principal)) -> JSONResponse:
             "importing": (sync.backfill_status if sync else "pending") in _IMPORTING,
             "last_incremental_at": _isoformat(sync.last_incremental_at if sync else None),
         },
+        # §4.14 / D-7. Every viewer needs `analytics_enabled`: the Deals and Sources pages
+        # render "turned off" from it instead of asking Bitrix24 for a token first.
+        "crm": {
+            "analytics_enabled": portal.crm_opt_out_at is None,
+            "mode": portal.crm_mode,
+            # The notice informs and gates nothing; an administrator sees it until dismissed.
+            "notice_visible": bool(
+                principal.is_admin
+                and portal.crm_opt_out_at is None
+                and principal.user_id not in (portal.crm_notice_dismissed_by or [])
+            ),
+        },
     }
     if principal.is_admin:
         body["sync"]["last_error_code"] = sync.last_error_code if sync else None
+        body["crm"]["opted_out_at"] = _isoformat(portal.crm_opt_out_at)
+        body["crm"]["purge_pending"] = bool(portal.crm_purge_pending)
     return JSONResponse(body)
 
 

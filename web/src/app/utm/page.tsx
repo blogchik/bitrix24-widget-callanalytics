@@ -106,18 +106,20 @@ export default function UtmPage() {
   const [showPercent, setShowPercent] = useState(false);
 
   const timezone = me.data?.timezone ?? 'UTC';
+  // D-7: with CRM analytics turned off the report is closed, so nothing is fetched for it.
+  const crmOff = me.data?.crm?.analytics_enabled === false;
 
   useEffect(() => {
-    if (!me.data || filters) {
+    if (!me.data || filters || crmOff) {
       return;
     }
     const base = defaultFilters(timezone);
     const range = rangeForPreset(DEFAULT_PRESET, timezone);
     setFilters({ ...base, preset: DEFAULT_PRESET, from: range.from, to: range.to });
-  }, [filters, me.data, timezone]);
+  }, [crmOff, filters, me.data, timezone]);
 
   useEffect(() => {
-    if (!me.data || me.data.access === 'denied') {
+    if (!me.data || me.data.access === 'denied' || crmOff) {
       return;
     }
     let cancelled = false;
@@ -133,7 +135,7 @@ export default function UtmPage() {
     return () => {
       cancelled = true;
     };
-  }, [me.data]);
+  }, [crmOff, me.data]);
 
   const report = useUtm(filters, employees);
   const data = report.data;
@@ -190,6 +192,11 @@ export default function UtmPage() {
   if (me.data.access === 'denied') {
     return (
       <StateCard kind="denied" title={t('state.denied.title')} body={t(deniedBodyKey(me.data))} />
+    );
+  }
+  if (crmOff) {
+    return (
+      <StateCard kind="crm_off" title={t('state.crm_off.title')} body={t('state.crm_off.body')} />
     );
   }
 

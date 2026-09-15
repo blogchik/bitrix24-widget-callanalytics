@@ -46,9 +46,18 @@ from sqlalchemy.sql import Select, func
 from sqlalchemy.sql.selectable import NamedFromClause
 
 from app.config import settings
-from app.db.models import Base, CrmContext, Portal, PortalSync, RestLog
+from app.db.models import (
+    CRM_ITEM_DATA_COLUMNS,
+    Base,
+    CrmContext,
+    CrmItem,
+    CrmLane,
+    Portal,
+    PortalSync,
+    RestLog,
+)
 from app.db.session import control_txn, tenant_txn
-from app.db.tenancy import TENANT_TABLES
+from app.db.tenancy import CRM_TENANT_TABLES, TENANT_TABLES
 from app.logging import get_logger
 from app.services.portals import record_event
 
@@ -58,6 +67,8 @@ __all__ = [
     "PurgeOutcome",
     "outside_incomplete_cooldown",
     "purge_crm_contexts",
+    "purge_crm_data",
+    "purge_crm_retention",
     "purge_portal_data",
     "purge_rest_log",
     "redact_on_clean",
@@ -71,6 +82,13 @@ CHUNK_ROWS: Final[int] = 10_000
 #: §5.7 does not apply here; §6 fixes 30 days for the resolved-CRM cache.
 CRM_CONTEXT_MAX_AGE_DAYS: Final[int] = 30
 
+#: Privacy policy section 5 (G0 Q4): a deleted record's id is kept this long, then forgotten.
+CRM_TOMBSTONE_DAYS: Final[int] = 35
+
+#: Privacy policy section 5: a record the installer can no longer read loses its values after
+#: this long (§5.12 hides it from reports after 7 days already).
+CRM_UNREADABLE_EVICT_DAYS: Final[int] = 30
+
 #: A `purge_incomplete` leaves `purge_pending = true`, and §5.9's tick picks purge work
 #: with `SELECT id FROM portals WHERE purge_pending LIMIT 1` on every visit. Without a
 #: cooldown, a purge that cannot make progress (a lock it never wins, a policy
@@ -83,6 +101,11 @@ INCOMPLETE_RETRY_SECONDS: Final[int] = 3600
 #: there is purged on uninstall without anyone remembering to edit this module.
 _TENANT_TABLES: Final[tuple[Table, ...]] = tuple(
     Base.metadata.tables[name] for name in TENANT_TABLES
+)
+
+#: The CRM mirror's tables, same registry: what turning CRM analytics off deletes.
+_CRM_TABLES: Final[tuple[Table, ...]] = tuple(
+    Base.metadata.tables[name] for name in CRM_TENANT_TABLES
 )
 
 #: Guard against an unbounded loop if a delete keeps reporting rows it never removes.
@@ -262,48 +285,7 @@ async def purge_portal_data(portal_id: int, *, force: bool = False) -> PurgeOutc
             ).scalar_one_or_none()
         )
 
-    pre_counts: dict[str, int] = {}
-    deleted: dict[str, int] = {}
-    incomplete = False
-
-    for table in _TENANT_TABLES:
-        pre_counts[table.name] = await _count(table, portal_id)
-        removed = 0
-        first_chunk: int | None = None
-        for _ in range(_MAX_CHUNKS):
-            # A FRESH transaction per chunk: `SET LOCAL app.portal_id` dies with the
-            # transaction that issued it, so reusing one session across commits would
-            # leave every chunk after the first running with no tenant context - and
-            # deleting nothing, silently (§3 decision 8).
-            async with tenant_txn(portal_id) as session:
-                result = await session.execute(_chunk_delete(table, portal_id))
-            rows = int(cast("CursorResult[Any]", result).rowcount or 0)
-            if first_chunk is None:
-                first_chunk = rows
-            removed += rows
-            if rows == 0:
-                break
-        else:
-            log.error(
-                "purge: chunk limit reached, giving up this visit",
-                extra={"portal_id": portal_id, "table": table.name, "deleted": removed},
-            )
-            incomplete = True
-
-        deleted[table.name] = removed
-        if pre_counts[table.name] > 0 and not first_chunk:
-            # The §5.9 assertion: rows were visible a moment ago and the delete matched
-            # none of them. Something took our tenant context away; reporting "done"
-            # here is the exact failure this whole module is shaped to prevent.
-            log.error(
-                "purge: rows exist but the first DELETE matched nothing",
-                extra={
-                    "portal_id": portal_id,
-                    "table": table.name,
-                    "pre_count": pre_counts[table.name],
-                },
-            )
-            incomplete = True
+    pre_counts, deleted, incomplete = await _delete_verified(portal_id, _TENANT_TABLES)
 
     final_counts = {table.name: await _count(table, portal_id) for table in _TENANT_TABLES}
     live_rows_after_reinstall = False
@@ -352,6 +334,117 @@ async def purge_portal_data(portal_id: int, *, force: bool = False) -> PurgeOutc
         bodies_redacted=bodies_redacted,
     )
     await _finish(outcome)
+    return outcome
+
+
+async def _delete_verified(
+    portal_id: int, tables: Sequence[Table]
+) -> tuple[dict[str, int], dict[str, int], bool]:
+    """Rules 1 and 2 over `tables`: `(pre-counts, deleted, incomplete)`."""
+    pre_counts: dict[str, int] = {}
+    deleted: dict[str, int] = {}
+    incomplete = False
+
+    for table in tables:
+        pre_counts[table.name] = await _count(table, portal_id)
+        removed = 0
+        first_chunk: int | None = None
+        for _ in range(_MAX_CHUNKS):
+            # A FRESH transaction per chunk: `SET LOCAL app.portal_id` dies with the
+            # transaction that issued it, so reusing one session across commits would
+            # leave every chunk after the first running with no tenant context - and
+            # deleting nothing, silently (§3 decision 8).
+            async with tenant_txn(portal_id) as session:
+                result = await session.execute(_chunk_delete(table, portal_id))
+            rows = int(cast("CursorResult[Any]", result).rowcount or 0)
+            if first_chunk is None:
+                first_chunk = rows
+            removed += rows
+            if rows == 0:
+                break
+        else:
+            log.error(
+                "purge: chunk limit reached, giving up this visit",
+                extra={"portal_id": portal_id, "table": table.name, "deleted": removed},
+            )
+            incomplete = True
+
+        deleted[table.name] = removed
+        if pre_counts[table.name] > 0 and not first_chunk:
+            # The §5.9 assertion: rows were visible a moment ago and the delete matched
+            # none of them. Something took our tenant context away; reporting "done"
+            # here is the exact failure this whole module is shaped to prevent.
+            log.error(
+                "purge: rows exist but the first DELETE matched nothing",
+                extra={
+                    "portal_id": portal_id,
+                    "table": table.name,
+                    "pre_count": pre_counts[table.name],
+                },
+            )
+            incomplete = True
+
+    return pre_counts, deleted, incomplete
+
+
+async def purge_crm_data(portal_id: int, *, force: bool = False) -> PurgeOutcome:
+    """Delete one portal's CRM mirror after its administrator turned CRM analytics off - and PROVE it.
+
+    The three rules of `purge_portal_data`, over `CRM_TENANT_TABLES` only: calls, employees
+    and the CRM tab contexts stay, because the administrator switched off one feature, not the
+    app. The final count is strict with no exception: while `crm_purge_pending` is set the
+    worker mirrors nothing (`jobs/definitions.py::_crm_active`), so a row after the deletes
+    has no legitimate author.
+
+    On success `crm_purge_pending` is cleared and the lanes are forgotten, so turning CRM
+    analytics back on rebuilds the mirror from nothing. A failure leaves the flag set and
+    reuses the `purge_incomplete` cooldown, so the tick retries it paced.
+    """
+    if not force and await _recently_failed(portal_id):
+        return PurgeOutcome(portal_id=portal_id, skipped=True)
+
+    pre_counts, deleted, incomplete = await _delete_verified(portal_id, _CRM_TABLES)
+    final_counts = {table.name: await _count(table, portal_id) for table in _CRM_TABLES}
+    if any(final_counts.values()):
+        incomplete = True
+    outcome = PurgeOutcome(
+        portal_id=portal_id,
+        pre_counts=pre_counts,
+        deleted=deleted,
+        final_counts=final_counts,
+        incomplete=incomplete,
+    )
+    details: dict[str, Any] = {
+        "pre_counts": pre_counts,
+        "deleted": deleted,
+        "final_counts": final_counts,
+    }
+    async with control_txn() as session:
+        if incomplete:
+            await session.execute(
+                update(PortalSync)
+                .where(PortalSync.portal_id == portal_id)
+                .values(
+                    last_error_code=_PURGE_INCOMPLETE,
+                    last_error_text="CRM purge could not prove the CRM tables are empty",
+                    last_error_at=func.now(),
+                )
+            )
+            await record_event(session, portal_id, "crm_purge_incomplete", details=details)
+        else:
+            await session.execute(
+                update(Portal).where(Portal.id == portal_id).values(crm_purge_pending=False)
+            )
+            await session.execute(delete(CrmLane).where(CrmLane.portal_id == portal_id))
+            await record_event(session, portal_id, "crm_purge_done", details=details)
+    log.info(
+        "crm purge: finished",
+        extra={
+            "portal_id": portal_id,
+            "deleted": outcome.total_deleted,
+            "incomplete": incomplete,
+        },
+    )
     return outcome
 
 
@@ -509,3 +602,53 @@ async def purge_crm_contexts() -> int:
     if removed:
         log.info("crm_contexts purge", extra={"deleted": removed, "cutoff": cutoff.isoformat()})
     return removed
+
+
+async def purge_crm_retention() -> tuple[int, int]:
+    """Daily CRM mirror retention (§5.12, privacy policy section 5): `(forgotten, evicted)`.
+
+    * a tombstone older than 35 days is deleted outright - the id has done its job of keeping
+      an old page from re-importing the record;
+    * a live record unreadable for 30 days loses its values and becomes an `evicted` tombstone,
+      which a later successful read may restore and which is itself forgotten 35 days later.
+
+    Portal by portal under tenant context, for the reason `purge_crm_contexts` gives.
+    """
+    now = dt.datetime.now(dt.UTC)
+    forget_before = now - dt.timedelta(days=CRM_TOMBSTONE_DAYS)
+    evict_before = now - dt.timedelta(days=CRM_UNREADABLE_EVICT_DAYS)
+    table = cast("Table", CrmItem.__table__)
+    evicted_values: dict[str, Any] = dict.fromkeys(CRM_ITEM_DATA_COLUMNS)
+    evicted_values.update(deleted_at=now, delete_reason="evicted", content_changed_at=now)
+
+    forgotten = 0
+    evicted = 0
+    for portal_id in await _portal_ids():
+        for _ in range(_MAX_CHUNKS):
+            async with tenant_txn(portal_id) as session:
+                result = await session.execute(
+                    _chunk_delete(
+                        table,
+                        portal_id,
+                        extra=lambda victim: victim.c.deleted_at < forget_before,
+                    )
+                )
+            rows = int(cast("CursorResult[Any]", result).rowcount or 0)
+            forgotten += rows
+            if rows == 0:
+                break
+        async with tenant_txn(portal_id) as session:
+            result = await session.execute(
+                update(CrmItem)
+                .where(
+                    CrmItem.portal_id == portal_id,
+                    CrmItem.deleted_at.is_(None),
+                    CrmItem.unreadable_since < evict_before,
+                )
+                .values(**evicted_values)
+                .execution_options(synchronize_session=False)
+            )
+        evicted += int(cast("CursorResult[Any]", result).rowcount or 0)
+    if forgotten or evicted:
+        log.info("crm retention", extra={"forgotten": forgotten, "evicted": evicted})
+    return forgotten, evicted

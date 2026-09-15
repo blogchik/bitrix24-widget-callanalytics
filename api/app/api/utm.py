@@ -117,6 +117,9 @@ async def utm(request: Request, principal: Principal = Depends(get_principal)) -
         return JSONResponse({"code": "viewer_token_required"}, status_code=409)
 
     portal = await _active_portal(principal.portal_id)
+    if portal.crm_opt_out_at is not None:
+        # An administrator turned CRM analytics off; see `api/deals.py` - the same rule.
+        return JSONResponse({"code": "crm_analytics_off"}, status_code=409)
 
     try:
         report = await load_utm_report(

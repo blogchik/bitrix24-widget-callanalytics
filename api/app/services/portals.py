@@ -34,7 +34,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func, text
 
-from app.db.models import Portal, PortalEvent, PortalSync, SyncMethodBudget
+from app.db.models import CrmLane, Portal, PortalEvent, PortalSync, SyncMethodBudget
 from app.logging import get_logger
 from app.security.crypto import DecryptionError, decrypt, encrypt
 
@@ -46,17 +46,24 @@ if TYPE_CHECKING:
     from app.bitrix.oauth import TokenResponse
 
 __all__ = [
+    "CRM_MODES",
     "CredentialWriteRefused",
     "InstallOutcome",
     "clear_credentials",
     "decrypt_portal_token",
+    "dismiss_crm_notice",
     "get_portal_by_member_id",
     "mark_uninstalled",
     "record_event",
     "record_placements",
+    "set_crm_analytics",
+    "set_crm_mode",
     "set_token_status",
     "store_portal_credential",
 ]
+
+#: `portals_crm_mode_chk` (0004, §4.14).
+CRM_MODES: Final[tuple[str, ...]] = ("off", "sync", "shadow", "mirror")
 
 log = get_logger(__name__)
 
@@ -306,6 +313,9 @@ async def store_portal_credential(
         await session.execute(
             delete(SyncMethodBudget).where(SyncMethodBudget.portal_id == portal_id)
         )
+        # The CRM lanes describe mirror rows that a new install does not have (they are
+        # purged on uninstall), so the mirror is rebuilt from nothing, like the call cursors.
+        await session.execute(delete(CrmLane).where(CrmLane.portal_id == portal_id))
     await session.execute(
         pg_insert(PortalSync)
         .values(sync_generation=1, **sync_values)
@@ -534,5 +544,105 @@ async def mark_uninstalled(
         )
     )
     await session.execute(delete(SyncMethodBudget).where(SyncMethodBudget.portal_id == portal_id))
+    await session.execute(delete(CrmLane).where(CrmLane.portal_id == portal_id))
     await record_event(session, portal_id, kind, user_id=user_id, details=details)
     return True
+
+
+async def set_crm_analytics(
+    session: AsyncSession, portal_id: int, *, enabled: bool, user_id: int
+) -> bool:
+    """An administrator's CRM analytics switch (D-7, docs/crm-mirror-notice.md).
+
+    Returns whether anything changed; switching to the state a portal is already in is a
+    no-op, so a double click writes one audit event, not two.
+
+    **Off** stamps the opt-out, pins `crm_mode='off'` (`portals_crm_opt_out_chk`), queues the
+    CRM-only purge and forgets the lanes. It also raises the fence `mark_uninstalled` raises -
+    `sync_generation + 1` with the lease cleared - because a visit already reading CRM when the
+    switch is pressed must not be able to write a row after the purge has emptied the tables.
+
+    **On** clears the stamp and returns to `crm_mode='sync'`. `crm_purge_pending` is left as it
+    is: while it is set the worker mirrors nothing (`jobs/definitions.py::_crm_active`), so a
+    purge still running finishes first and the mirror is rebuilt from nothing afterwards.
+    """
+    opted_out_at = (
+        await session.execute(
+            select(Portal.crm_opt_out_at).where(Portal.id == portal_id).with_for_update()
+        )
+    ).one_or_none()
+    if opted_out_at is None:
+        return False
+    currently_off = opted_out_at[0] is not None
+
+    if enabled:
+        if not currently_off:
+            return False
+        await session.execute(
+            update(Portal)
+            .where(Portal.id == portal_id)
+            .values(crm_mode="sync", crm_opt_out_at=None, crm_opt_out_by=None)
+        )
+        await record_event(session, portal_id, "crm_analytics_on", user_id=user_id)
+        return True
+
+    if currently_off:
+        return False
+    await session.execute(
+        update(Portal)
+        .where(Portal.id == portal_id)
+        .values(
+            crm_mode="off",
+            crm_opt_out_at=func.now(),
+            crm_opt_out_by=user_id,
+            crm_purge_pending=True,
+        )
+    )
+    await session.execute(
+        update(PortalSync)
+        .where(PortalSync.portal_id == portal_id)
+        .values(sync_generation=PortalSync.sync_generation + 1, **_lease_release_values())
+    )
+    await session.execute(delete(CrmLane).where(CrmLane.portal_id == portal_id))
+    await record_event(session, portal_id, "crm_analytics_off", user_id=user_id)
+    return True
+
+
+async def dismiss_crm_notice(session: AsyncSession, portal_id: int, *, user_id: int) -> None:
+    """Hide the informational CRM notice for one administrator. Idempotent."""
+    await session.execute(
+        update(Portal)
+        .where(Portal.id == portal_id, ~Portal.crm_notice_dismissed_by.contains([user_id]))
+        .values(crm_notice_dismissed_by=func.array_append(Portal.crm_notice_dismissed_by, user_id))
+    )
+
+
+async def set_crm_mode(session: AsyncSession, portal_id: int, mode: str) -> str | None:
+    """An operator's move of `crm_mode` (`python -m app.tools.crm_mode`); returns the old mode.
+
+    Refuses anything but `off` for a portal whose administrator turned CRM analytics off:
+    that decision is theirs, and the CHECK would refuse it anyway. `off` here stops the
+    worker's CRM requests and keeps the rows - it is not the privacy switch, which deletes them.
+    """
+    if mode not in CRM_MODES:
+        raise ValueError(f"unknown crm_mode {mode!r}")
+    row = (
+        await session.execute(
+            select(Portal.crm_mode, Portal.crm_opt_out_at)
+            .where(Portal.id == portal_id)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    if row.crm_opt_out_at is not None and mode != "off":
+        raise ValueError("an administrator turned CRM analytics off for this portal")
+    if row.crm_mode != mode:
+        await session.execute(update(Portal).where(Portal.id == portal_id).values(crm_mode=mode))
+        await record_event(
+            session,
+            portal_id,
+            "crm_mode_set",
+            details={"from": row.crm_mode, "to": mode, "source": "tool"},
+        )
+    return str(row.crm_mode)

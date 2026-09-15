@@ -47,6 +47,8 @@ DEFAULT_SCHEDULE: Final[tuple[tuple[str, float], ...]] = (
     ("tick", TICK_SECONDS),
     ("purge_rest_log", DAILY_SECONDS),
     ("purge_crm_contexts", DAILY_SECONDS),
+    # §5.12: tombstones forgotten after 35 days, unreadable records evicted after 30.
+    ("purge_crm_retention", DAILY_SECONDS),
     # §5.8's fallback uninstall. Daily like the retention jobs, and for the same
     # reason: it is a sweep over committed state that nothing else triggers.
     ("sweep_inferred_uninstalls", DAILY_SECONDS),

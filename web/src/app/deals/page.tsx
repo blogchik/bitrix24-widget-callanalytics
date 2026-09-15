@@ -111,7 +111,9 @@ export default function DealsPage() {
 
   const timezone = me.data?.timezone ?? null;
   const access = me.data?.access ?? null;
-  const canRead = access === 'all' || access === 'own';
+  // D-7: with CRM analytics turned off the report is closed, so nothing is fetched for it.
+  const crmOff = me.data?.crm?.analytics_enabled === false;
+  const canRead = (access === 'all' || access === 'own') && !crmOff;
 
   // The default period is thirty days *in the viewer's zone*, so it cannot be computed
   // before `GET /me` has answered with that zone.
@@ -192,6 +194,11 @@ export default function DealsPage() {
   if (me.data.access === 'denied') {
     return (
       <StateCard kind="denied" title={t('state.denied.title')} body={t(deniedBodyKey(me.data))} />
+    );
+  }
+  if (crmOff) {
+    return (
+      <StateCard kind="crm_off" title={t('state.crm_off.title')} body={t('state.crm_off.body')} />
     );
   }
 

@@ -213,7 +213,10 @@ def apply_range_batch(
             violation = violation or found
             continue
         cursor = ids[-1] if ids else stream.cursor
-        updated[index] = replace(stream, cursor=cursor, done=len(page) < PAGE_SIZE)
+        # A full page that ends on the range's last id leaves nothing after it: asking for ids
+        # above hi - 1 and below hi is a range with no ids, which the builder refuses.
+        done = len(page) < PAGE_SIZE or cursor >= stream.hi - 1
+        updated[index] = replace(stream, cursor=cursor, done=done)
 
     time_block = merge_time_blocks([batch.time, *(command.time for command in batch.commands)])
     if violation is not None:

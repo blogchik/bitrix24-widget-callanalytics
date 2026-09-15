@@ -122,6 +122,9 @@ const OWN_MESSAGE_CODES: ReadonlySet<string> = new Set([
   'utm_report_failed',
   'utm_unsupported',
   'bad_dimension',
+  // §4.14 / D-7: an administrator turned CRM analytics off. The pages check `/me` first and
+  // render their own state; this sentence is the floor for any caller that did not.
+  'crm_analytics_off',
 ]);
 
 export interface ErrorPresentation {
@@ -361,6 +364,24 @@ export interface Me {
    */
   no_access?: { code: string; copy_key: string } | null;
   sync?: MeSync | null;
+  crm?: MeCrm | null;
+}
+
+/**
+ * Where CRM analytics stands for this portal (§4.14, D-7).
+ *
+ * Every viewer gets `analytics_enabled`: the Deals and Sources pages render "turned off" from
+ * it instead of asking Bitrix24 for a token first.
+ */
+export interface MeCrm {
+  analytics_enabled: boolean;
+  mode?: string | null;
+  /** An administrator who has not dismissed the informational notice. It gates nothing. */
+  notice_visible?: boolean | null;
+  /** Admin-only. */
+  opted_out_at?: string | null;
+  /** Admin-only: the CRM copy is still being deleted. */
+  purge_pending?: boolean | null;
 }
 
 /**
@@ -377,6 +398,27 @@ export function deniedBodyKey(me: Me): string {
 
 export function fetchMe(signal?: AbortSignal): Promise<Me> {
   return apiFetch<Me>('/me', { signal });
+}
+
+/** What `POST /portal/crm-analytics` answers: the switch as it now stands. */
+export interface CrmSwitchState {
+  analytics_enabled: boolean;
+  mode: string;
+  opted_out_at: string | null;
+  purge_pending: boolean;
+}
+
+/**
+ * The administrator's CRM analytics switch. Off deletes the portal's CRM copy and closes the
+ * Deals and Sources reports; on starts storage again (docs/crm-mirror-notice.md).
+ */
+export function setCrmAnalytics(enabled: boolean): Promise<CrmSwitchState> {
+  return apiFetch<CrmSwitchState>('/portal/crm-analytics', { method: 'POST', body: { enabled } });
+}
+
+/** "Got it" on the CRM notice, for this administrator only. */
+export function dismissCrmNotice(): Promise<unknown> {
+  return apiFetch<unknown>('/portal/crm-notice/dismiss', { method: 'POST', body: {} });
 }
 
 export interface Resource<T> {

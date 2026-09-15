@@ -199,7 +199,7 @@ Caddy (host, outside compose): `/app/*`, `/install/*`, `/settings/*`, `/events/*
 
 ## 3. Database schema — PostgreSQL 16
 
-Rules: surrogate `portal_id` on every tenant row; `member_id` unique on `portals` with a format check; customer-data tables (`calls`, `employees`, `crm_contexts`) carry FORCED RLS bound to the transaction-local `app.portal_id`; control-plane tables (`portals`, `portal_sync`, `sync_method_budgets`, `rest_log`, `portal_events`) have no RLS because the worker tick and support must scan across portals and they hold no call data. **No CHECK constraint is placed on a value Bitrix24 controls** — unknown enum values are stored raw and mapped in the UI; only values we generate are constrained. Encrypted columns are `bytea` and end in `_enc`: envelope `key_id(1) || nonce(12) || ciphertext || tag(16)`, AAD = `member_id || ':' || column_name`.
+Rules: surrogate `portal_id` on every tenant row; `member_id` unique on `portals` with a format check; customer-data tables (`calls`, `employees`, `crm_contexts`, and the CRM mirror's `crm_items`, `crm_funnels`, `crm_stages`, `crm_dirty`) carry FORCED RLS bound to the transaction-local `app.portal_id`; control-plane tables (`portals`, `portal_sync`, `sync_method_budgets`, `crm_lanes`, `rest_log`, `portal_events`) have no RLS because the worker tick and support must scan across portals; `app_flags` names no portal at all and they hold no call data. **No CHECK constraint is placed on a value Bitrix24 controls** — unknown enum values are stored raw and mapped in the UI; only values we generate are constrained. Encrypted columns are `bytea` and end in `_enc`: envelope `key_id(1) || nonce(12) || ciphertext || tag(16)`, AAD = `member_id || ':' || column_name`.
 
 ```sql
 -- ===================== roles (docker/postgres/init.sql; run once by ops) =====================
@@ -512,6 +512,123 @@ CREATE TABLE sync_method_budgets (
     PRIMARY KEY (portal_id, method)
 );
 
+-- ===================== 0004_crm_mirror (§4.14; COMMENTs in the revision) =====================
+ALTER TABLE portals
+    ADD COLUMN crm_mode                 varchar(8)  NOT NULL DEFAULT 'sync',  -- off|sync|shadow|mirror
+    ADD COLUMN crm_opt_out_at           timestamptz,                         -- set => crm_mode = 'off'
+    ADD COLUMN crm_opt_out_by           integer,
+    ADD COLUMN crm_notice_dismissed_by  integer[]   NOT NULL DEFAULT '{}',   -- informational banner only
+    ADD COLUMN crm_purge_pending        boolean     NOT NULL DEFAULT false,  -- CRM-only purge after opt-out
+    ADD CONSTRAINT portals_crm_mode_chk CHECK (crm_mode IN ('off','sync','shadow','mirror')),
+    ADD CONSTRAINT portals_crm_opt_out_chk CHECK (crm_opt_out_at IS NULL OR crm_mode = 'off');
+CREATE INDEX portals_crm_purge_idx ON portals (id) WHERE crm_purge_pending;
+
+-- ---------- crm_lanes: one CRM lane per portal (control plane, §5.10) ----------
+CREATE TABLE crm_lanes (
+    portal_id        bigint      NOT NULL REFERENCES portals(id) ON DELETE CASCADE,
+    lane             varchar(32) NOT NULL,                  -- dict | deal.backfill | lead.sweep | ...
+    status           varchar(16) NOT NULL DEFAULT 'pending',-- pending|active|done|parked
+    due_at           timestamptz NOT NULL DEFAULT now(),
+    cursor           jsonb       NOT NULL DEFAULT '{}'::jsonb, -- id bounds / server-clock watermark
+    progress_done    bigint      NOT NULL DEFAULT 0,
+    progress_total   bigint,
+    last_clean_at    timestamptz,
+    failures         integer     NOT NULL DEFAULT 0,
+    paused_until     timestamptz,
+    block_reason     varchar(64),
+    last_error_code  varchar(64),
+    last_error_at    timestamptz,
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (portal_id, lane),
+    CONSTRAINT crm_lanes_status_chk CHECK (status IN ('pending','active','done','parked'))
+);
+
+-- ---------- app_flags: fleet-wide switches (no portal) ----------
+CREATE TABLE app_flags (
+    name        varchar(64) PRIMARY KEY,
+    enabled     boolean     NOT NULL,
+    note        text        NOT NULL DEFAULT '',
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+-- seeded: ('crm_mirror', true) - the CRM kill switch
+
+-- ---------- crm_items: the mirror, D-3 fields only (FORCED RLS) ----------
+CREATE TABLE crm_items (
+    portal_id           bigint       NOT NULL REFERENCES portals(id) ON DELETE CASCADE,
+    entity_type_id      smallint     NOT NULL,   -- 1 lead, 2 deal
+    id                  bigint       NOT NULL,
+    category_id         integer,
+    stage_id            varchar(128),
+    stage_semantic      varchar(1),              -- S|F|P after normalise_semantic
+    assigned_by_id      integer,
+    created_time        timestamptz,
+    updated_time        timestamptz,
+    moved_time          timestamptz,
+    closed              boolean,
+    opportunity         numeric,                 -- own currency, half-up to cents
+    currency_id         varchar(16),
+    lead_id             bigint,
+    contact_ids         bigint[],
+    company_id          bigint,
+    utm_source          text,                    -- normalised as /utm normalises tags
+    utm_medium          text,
+    utm_campaign        text,
+    utm_content         text,
+    utm_term            text,
+    read_at             timestamptz  NOT NULL,   -- version: never overwritten by an older read
+    synced_at           timestamptz  NOT NULL DEFAULT now(),
+    content_changed_at  timestamptz,
+    deleted_at          timestamptz,             -- tombstone; every data column NULL while set
+    delete_reason       varchar(16),             -- not_found | evicted
+    unreadable_since    timestamptz,
+    PRIMARY KEY (portal_id, entity_type_id, id),
+    CONSTRAINT crm_items_entity_chk CHECK (entity_type_id IN (1, 2)),
+    CONSTRAINT crm_items_delete_reason_chk CHECK (delete_reason IN ('not_found','evicted')),
+    CONSTRAINT crm_items_tombstone_chk CHECK (...)  -- deleted_at set <=> reason set AND all data columns NULL
+);
+CREATE INDEX crm_items_deal_created_idx ON crm_items (portal_id, created_time)
+    INCLUDE (category_id, assigned_by_id, stage_id, stage_semantic) WHERE entity_type_id = 2 AND deleted_at IS NULL;
+CREATE INDEX crm_items_deal_updated_idx ON crm_items (portal_id, updated_time) WHERE entity_type_id = 2 AND deleted_at IS NULL;
+CREATE INDEX crm_items_deal_closed_idx  ON crm_items (portal_id, moved_time) WHERE entity_type_id = 2 AND closed AND deleted_at IS NULL;
+CREATE INDEX crm_items_lead_created_idx ON crm_items (portal_id, created_time) WHERE entity_type_id = 1 AND deleted_at IS NULL;
+CREATE INDEX crm_items_assignee_idx     ON crm_items (portal_id, entity_type_id, assigned_by_id, created_time) WHERE deleted_at IS NULL;
+CREATE INDEX crm_items_company_idx      ON crm_items (portal_id, company_id) WHERE company_id IS NOT NULL AND deleted_at IS NULL;
+CREATE INDEX crm_items_tombstone_idx    ON crm_items (portal_id, deleted_at) WHERE deleted_at IS NOT NULL;
+CREATE INDEX crm_items_unreadable_idx   ON crm_items (portal_id, unreadable_since) WHERE unreadable_since IS NOT NULL;
+
+-- ---------- crm_funnels / crm_stages: dictionaries with names (FORCED RLS) ----------
+CREATE TABLE crm_funnels (
+    portal_id bigint NOT NULL REFERENCES portals(id) ON DELETE CASCADE,
+    entity_type_id smallint NOT NULL, category_id integer NOT NULL,
+    name text NOT NULL DEFAULT '', sort integer NOT NULL DEFAULT 0, is_default boolean NOT NULL DEFAULT false,
+    seen_at timestamptz NOT NULL DEFAULT now(), missing_since timestamptz,
+    PRIMARY KEY (portal_id, entity_type_id, category_id),
+    CONSTRAINT crm_funnels_entity_chk CHECK (entity_type_id IN (1, 2))
+);
+CREATE TABLE crm_stages (
+    portal_id bigint NOT NULL REFERENCES portals(id) ON DELETE CASCADE,
+    entity_type_id smallint NOT NULL, category_id integer NOT NULL, status_id varchar(128) NOT NULL,
+    name text NOT NULL DEFAULT '', sort integer NOT NULL DEFAULT 0, semantic varchar(1) NOT NULL DEFAULT 'P',
+    seen_at timestamptz NOT NULL DEFAULT now(), missing_since timestamptz,
+    PRIMARY KEY (portal_id, entity_type_id, category_id, status_id),
+    CONSTRAINT crm_stages_entity_chk CHECK (entity_type_id IN (1, 2))
+);
+
+-- ---------- crm_dirty: ids to re-read (FORCED RLS) ----------
+CREATE TABLE crm_dirty (
+    portal_id bigint NOT NULL REFERENCES portals(id) ON DELETE CASCADE,
+    entity_type_id smallint NOT NULL, id bigint NOT NULL,
+    reasons integer NOT NULL DEFAULT 0,
+    seq bigint NOT NULL DEFAULT 1,               -- consumed only WHERE seq = what the refresh read
+    first_marked_at timestamptz NOT NULL DEFAULT now(), not_before timestamptz NOT NULL DEFAULT now(),
+    held_until timestamptz, attempts smallint NOT NULL DEFAULT 0,
+    PRIMARY KEY (portal_id, entity_type_id, id),
+    CONSTRAINT crm_dirty_entity_chk CHECK (entity_type_id IN (1, 2, 3, 4))
+);
+CREATE INDEX crm_dirty_due_idx ON crm_dirty (portal_id, not_before);
+-- RLS: crm_items, crm_funnels, crm_stages, crm_dirty get the same ENABLE + FORCE and the same
+-- <table>_tenant policy as calls below.
+
 -- ---------- Row-Level Security: structural tenant isolation ----------
 ALTER TABLE calls        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE calls        FORCE  ROW LEVEL SECURITY;
@@ -541,13 +658,18 @@ ALTER DEFAULT PRIVILEGES FOR ROLE ca_owner IN SCHEMA public GRANT SELECT, INSERT
 ALTER DEFAULT PRIVILEGES FOR ROLE ca_owner IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO ca_app;
 ```
 
-`alembic_version` is created by Alembic. Eight tables total: the seven of the baseline plus `sync_method_budgets` (0003). The one list of which tables are customer tables is `app/db/tenancy.py`; CI's `python -m app.tools.check_tenancy` fails when the catalog disagrees with it.
+`alembic_version` is created by Alembic. Fourteen tables total: the seven of the baseline, `sync_method_budgets` (0003), and `crm_lanes`, `app_flags`, `crm_items`, `crm_funnels`, `crm_stages`, `crm_dirty` (0004). The one list of which tables are customer tables is `app/db/tenancy.py`; CI's `python -m app.tools.check_tenancy` fails when the catalog disagrees with it.
 
 ### Per-table rationale
 
 - **`portals`** — tenant registry and the single portal credential in one row: minimal, and the `token_version` / `FOR UPDATE` single-flight needs exactly one row to lock. `member_id` has a format CHECK so garbage never becomes a tenant, but it is treated as public data. `client_endpoint` is written only from the OAuth response. `token_admin_verified_at` records that the stored credential belongs to a proven administrator. `token_status` is the one column the settings page and dashboard banner read to explain why sync stopped. `application_token_enc` survives uninstall so late/duplicate lifecycle events still verify. `last_event_ts` makes event delivery idempotent and stops a retried uninstall from wiping a fresh reinstall. `purge_pending`/`purge_bodies` make uninstall cleanup (including the CLEAN=1 body wipe) durable without a queue. The ONAPPUSERREADY system-user credential is **not** stored in v1 (unused, and a stored 180-day token is a liability).
 - **`portal_sync`** — everything the worker needs to resume from any crash, plus the two safety columns the review demanded: `sync_generation` (fencing) and `rescan_from_id` (no NULL-derived full rescans). `throttle_hits` separates "the portal is busy" from "the portal is broken". `run_started_at` distinguishes a crashed run from a dispatch miss. Separate from `portals` because it is rewritten after every batch and must never contend with the credential row's lock.
 - **`sync_method_budgets`** — Bitrix24 accounts operating time per method, and `time.operating` is that method's own accumulator (docs/spike-crm-mirror.md, S-A.6). `portal_sync.operating_*` stays the statistics method's, because that row also schedules the portal; every other method the worker calls gets a row, so one method's limit parks only that method. Numbers and timestamps only, so no RLS; deleted with the cursors on install, reinstall and uninstall.
+- **`crm_lanes`** — the CRM mirror's schedule: one row per (portal, lane) with its own due time, cursor and failure count, so a stuck lead backfill never delays a deal sweep and neither touches the call sync (§5.10). Id bounds and server-clock watermarks only, so no RLS.
+- **`app_flags`** — switches an operator flips with one `UPDATE` instead of a deploy; `crm_mirror = false` stops every CRM REST call the worker makes.
+- **`crm_items`** — the mirror itself, D-3 fields only. `read_at` versions every row so an older page cannot overwrite a newer read; a tombstone NULLs every data column (enforced by CHECK) and keeps the id for 35 days; the partial indexes are the three period legs of the Deals report and the created leg of Sources.
+- **`crm_funnels` / `crm_stages`** — dictionary rows with their names (G0 Q1). A funnel or stage missing from one read is only marked, and removed after a second read a day later, so one truncated answer cannot erase a column.
+- **`crm_dirty`** — ids waiting for a re-read, never values. `seq` lets a refresh consume exactly the mark it read and leave one that arrived meanwhile.
 - **`calls`** — the cache. Natural key `(portal_id, bx_id)` is the upsert target; the surrogate `id` is only for the API's opaque row ids. Generated `has_record` and `result_group` make the recording and result mappings identical in filters, summaries and jobs; the API then collapses `result_group` to two outcomes in one place (`answered` / `no_answer`) so the filter and the charts cannot drift apart, while the raw `call_failed_code` stays on the row for the cell's title. Constraints on Bitrix-supplied values were removed and string widths raised so a novel `CALL_TYPE`, a `DEAL` entity type or a long failure code cannot abort a 500-row chunk. The range index is covering so summary/heatmap/per-employee aggregation is an index-only scan.
 - **`employees`** — `user_brief` fields only (scope), which includes the internal extension `phone_inner` and excludes email and personal phone. `fetched_at` NULL placeholders are inserted by the call upsert so the refresh job never has to `SELECT DISTINCT` over `calls`; `found=false` stops retrying deleted users every cycle. Dismissed users are kept because their calls remain.
 - **`crm_contexts`** — the resolved matching set for a CRM tab, written only by a successful resolution by the *current* opener and read only when at least as fresh as the JWT, so a privileged user's resolution is never replayed for someone who lacks CRM rights.

@@ -124,8 +124,9 @@ There is no bug bounty. We pay in credit and in a fast fix.
 Ranked by how seriously we take it.
 
 1. **Tenant isolation bypass.** Any path that reads, writes or deletes rows for a portal
-   other than the caller's. Every table in `api/app/db/tenancy.py::TENANT_TABLES` (today
-   `calls`, `employees` and `crm_contexts`; the CRM mirror's tables join the same list) carries
+   other than the caller's. Every table in `api/app/db/tenancy.py::TENANT_TABLES` (`calls`,
+   `employees`, `crm_contexts` and the CRM mirror's `crm_items`, `crm_funnels`, `crm_stages`,
+   `crm_dirty`) carries
    *forced* row-level security bound to a transaction-local setting, and the runtime role `ca_app` cannot bypass
    it (§3) — so this usually means a query that escapes `tenant_txn`, a job that forgets to
    re-issue `SET LOCAL app.portal_id`, or a read that skips `services/calls_repo.py`.

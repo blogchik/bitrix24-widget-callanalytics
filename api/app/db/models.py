@@ -202,6 +202,31 @@ class PortalSync(Base):
     portal: Mapped[Portal] = relationship(back_populates="sync", lazy="raise")
 
 
+class SyncMethodBudget(Base):
+    """Operating-time state per (portal, Bitrix24 method), statistics excepted (§5.6).
+
+    `portal_sync.operating_*` stays the statistics method's; every other method the worker
+    calls is accounted here, because Bitrix24 accounts operating time per method.
+    """
+
+    __tablename__ = "sync_method_budgets"
+
+    portal_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("portals.id", ondelete="CASCADE"), primary_key=True
+    )
+    method: Mapped[str] = mapped_column(String(64), primary_key=True)
+    operating_seconds: Mapped[Decimal | None] = mapped_column(Numeric(8, 2))
+    operating_reset_at: Mapped[dt.datetime | None] = mapped_column(_TS)
+    blocked_until: Mapped[dt.datetime | None] = mapped_column(_TS)
+    limit_s: Mapped[Decimal | None] = mapped_column(Numeric(8, 2))
+    throttle_hits: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    clean_visits: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default=text("0")
+    )
+    # Maintained by the sync_method_budgets_updated_at trigger, not by the ORM.
+    updated_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
+
+
 class Call(Base):
     """Metadata cache of `voximplant.statistic.get`. Never stores audio.
 

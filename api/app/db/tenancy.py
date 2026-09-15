@@ -51,6 +51,7 @@ CONTROL_PLANE_TABLES: Final[Mapping[str, str]] = {
     "portal_sync": "one lease and cursor row per portal, read by the worker before a tenant is chosen",
     "rest_log": "the request log (§6): its own retention and CLEAN redaction, not the tenant purge",
     "portal_events": "the lifecycle audit trail support reads across portals",
+    "sync_method_budgets": "operating-time numbers per (portal, method), read before a tenant is chosen",
 }
 
 #: Indexes on a tenant table that deliberately do not lead with `portal_id`.

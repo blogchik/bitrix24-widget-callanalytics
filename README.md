@@ -68,8 +68,9 @@ which is the correct answer rather than an error.
 
 Three properties are worth knowing before reading the code:
 
-1. **Tenant isolation is structural, not conventional.** `calls`, `employees` and
-   `crm_contexts` carry forced row-level security bound to a transaction-local setting, and
+1. **Tenant isolation is structural, not conventional.** Every customer table — the calls,
+   employees and CRM mirror tables listed in `api/app/db/tenancy.py` — carries forced
+   row-level security bound to a transaction-local setting, and
    the runtime database role cannot bypass it. A query that forgets its tenant context
    returns zero rows rather than another portal's. Because that failure is silent, every job
    that writes or deletes must open `tenant_txn` per transaction and verify its effect.

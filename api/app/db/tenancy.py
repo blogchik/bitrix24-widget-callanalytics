@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 __all__ = [
     "CONTROL_PLANE_TABLES",
+    "CRM_TENANT_TABLES",
     "NON_PORTAL_LEADING_INDEXES",
     "RUNTIME_ROLE",
     "TENANT_TABLES",
@@ -41,8 +42,11 @@ __all__ = [
     "role_problems",
 ]
 
+#: The CRM mirror's customer tables (0004, §4.14): what turning CRM analytics off deletes.
+CRM_TENANT_TABLES: Final[tuple[str, ...]] = ("crm_items", "crm_funnels", "crm_stages", "crm_dirty")
+
 #: The FORCED-RLS customer tables, in the fixed order the purge deletes and audits them.
-TENANT_TABLES: Final[tuple[str, ...]] = ("calls", "employees", "crm_contexts")
+TENANT_TABLES: Final[tuple[str, ...]] = ("calls", "employees", "crm_contexts", *CRM_TENANT_TABLES)
 
 #: Every other table that names a portal, with the reason it is not RLS-bound. A new table
 #: with a `portal_id` column belongs in exactly one of these two lists.
@@ -52,6 +56,7 @@ CONTROL_PLANE_TABLES: Final[Mapping[str, str]] = {
     "rest_log": "the request log (§6): its own retention and CLEAN redaction, not the tenant purge",
     "portal_events": "the lifecycle audit trail support reads across portals",
     "sync_method_budgets": "operating-time numbers per (portal, method), read before a tenant is chosen",
+    "crm_lanes": "CRM lane schedules and id/time cursors, no record values; read before a tenant is chosen",
 }
 
 #: Indexes on a tenant table that deliberately do not lead with `portal_id`.

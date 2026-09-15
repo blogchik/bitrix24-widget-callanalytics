@@ -155,6 +155,9 @@ class PortalFixture:
     user_ids: tuple[int, ...]
     bx_ids: tuple[int, ...]
     entity_ids: tuple[int, ...]
+    #: `crm_items` ids, alternating deal and lead; each also has a funnel, a stage and a
+    #: dirty mark, so every CRM mirror table holds rows a leak or a missed purge would show.
+    item_ids: tuple[int, ...] = ()
 
     @property
     def calls(self) -> int:
@@ -167,6 +170,16 @@ class PortalFixture:
     @property
     def crm_contexts(self) -> int:
         return len(self.entity_ids)
+
+    @property
+    def crm_rows(self) -> int:
+        """Rows across the CRM mirror tables: each item plus its dirty mark, one funnel, one stage."""
+        return 2 * len(self.item_ids) + 2
+
+    @property
+    def customer_rows(self) -> int:
+        """Every seeded row in `TENANT_TABLES` - what a complete purge must remove."""
+        return self.calls + self.employees + self.crm_contexts + self.crm_rows
 
 
 @dataclass(frozen=True)
@@ -209,6 +222,7 @@ async def _seed_portal(index: int) -> PortalFixture:
     user_ids = (base + 1, base + 2)
     bx_ids = tuple(base + 10 + n for n in range(len(_CALL_CODES)))
     entity_ids = (base + 100, base + 200)
+    item_ids = (base + 300, base + 301)
     start = datetime.now(UTC) - timedelta(days=1)
 
     # Customer rows: only reachable under tenant context (§3 policies).
@@ -274,6 +288,47 @@ async def _seed_portal(index: int) -> PortalFixture:
                     "uid": user_ids[0],
                 },
             )
+        for position, item_id in enumerate(item_ids):
+            entity_type_id = (2, 1)[position % 2]
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO crm_items (portal_id, entity_type_id, id, category_id, stage_id,
+                                           stage_semantic, assigned_by_id, created_time,
+                                           updated_time, read_at)
+                    VALUES (:pid, :etype, :iid, :cat, 'NEW', 'P', :uid, :created, :created, now())
+                    """
+                ),
+                {
+                    "pid": portal_id,
+                    "etype": entity_type_id,
+                    "iid": item_id,
+                    "cat": 0 if entity_type_id == 2 else None,
+                    "uid": user_ids[position % len(user_ids)],
+                    "created": start,
+                },
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO crm_dirty (portal_id, entity_type_id, id) "
+                    "VALUES (:pid, :etype, :iid)"
+                ),
+                {"pid": portal_id, "etype": entity_type_id, "iid": item_id},
+            )
+        await session.execute(
+            text(
+                "INSERT INTO crm_funnels (portal_id, entity_type_id, category_id, name, is_default) "
+                "VALUES (:pid, 2, 0, 'Main', true)"
+            ),
+            {"pid": portal_id},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO crm_stages (portal_id, entity_type_id, category_id, status_id, name) "
+                "VALUES (:pid, 2, 0, 'NEW', 'New')"
+            ),
+            {"pid": portal_id},
+        )
 
     return PortalFixture(
         portal_id=portal_id,
@@ -281,6 +336,7 @@ async def _seed_portal(index: int) -> PortalFixture:
         user_ids=user_ids,
         bx_ids=bx_ids,
         entity_ids=entity_ids,
+        item_ids=item_ids,
     )
 
 

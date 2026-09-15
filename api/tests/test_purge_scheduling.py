@@ -143,7 +143,7 @@ async def _tick_and_wait() -> int | None:
 
 
 def _total(portal: PortalFixture) -> int:
-    return portal.calls + portal.employees + portal.crm_contexts
+    return portal.customer_rows
 
 
 @pytest.fixture(autouse=True)
@@ -215,8 +215,8 @@ def _open_the_app_during(
     `handlers/open.py` calls `upsert_viewer` on every open, in its own `tenant_txn`,
     before any purge check - so on a portal that reinstalled during cleanup this insert
     can land after a table's last DELETE and before `purge_portal_data`'s final count.
-    Counting `_count` calls is how the window is hit deterministically: three pre-counts
-    (calls, employees, crm_contexts), then the three final counts.
+    Counting `_count` calls is how the window is hit deterministically: one pre-count per
+    table in `TENANT_TABLES`, then one final count per table in the same order.
     """
     original = purge_module._count
     seen = {"n": 0}
@@ -257,9 +257,9 @@ async def test_reinstall_during_cleanup_converges_despite_a_live_open(
     portal = two_portals.a
     await _arm_uninstalled(portal.portal_id)
     await _reinstall(portal.portal_id)
-    # The 4th `_count` call is the first FINAL count: every delete loop has finished, so
-    # the row this open writes is the new install's data, not a purge that failed.
-    _open_the_app_during(monkeypatch, portal, at_count=4)
+    # The call after the last pre-count is the first FINAL count: every delete loop has
+    # finished, so the row this open writes is the new install's data, not a failed purge.
+    _open_the_app_during(monkeypatch, portal, at_count=len(TENANT_TABLES) + 1)
 
     outcome = await purge_portal_data(portal.portal_id)
 

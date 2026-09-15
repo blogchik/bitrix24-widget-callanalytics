@@ -74,8 +74,15 @@ class Portal(Base):
             "'method_missing','filter_unsupported')",
             name="portals_token_status_chk",
         ),
+        CheckConstraint(
+            "crm_mode IN ('off','sync','shadow','mirror')", name="portals_crm_mode_chk"
+        ),
+        CheckConstraint(
+            "crm_opt_out_at IS NULL OR crm_mode = 'off'", name="portals_crm_opt_out_chk"
+        ),
         Index("portals_status_idx", "status", postgresql_where=text("status = 'active'")),
         Index("portals_purge_idx", "id", postgresql_where=text("purge_pending")),
+        Index("portals_crm_purge_idx", "id", postgresql_where=text("crm_purge_pending")),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
@@ -126,6 +133,17 @@ class Portal(Base):
     uninstalled_at: Mapped[dt.datetime | None] = mapped_column(_TS)
     last_opened_at: Mapped[dt.datetime | None] = mapped_column(_TS)
     last_admin_opened_at: Mapped[dt.datetime | None] = mapped_column(_TS)
+    # CRM mirror (0004, §4.14). `crm_mode` gates the worker's CRM lanes; an administrator's
+    # opt-out pins it to `off` (portals_crm_opt_out_chk) and queues the CRM-only purge.
+    crm_mode: Mapped[str] = mapped_column(String(8), nullable=False, server_default=text("'sync'"))
+    crm_opt_out_at: Mapped[dt.datetime | None] = mapped_column(_TS)
+    crm_opt_out_by: Mapped[int | None] = mapped_column(Integer)
+    crm_notice_dismissed_by: Mapped[list[int]] = mapped_column(
+        postgresql.ARRAY(Integer), nullable=False, server_default=text("'{}'")
+    )
+    crm_purge_pending: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     created_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
     # Maintained by the portals_updated_at trigger, not by the ORM.
     updated_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
@@ -224,6 +242,51 @@ class SyncMethodBudget(Base):
         SmallInteger, nullable=False, server_default=text("0")
     )
     # Maintained by the sync_method_budgets_updated_at trigger, not by the ORM.
+    updated_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
+
+
+class CrmLane(Base):
+    """One CRM mirror lane of one portal: its schedule, cursor and failures (§5.10).
+
+    Control plane: id bounds, server timestamps and counters, never a record's values.
+    """
+
+    __tablename__ = "crm_lanes"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','active','done','parked')", name="crm_lanes_status_chk"
+        ),
+    )
+
+    portal_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("portals.id", ondelete="CASCADE"), primary_key=True
+    )
+    lane: Mapped[str] = mapped_column(String(32), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'pending'"))
+    due_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
+    cursor: Mapped[dict[str, Any]] = mapped_column(
+        postgresql.JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    progress_done: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    progress_total: Mapped[int | None] = mapped_column(BigInteger)
+    last_clean_at: Mapped[dt.datetime | None] = mapped_column(_TS)
+    failures: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    paused_until: Mapped[dt.datetime | None] = mapped_column(_TS)
+    block_reason: Mapped[str | None] = mapped_column(String(64))
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    last_error_at: Mapped[dt.datetime | None] = mapped_column(_TS)
+    # Maintained by the crm_lanes_updated_at trigger, not by the ORM.
+    updated_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
+
+
+class AppFlag(Base):
+    """A fleet-wide switch an operator flips without a deploy (`crm_mirror` is the first)."""
+
+    __tablename__ = "app_flags"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
     updated_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
 
 
@@ -401,6 +464,192 @@ class CrmContext(Base):
     # §4.8: a read is served only from a row at least as fresh as the JWT, so a
     # privileged user's resolution is never replayed for someone without rights.
     resolved_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
+
+
+#: The columns a tombstone NULLs (crm_items_tombstone_chk); everything D-3 lets us store.
+CRM_ITEM_DATA_COLUMNS: tuple[str, ...] = (
+    "category_id",
+    "stage_id",
+    "stage_semantic",
+    "assigned_by_id",
+    "created_time",
+    "updated_time",
+    "moved_time",
+    "closed",
+    "opportunity",
+    "currency_id",
+    "lead_id",
+    "contact_ids",
+    "company_id",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_content",
+    "utm_term",
+)
+
+
+class CrmItem(Base):
+    """The CRM mirror: one deal (`entity_type_id` 2) or lead (1), D-3 fields only (§4.14).
+
+    RLS-protected like `calls`. No CHECK on a Bitrix-controlled value, for the reason §3 gives
+    for `calls`: one odd stage id must never stall a lane.
+    """
+
+    __tablename__ = "crm_items"
+    __table_args__ = (
+        CheckConstraint("entity_type_id IN (1, 2)", name="crm_items_entity_chk"),
+        CheckConstraint(
+            "delete_reason IN ('not_found','evicted')", name="crm_items_delete_reason_chk"
+        ),
+        Index(
+            "crm_items_deal_created_idx",
+            "portal_id",
+            "created_time",
+            postgresql_include=["category_id", "assigned_by_id", "stage_id", "stage_semantic"],
+            postgresql_where=text("entity_type_id = 2 AND deleted_at IS NULL"),
+        ),
+        Index(
+            "crm_items_deal_updated_idx",
+            "portal_id",
+            "updated_time",
+            postgresql_where=text("entity_type_id = 2 AND deleted_at IS NULL"),
+        ),
+        Index(
+            "crm_items_deal_closed_idx",
+            "portal_id",
+            "moved_time",
+            postgresql_where=text("entity_type_id = 2 AND closed AND deleted_at IS NULL"),
+        ),
+        Index(
+            "crm_items_lead_created_idx",
+            "portal_id",
+            "created_time",
+            postgresql_where=text("entity_type_id = 1 AND deleted_at IS NULL"),
+        ),
+        Index(
+            "crm_items_assignee_idx",
+            "portal_id",
+            "entity_type_id",
+            "assigned_by_id",
+            "created_time",
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+        Index(
+            "crm_items_company_idx",
+            "portal_id",
+            "company_id",
+            postgresql_where=text("company_id IS NOT NULL AND deleted_at IS NULL"),
+        ),
+        Index(
+            "crm_items_tombstone_idx",
+            "portal_id",
+            "deleted_at",
+            postgresql_where=text("deleted_at IS NOT NULL"),
+        ),
+        Index(
+            "crm_items_unreadable_idx",
+            "portal_id",
+            "unreadable_since",
+            postgresql_where=text("unreadable_since IS NOT NULL"),
+        ),
+    )
+
+    portal_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("portals.id", ondelete="CASCADE"), primary_key=True
+    )
+    entity_type_id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    category_id: Mapped[int | None] = mapped_column(Integer)
+    stage_id: Mapped[str | None] = mapped_column(String(128))
+    stage_semantic: Mapped[str | None] = mapped_column(String(1))
+    assigned_by_id: Mapped[int | None] = mapped_column(Integer)
+    created_time: Mapped[dt.datetime | None] = mapped_column(_TS)
+    updated_time: Mapped[dt.datetime | None] = mapped_column(_TS)
+    moved_time: Mapped[dt.datetime | None] = mapped_column(_TS)
+    closed: Mapped[bool | None] = mapped_column(Boolean)
+    # Unconstrained NUMERIC: an absurd amount on one portal must not abort a chunk.
+    opportunity: Mapped[Decimal | None] = mapped_column(Numeric)
+    currency_id: Mapped[str | None] = mapped_column(String(16))
+    lead_id: Mapped[int | None] = mapped_column(BigInteger)
+    contact_ids: Mapped[list[int] | None] = mapped_column(postgresql.ARRAY(BigInteger))
+    company_id: Mapped[int | None] = mapped_column(BigInteger)
+    utm_source: Mapped[str | None] = mapped_column(Text)
+    utm_medium: Mapped[str | None] = mapped_column(Text)
+    utm_campaign: Mapped[str | None] = mapped_column(Text)
+    utm_content: Mapped[str | None] = mapped_column(Text)
+    utm_term: Mapped[str | None] = mapped_column(Text)
+    # The worker's clock before the request that produced this version: an upsert writes only
+    # when it is not older, so a slow page never overwrites a newer read.
+    read_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False)
+    synced_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
+    content_changed_at: Mapped[dt.datetime | None] = mapped_column(_TS)
+    deleted_at: Mapped[dt.datetime | None] = mapped_column(_TS)
+    delete_reason: Mapped[str | None] = mapped_column(String(16))
+    unreadable_since: Mapped[dt.datetime | None] = mapped_column(_TS)
+
+
+class CrmFunnel(Base):
+    """A deal funnel, or the lead pipeline as category 0, with its name (G0 Q1)."""
+
+    __tablename__ = "crm_funnels"
+    __table_args__ = (CheckConstraint("entity_type_id IN (1, 2)", name="crm_funnels_entity_chk"),)
+
+    portal_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("portals.id", ondelete="CASCADE"), primary_key=True
+    )
+    entity_type_id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    category_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
+    sort: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    seen_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
+    missing_since: Mapped[dt.datetime | None] = mapped_column(_TS)
+
+
+class CrmStage(Base):
+    """A stage of one funnel, keyed by the (category, status) pair (`deals.py::Stage`)."""
+
+    __tablename__ = "crm_stages"
+    __table_args__ = (CheckConstraint("entity_type_id IN (1, 2)", name="crm_stages_entity_chk"),)
+
+    portal_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("portals.id", ondelete="CASCADE"), primary_key=True
+    )
+    entity_type_id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    category_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))
+    sort: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    semantic: Mapped[str] = mapped_column(String(1), nullable=False, server_default=text("'P'"))
+    seen_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
+    missing_since: Mapped[dt.datetime | None] = mapped_column(_TS)
+
+
+class CrmDirty(Base):
+    """A record id to re-read, and why. Only ids: values always come from a re-read."""
+
+    __tablename__ = "crm_dirty"
+    __table_args__ = (
+        CheckConstraint("entity_type_id IN (1, 2, 3, 4)", name="crm_dirty_entity_chk"),
+        Index("crm_dirty_due_idx", "portal_id", "not_before"),
+    )
+
+    portal_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("portals.id", ondelete="CASCADE"), primary_key=True
+    )
+    entity_type_id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    reasons: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # A refresh deletes the row only WHERE seq equals what it read, so a mark that arrives
+    # mid-refresh survives for the next pass.
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("1"))
+    first_marked_at: Mapped[dt.datetime] = mapped_column(
+        _TS, nullable=False, server_default=func.now()
+    )
+    not_before: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
+    held_until: Mapped[dt.datetime | None] = mapped_column(_TS)
+    attempts: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("0"))
 
 
 class RestLog(Base):

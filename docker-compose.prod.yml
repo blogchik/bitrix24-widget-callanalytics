@@ -64,7 +64,9 @@ services:
     #
     # Workload is metadata only: a few hundred thousand rows per portal, a single
     # writer (the worker), and short dashboard aggregations. It needs neither a
-    # large buffer cache, nor a large work_mem, nor parallelism.
+    # large buffer cache, nor a large work_mem, nor parallelism. The CRM mirror
+    # adds up to ~1.5M narrow rows for a large portal (docs/deployment.md, "When
+    # the CRM mirror is on"); these numbers are revisited when it ships.
     #
     # max_connections=50 is derived, not guessed: it is the theoretical ceiling of
     # our own pools. api runs ${API_WORKERS:-2} uvicorn processes x SQLAlchemy

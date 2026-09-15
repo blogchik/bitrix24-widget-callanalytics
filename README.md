@@ -4,8 +4,10 @@
 each of them their own telephony activity: a dashboard on the left-menu page and a call list
 on the Deal / Lead / Contact / Company detail tabs.
 
-The app is **not** a telephony provider. It registers no calls, uploads no recordings and
-connects no PBX. It reads `voximplant.statistic.get` and presents it.
+The app is **not** a telephony provider. It registers no calls, uploads no recordings,
+connects no PBX and writes nothing to a CRM. It reads `voximplant.statistic.get` and, for its
+deal and UTM reports, a minimal copy of the portal's deals and leads kept in sync by the worker
+(docs/architecture.md decision 26), and presents them.
 
 ## Status
 
@@ -141,7 +143,7 @@ and the key on the host can run exactly three:
 
 ```
 deploy <40-hex-sha>    pull that tag, migrate, restart, verify from inside
-rollback               go back to the previously recorded tag; no build, no migration
+rollback               go back to the previously recorded tag; no build, cannot cross a migration
 status                 what is running, and what rollback would return to
 ```
 

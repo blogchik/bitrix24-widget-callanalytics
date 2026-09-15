@@ -40,7 +40,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
-from app.bitrix.crm import deal_context_commands, entity_activity_commands
+from app.bitrix.crm import tab_context_commands
 from app.bitrix.errors import (
     BitrixError,
     ExpiredToken,
@@ -251,15 +251,14 @@ async def _parse_body(request: Request) -> tuple[str, str] | None:
 
 
 def _crm_commands(entity_type: str, entity_id: int) -> list[tuple[str, str, dict[str, Any]]]:
-    """The CRM half of the open-time batch (§4.4 step 4).
+    """The CRM half of the open-time batch (§4.4 step 4), exactly as the open sends it.
 
     A deal needs its own related entities (contacts, companies) because telephony rows
     are documented to carry CONTACT / COMPANY / LEAD and not the deal; every other
-    entity type only needs its call activities.
+    entity type only needs its call activities - all `CRM_ACTIVITY_CAP` of them, because
+    the resolve below overwrites the row the open stored.
     """
-    if entity_type == "DEAL":
-        return list(deal_context_commands(entity_id))
-    return list(entity_activity_commands(entity_type, entity_id))
+    return tab_context_commands(entity_type, entity_id)
 
 
 @router.post("/session/exchange")

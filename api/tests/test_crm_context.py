@@ -28,6 +28,7 @@ import time
 from collections import deque
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, Final
 
 import pytest
@@ -38,8 +39,10 @@ from app.bitrix.client import BatchResult, CommandResult
 from app.bitrix.crm import (
     OWNER_TYPE_IDS,
     activity_page_commands,
+    activity_page_keys,
     deal_context_commands,
     entity_activity_commands,
+    tab_context_commands,
 )
 from app.bitrix.errors import AccessDenied
 from app.config import settings
@@ -298,6 +301,48 @@ async def test_an_errored_crm_command_resolves_to_nothing(portal: SeededPortal) 
     """
     assert await resolve("DEAL", DEAL_ID, error_on="crm.activity.list") is None
     assert await resolve("DEAL", DEAL_ID, error_on="crm.deal.get") is None
+
+
+# --- 2b. the open and the exchange resolve with one command list ---------------------
+
+
+@pytest.mark.parametrize("entity_type", ["DEAL", "LEAD", "CONTACT", "COMPANY"])
+def test_the_open_and_the_exchange_send_the_same_crm_commands(entity_type: str) -> None:
+    """§4.4 step 4 and §4.6 resolve the same context, so they must send the same batch.
+
+    Regression: `/session/exchange` built its own list and left out the follow-up activity
+    pages, so its hourly re-resolve overwrote the row the open had stored with page 0
+    alone - at most 50 activity ids where the open had matched `CRM_ACTIVITY_CAP`.
+    """
+    from app.api.session import _crm_commands
+    from app.handlers.open import _crm_tab
+
+    post = SimpleNamespace(
+        placement=f"CRM_{entity_type}_DETAIL_TAB", placement_options={"ID": DEAL_ID}
+    )
+    opened = _crm_tab(post)  # type: ignore[arg-type]
+    assert opened is not None
+
+    exchanged = _crm_commands(entity_type, DEAL_ID)
+    assert exchanged == opened.commands == tab_context_commands(entity_type, DEAL_ID)
+    sent = {key for key, _, _ in exchanged}
+    assert set(activity_page_keys()) <= sent, "every activity page the cap allows is sent"
+
+
+async def test_an_exchange_re_resolve_keeps_every_activity_page() -> None:
+    """The consequence the regression above was about: five full pages resolve to the cap,
+    not to the first 50 ids."""
+    page_size = 50
+    pages = tuple(
+        tuple(range(5000 + page_size * page, 5000 + page_size * (page + 1)))
+        for page in range(settings.crm_activity_cap // page_size)
+    )
+    commands = tab_context_commands("DEAL", DEAL_ID)
+    ctx = await resolve_crm_context(
+        batch_for(commands, activity_pages=pages), entity_type="DEAL", entity_id=DEAL_ID
+    )
+    assert ctx is not None
+    assert len(ctx.activity_ids) == settings.crm_activity_cap
 
 
 # --- 3. the three-way match clause (§4.8) -------------------------------------------

@@ -66,6 +66,7 @@ __all__ = [
     "parse_deal_entity_keys",
     "present_activity_keys",
     "resolve_recording_url",
+    "tab_context_commands",
 ]
 
 CRM_DEAL_GET: Final[str] = "crm.deal.get"
@@ -265,6 +266,31 @@ def activity_page_commands(
         )
         for start in starts
     ]
+
+
+def tab_context_commands(
+    entity_type: str, entity_id: int
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """Every CRM command a detail tab resolves its context with (§4.4 step 4, §4.6).
+
+    The open handler and `POST /session/exchange` resolve the same context and must send
+    the same commands. They used to build the list separately, and the exchange left out
+    the follow-up activity pages: its hourly re-resolve overwrote the cached row with page
+    0 alone, so a tab that had matched `CRM_ACTIVITY_CAP` activity ids at open matched at
+    most 50 an hour later, and calls linked to the deal only by activity dropped off it.
+    One builder for both callers is what stops the two lists drifting again.
+
+    The follow-up pages ride in the same batch speculatively (`activity_page_commands`
+    with `total=None`): a page past the end of the selection is an empty list, not an
+    error, and fetching them after reading page 0's total would cost a second round trip.
+    """
+    number = _entity_id(entity_id)
+    first_page = (
+        deal_context_commands(number)
+        if entity_type == "DEAL"
+        else entity_activity_commands(entity_type, number)
+    )
+    return [*first_page, *activity_page_commands(entity_type, number)]
 
 
 def context_command_keys(entity_type: str) -> tuple[str, ...]:

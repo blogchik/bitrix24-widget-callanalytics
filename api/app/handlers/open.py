@@ -44,10 +44,8 @@ from sqlalchemy.sql import func
 from app.bitrix.client import BatchResult, BitrixClient
 from app.bitrix.crm import (
     PLACEMENT_ENTITY_TYPES,
-    activity_page_commands,
-    deal_context_commands,
-    entity_activity_commands,
     entity_type_for_placement,
+    tab_context_commands,
 )
 from app.bitrix.errors import BitrixError, TransportError
 from app.bitrix.forms import (
@@ -246,17 +244,9 @@ def _crm_tab(post: IframePost) -> _CrmTab | None:
     entity_id = _int_or_none(post.placement_options.get("ID"))
     if entity_id is None or entity_id <= 0:  # pragma: no cover - forms.py guarantees it
         return None
-    commands = (
-        deal_context_commands(entity_id)
-        if entity_type == "DEAL"
-        else entity_activity_commands(entity_type, entity_id)
-    )
-    # §4.4 step 4 budgets the tab at "max 5 pages of 50 = CRM_ACTIVITY_CAP". The
-    # follow-up pages are packed into the SAME batch rather than fetched after reading
-    # page 0's `result_total`: an entity with more than 50 calls would otherwise cost a
-    # second HTTP round trip while the user waits, and a page past the end of the
-    # selection comes back as an empty list, not an error.
-    commands = [*commands, *activity_page_commands(entity_type, entity_id)]
+    # §4.4 step 4 budgets the tab at "max 5 pages of 50 = CRM_ACTIVITY_CAP", every page in
+    # this one batch. `/session/exchange` sends the same list from the same builder.
+    commands = tab_context_commands(entity_type, entity_id)
     return _CrmTab(entity_type=entity_type, entity_id=entity_id, commands=commands)
 
 

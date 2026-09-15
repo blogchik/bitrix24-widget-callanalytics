@@ -39,10 +39,11 @@ from app.db.engine import dispose_engine
 from app.db.engine import engine as _runtime_engine
 from app.db.session import control_txn, tenant_txn
 
-API_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
+# The tables that carry FORCED RLS (§3), re-exported for the suites that seed, purge and
+# isolate them. The one list lives in app/db/tenancy.py; nothing here may redefine it.
+from app.db.tenancy import TENANT_TABLES
 
-#: The three tables that carry FORCED RLS (§3). Everything else is control plane.
-TENANT_TABLES: Final[tuple[str, ...]] = ("calls", "employees", "crm_contexts")
+API_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 
 
 def _as_async_url(url: str) -> str:

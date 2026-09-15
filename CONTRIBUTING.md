@@ -77,6 +77,7 @@ and zero targets under the floor is the standard, and it is measured rather than
   deficiency; the hexes are specification values, not preferences.
 - Re-adding `X-Frame-Options`. It has no origin granularity and would break every portal;
   `Content-Security-Policy: frame-ancestors` is the control, per request.
-- Anything that makes the app write to Bitrix24 without a clear reason. It reads
-  `voximplant.statistic.get` and presents it, and that boundary is most of its safety
-  argument.
+- Anything that makes the app write to Bitrix24 without a clear reason. It reads call
+  statistics and the minimal CRM fields its reports need; the only registrations it makes are
+  placements and `event.bind` subscriptions, and it never writes a CRM record. That boundary
+  is most of its safety argument.

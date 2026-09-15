@@ -28,13 +28,13 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
-from sqlalchemy import bindparam, select, update
+from sqlalchemy import bindparam, delete, select, update
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func, text
 
-from app.db.models import Portal, PortalEvent, PortalSync
+from app.db.models import Portal, PortalEvent, PortalSync, SyncMethodBudget
 from app.logging import get_logger
 from app.security.crypto import DecryptionError, decrypt, encrypt
 
@@ -301,6 +301,11 @@ async def store_portal_credential(
     if created or reinstalled:
         sync_values.update(_cursor_reset_values())
         sync_update.update(_cursor_reset_values())
+        # Budget state describes the previous install's API usage; a fresh start owes it
+        # nothing, exactly like the cursors above.
+        await session.execute(
+            delete(SyncMethodBudget).where(SyncMethodBudget.portal_id == portal_id)
+        )
     await session.execute(
         pg_insert(PortalSync)
         .values(sync_generation=1, **sync_values)
@@ -528,5 +533,6 @@ async def mark_uninstalled(
             **_cursor_reset_values(),
         )
     )
+    await session.execute(delete(SyncMethodBudget).where(SyncMethodBudget.portal_id == portal_id))
     await record_event(session, portal_id, kind, user_id=user_id, details=details)
     return True

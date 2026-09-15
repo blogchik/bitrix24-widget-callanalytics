@@ -1,13 +1,15 @@
 # Security Policy
 
 Call Analytics (`texnobus.callanalytics`) is a Bitrix24 Marketplace app: **one deployment
-serves many portals**, and each portal's call history, employee list and OAuth credentials
-live in the same PostgreSQL database as everybody else's. That single fact decides how we
+serves many portals**, and each portal's call history, employee list, a minimal copy of its
+CRM deals and leads, and OAuth credentials live in the same PostgreSQL database as everybody
+else's. That single fact decides how we
 rank every report. The worst outcomes, in order, are:
 
 1. one portal reading, writing or deleting another portal's rows;
 2. a portal's OAuth credential or `application_token` leaving the system;
-3. a user seeing calls that Bitrix24 would not have shown them.
+3. a user seeing calls or CRM records beyond what Bitrix24 would show them under the
+   declared visibility rule (docs/architecture.md §4.7, decision 28).
 
 Everything below follows from that. The design and its rationale are in
 [docs/architecture.md](docs/architecture.md); section numbers referenced here point into it.
@@ -122,8 +124,9 @@ There is no bug bounty. We pay in credit and in a fast fix.
 Ranked by how seriously we take it.
 
 1. **Tenant isolation bypass.** Any path that reads, writes or deletes rows for a portal
-   other than the caller's. `calls`, `employees` and `crm_contexts` carry *forced* row-level
-   security bound to a transaction-local setting, and the runtime role `ca_app` cannot bypass
+   other than the caller's. Every table in `api/app/db/tenancy.py::TENANT_TABLES` (today
+   `calls`, `employees` and `crm_contexts`; the CRM mirror's tables join the same list) carries
+   *forced* row-level security bound to a transaction-local setting, and the runtime role `ca_app` cannot bypass
    it (§3) — so this usually means a query that escapes `tenant_txn`, a job that forgets to
    re-issue `SET LOCAL app.portal_id`, or a read that skips `services/calls_repo.py`.
 2. **Credential compromise.** Recovering an OAuth access/refresh token or an
@@ -135,14 +138,23 @@ Ranked by how seriously we take it.
 3. **Session token forgery or escalation.** Minting or altering the HS256 session JWT;
    raising `acc` from `own` to `all`, or `adm` from false to true; attaching an `ent` claim
    for a CRM entity the viewer cannot see; replaying an expired token through
-   `/api/v1/session/exchange`; abusing the five-minute playback token (§4.6, §4.7).
+   `/api/v1/session/exchange`; abusing the five-minute playback token (§4.6, §4.7). For the CRM reports (§4.14):
+   reading a deal or lead outside decision 28 — another assignee's record, a funnel Bitrix24
+   did not return for the viewer, leads the lead probe refused — or getting a CRM tab session
+   for an entity the live per-record check refused.
 4. **Secret leakage into a log.** Anything the recursive redaction in
    `api/app/security/redact.py` misses, so that a token reaches stdout, a `rest_log` row or
    Caddy's access log (§6). `api/tests/test_secret_logging.py` is the regression test — a
    report that makes it fail is in scope automatically.
 5. **Lifecycle-event authentication bypass.** Getting `POST /events/` to act on an
    `ONAPPUNINSTALL` or `ONAPPUPDATE` without a constant-time-equal `application_token`, or
-   creating a portal row without the refresh exchange plus `user.admin` proof (§4.9).
+   creating a portal row without the refresh exchange plus `user.admin` proof (§4.9). The
+   CRM change-signal endpoint `POST /events/crm/` and the offline-queue drain (§5.11, shipping
+   with the CRM mirror) belong here too:
+   - marking records or waking a portal without the stored `application_token`;
+   - writing anything for an uninstalled or opted-out portal;
+   - making the worker tombstone a record that still exists, since a tombstone needs
+     Bitrix24's own `crm.item.get` NOT_FOUND (§5.12).
 6. **Frame-embedding escape.** Making the per-request
    `Content-Security-Policy: frame-ancestors` accept an origin that is not the validated
    `DOMAIN`, so the app renders inside an attacker's page (§4.10).

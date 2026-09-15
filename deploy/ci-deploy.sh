@@ -12,7 +12,8 @@
 # arrives as $SSH_ORIGINAL_COMMAND and anything not matched below is refused.
 #
 #   deploy <40-hex-sha>   pull that tag, migrate, restart, verify, record it
-#   rollback              go back to the previously recorded tag; no build, no migration
+#   rollback              go back to the previously recorded tag; no build, and it
+#                         cannot cross a migration (the older tree's alembic stops it)
 #   status                what is running, and what rollback would go back to
 #
 # **Why it lives OUTSIDE /opt/callanalytics.** `deploy` checks the working tree out at

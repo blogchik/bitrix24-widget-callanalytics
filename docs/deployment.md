@@ -461,7 +461,7 @@ from any machine holding a key that is *not* restricted:
 | Command | What it does |
 | --- | --- |
 | `deploy <40-hex-sha>` | Fetch, check the tree out at that commit, pull those image tags, migrate, `up -d --wait`, verify from inside. Records the previous tag first. |
-| `rollback` | Re-run the above against the previously recorded tag. No build, no migration. |
+| `rollback` | Re-run the above against the previously recorded tag. No build. `alembic upgrade head` runs from that older checkout too: a no-op when the schema has not moved, and a stop — with the running release untouched — when the release being left carried a migration the older tree does not know. |
 | `status` | What is running, what `rollback` would return to, and the checkout's HEAD. |
 
 The script behind them is [`deploy/ci-deploy.sh`](../deploy/ci-deploy.sh) in this
@@ -489,6 +489,13 @@ this box, reach for it before you reach for a rebuild.
 A schema rollback is a different question and usually the wrong move. `downgrade()` exists
 in every revision and CI proves it still runs, but executing it discards whatever the
 newer columns hold. Prefer rolling the images back and leaving the schema forward.
+
+That preference has a hard edge. `rollback` re-runs `alembic upgrade head` from the older
+checkout, and an older tree does not know a newer revision, so a rollback across a
+migration stops before it restarts anything. This is why a migration ships as its own
+schema-only release, one release ahead of the code that uses it (architecture decision
+30): the code release can then always be rolled back to the schema release, which already
+knows the revision.
 
 ---
 
@@ -610,6 +617,13 @@ What survives a restore and what does not:
 - `portals`, `portal_sync` — irreplaceable. Tokens, cursors, placement state.
 - `calls`, `employees`, `crm_contexts` — rebuildable. The worker re-fetches them from
   Bitrix24; the cost is a backfill, not data.
+- `sync_method_budgets` — self-correcting. A stale row at worst parks one method until its
+  reset time.
+- The CRM mirror's tables, once they exist — rebuildable like `calls`, but a restored copy
+  silently predates every edit and deletion made after the dump. Right after a restore, run
+  the mirror's gap recovery (`python -m app.tools.crm_mode recover --all`, shipping with
+  milestone M4) so sweeps rewind and a full reconciliation runs, instead of serving the
+  restored rows as current.
 - `rest_log` — retention is seven days anyway.
 
 ---
@@ -727,6 +741,32 @@ Our four containers should sit far below their caps — 384M postgres, 384M api,
 worker, 256M web, 1344M in total against roughly 2.2 GiB available. A container running
 at its ceiling is a leak to investigate, not a limit to raise: the caps are sized so that
 if we leak, the kernel kills *us* instead of choosing a victim elsewhere on the machine.
+
+### When the CRM mirror is on (from milestone M4)
+
+The mirror (architecture §4.14, §5.10–§5.13) changes the arithmetic above. Revisit it
+before the caps are hit, not after:
+
+- **Disk.** Postgres grows by roughly 0.5 GB for a large portal (about 100 000 deals and
+  300 000 leads with their stage history and call activities), and by megabytes for a
+  typical one. `rest_log` grows about fourfold while a history backfill runs; CRM batches
+  are logged as timing and payload shape, never row values.
+- **Worker capacity.** Two heavy slots out of four leave room for about 120 portals that are
+  still loading history, and about 240 once they are quiet; past 150 CRM portals the quiet
+  ones poll every 15 minutes. These are planning numbers, re-measured when M4 ships.
+- **Release order.** Every migration ships as its own schema-only release, one release ahead
+  of the code that uses it (decision 30). The next section explains why a rollback cannot
+  cross a migration.
+
+Worth a look, beyond the list above:
+
+| Signal | Where | Worry when |
+| --- | --- | --- |
+| Overdue visits | `portal_sync.next_run_at` on active portals | more than a minute late, repeatedly |
+| Disk | `df -h /` and the `pgdata` volume | growth outpacing the sizing above |
+| Offline event backlog | the settings page, CRM block | growing across days |
+| Reserved offline batches | `crm_offline_batches` in state `reserved` | older than an hour |
+| Visibility alarm | `portals.crm_visibility_alarm_at` | set at all: the installer credential stopped seeing records |
 
 ---
 

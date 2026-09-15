@@ -53,3 +53,27 @@ when no error was logged.
 | Open as a non-admin with own-calls rights | Only that user's own leads and deals, and no employee control |
 | Read the conversion column on a tag with more deals than leads | A value above 100 %, with the note above the table explaining it |
 | Narrow the browser to 375 px | No horizontal page scroll; the table and the matrix scroll inside their own regions and say so |
+
+### CRM mirror (decisions 26–30, §4.14, §5.10–§5.13)
+
+Walk these on a portal that has been switched to the mirror (`crm_mode = mirror`).
+
+| Step | Expected |
+|---|---|
+| Install on a clean portal, then call `event.get` | The CRM offline bindings (or, on plans without them, the online `/events/crm/` bindings) and `ONOFFLINEEVENT` are present |
+| Publish a new app version, apply it, call `event.get` again | The same bindings are present again after the update |
+| Open "Deals" or "Sources" right after install | A "history is still loading" notice with a percentage, never a silently short report |
+| Change a deal's stage in Bitrix24 | The report shows the new stage within 5 minutes |
+| Delete a deal in Bitrix24 | It disappears from the reports within 5 minutes (offline-events plan) |
+| Choose a period of 366 days | The report renders; no 92-day cap and no REST request per period change |
+| Open as a non-administrator whose CRM role hides funnel X | Funnel X appears nowhere: not on "Deals", not in the deals leg of "Sources", not in transitions |
+| Open as a non-administrator with no right to view leads | The leads leg is unavailable, as it was with the live read |
+| POST a forged lead, contact or company tab id the user cannot read | "No access to this CRM item", no entity session |
+| As an administrator, open settings and press "Disable CRM analytics" | CRM sync stops, the portal's CRM rows are deleted, and the Deals and Sources pages show the "turned off" state |
+| Uninstall the app | Every customer table is empty for the portal, the CRM ones included |
+
+### Known simplifications of the CRM mirror to declare
+
+- Visibility is administrator → all records; everyone else → records assigned to them, inside the funnels Bitrix24 shows them, and leads only when Bitrix24 lets them view leads. A department head or a user with broader CRM rights sees only their own records.
+- Amounts are shown in each deal's own currency; Bitrix24 does not return the account-currency amount to list calls.
+- A record restored from the Bitrix24 recycle bin gets a new id, so it arrives as a new record without the history it had before deletion.

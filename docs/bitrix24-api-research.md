@@ -155,6 +155,89 @@ nothing before this touched leads as DATA, and nothing touched UTM at all.
 - [unknown] (What does `crm.item.list {entityTypeId:1}` answer in simple CRM mode?) It may error, or it may return an empty list. If it returns empty, "leads are turned off" and "no leads this month" are indistinguishable and the copy must cover both.
   - impact: §4.13 treats only a typed `MethodNotFound` / `AccessDenied` as "unavailable", so an empty 200 currently reads as "no leads this month".
 
+### Block (i) — CRM change capture (for the CRM mirror, architecture decisions 26–30)
+
+Researched 2026-09-14 against apidocs.bitrix24.com and helpdesk.bitrix24.com. Rows tagged
+`[measured]` were run read-only on one production cloud portal on 2026-09-15; the anonymised
+table is `docs/spike-crm-mirror.md` (spike S-A). The spikes still open are listed at the end.
+
+**A. Change signals**
+
+- [verified] (A1 · CRM events carry an id, not a record) `ONCRMDEALADD` / `ONCRMDEALUPDATE` / `ONCRMDEALDELETE` and their lead, contact and company twins deliver the record id in `data[FIELDS][ID]` and no field values.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/deals/events/on-crm-deal-update.html , https://apidocs.bitrix24.com/api-reference/crm/deals/events/on-crm-deal-delete.html
+  - impact: an event is a signal. The stored row always comes from a re-read, so a lost, duplicated or reordered event can never write a wrong value.
+- [verified] (A2 · Online events are delivered once) An online handler that is down or slow loses the event; Bitrix24 does not retry it.
+  - src: https://apidocs.bitrix24.com/api-reference/events/index.html
+  - impact: online events alone cannot keep a mirror complete. A sweep and a reconciliation are mandatory, not optimisations.
+- [verified] (A3 · Offline events are a queue on the portal) `event.bind` with `event_type=offline` stores events on the portal; `event.offline.get`, `event.offline.clear`, `event.offline.error` and `event.offline.list` read and manage the queue. Binding and every queue call require an administrator in an application context. Repeats collapse on (event name, `EVENT_DATA`), so one record's ADD, UPDATE and DELETE stay three rows.
+  - src: https://apidocs.bitrix24.com/api-reference/events/offline-events.html , https://apidocs.bitrix24.com/api-reference/events/event-offline-get.html , https://apidocs.bitrix24.com/api-reference/events/event-offline-list.html , https://apidocs.bitrix24.com/api-reference/events/event-offline-clear.html
+  - impact: the worker binds and drains with the installer credential, which is already proven to be an administrator's. Queue calls count against the request and operating-time limits like any other method.
+- [verified] (A4 · Reserve, then confirm) `event.offline.get` with `clear=0` returns a `process_id` and holds the rows until `event.offline.clear` names it. Whether a portal supports this is reported by `feature.get` as `rest_offline_extended`.
+  - src: https://apidocs.bitrix24.com/api-reference/events/event-offline-get.html , https://apidocs.bitrix24.com/api-reference/common/system/feature-get.html
+  - impact: the signal mode is chosen per portal at runtime — reserve-and-confirm, list-then-clear, or online events with a faster sweep — instead of assuming one plan.
+- [verified] (A5 · `ONOFFLINEEVENT` is a doorbell) It notifies an online handler that the queue is not empty and takes `minTimeout`; notifications that fall inside the timeout are dropped, not delayed.
+  - src: https://apidocs.bitrix24.com/api-reference/events/on-offline-event.html
+  - impact: a wake-up only. A timer poll stays as the schedule.
+- [verified] (A6 · Bindings are not permanent) Uninstalling removes the app's bindings and its queue, and an app update can leave bindings missing.
+  - src: https://apidocs.bitrix24.com/api-reference/events/event-bind.html , https://apidocs.bitrix24.com/api-reference/events/event-get.html
+  - impact: bindings are reconciled with `event.get` on install, on `ONAPPUPDATE` and daily, and a binding found missing triggers gap recovery.
+- [verified] (A7 · A funnel move is not an update) Moving a deal to another funnel fires `ONCRMDEALMOVETOCATEGORY`; `ONCRMDEALUPDATE` does not fire for it.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/deals/events/on-crm-deal-move-to-category.html , https://apidocs.bitrix24.com/api-reference/crm/deals/events/index.html
+  - impact: bound on its own. Stage history rows with `TYPE_ID=5` are the pull-side backstop.
+
+**B. Reading the source of truth**
+
+- [verified] (B1 · Fast listing) `order {id: ASC}` with a `>id` filter and `start: -1` skips the COUNT and pages by keyset.
+  - src: https://apidocs.bitrix24.com/settings/performance/huge-data.html
+  - impact: every mirror list is a keyset walk, and nothing reads `total` or `next`.
+- [measured] (B2 · Keyset on this portal) `>id` with `start:-1` works on `crm.item.list` and on the legacy `crm.deal.list` / `crm.lead.list`, ascending and descending; `total` and `next` come back `null`, not 0.
+- [measured] (B3 · Filters that are honoured) `>=updatedTime`, the three-leg OR (created, or updated, or closed and moved), `@id` with 50 ids, and `order {updatedTime, id}` all constrain the result.
+- [measured] (B4 · Fields a real portal returns) `opportunityAccount` and `accountCurrencyId` are never returned by `crm.item.list`, even when selected; `contactIds` is a list; `closed` is `"Y"` / `"N"`; the envelope carries `time.date_start` with a UTC offset.
+  - impact: money is stored in each deal's own currency only, and a deal's contacts need no second call.
+- [measured] (B5 · A missing record) `crm.item.get` for a missing id answers the error code `NOT_FOUND`. Legacy `crm.deal.get` answers "Not found" with no code.
+  - impact: a tombstone is confirmed only through `crm.item.get`. A portal with only the legacy methods holds deletions instead of guessing.
+- [measured] (B6 · Stage history) `crm.stagehistory.list` pages by an `>ID` keyset and filters by `@OWNER_ID`.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/crm-stage-history-list.html
+- [measured] (B7 · Chaining) `$result` references work inside a batch; after a short page the next chained command fails with `INVALID_ARG_VALUE`, which means "no more rows", not a fault.
+- [unknown] (B8 · What bumps `updatedTime`) Which edits update it is not documented, and an import can set it.
+  - impact: never the only watermark. Signals come first, and a patrol re-reads values on a cycle for edits that do not bump it.
+
+**C. Deletes and limits**
+
+- [verified] (C1 · Recycle bin) Deleted CRM items go to the recycle bin for 30 days and are then deleted for good; a record restored from it comes back with a new id.
+  - src: https://helpdesk.bitrix24.com/open/8974325/ , https://helpdesk.bitrix24.com/open/24854300/
+  - impact: a restore arrives as a new record without its earlier history, which is declared in the moderation checklist.
+- [verified] (C2 · Absence proves nothing) A list returns only what the calling user may read, so a narrowed credential and a deleted record look the same from a list.
+  - src: https://apidocs.bitrix24.com/api-reference/crm/universal/crm-item-list.html
+  - impact: decision 29. Nothing is tombstoned because a list stopped returning it.
+- [measured] (C3 · Operating time is per method) `time.operating` accumulates per method for this app over the last ten minutes, and exceeding the limit blocks that method for this app only (see the correction in the limits entry above).
+  - src: https://apidocs.bitrix24.com/settings/performance/limits.html
+  - impact: decision 27, `sync_method_budgets`.
+- [measured] (C4 · Range counts are cheap here) A bounded `start:0` count over an id range cost about 0.3–0.4 s on the measured portal.
+  - impact: reconciliation by count bisection is affordable. Re-measure on a large portal before relying on it (spike S-C).
+
+**D. Visibility**
+
+- [verified] (D1 · Funnels follow the caller) `crm.category.list` is filtered by the caller's permissions (block (g)).
+  - impact: the viewer's own funnel list, read with the viewer's token at every open, is the deal half of decision 28.
+- [verified] (D2 · Roles are rich and unreadable) CRM roles set access per entity, per stage and to "all" / "department" / "own" items, and a user with several roles gets the most permissive one. No REST method returning a user's CRM role was found.
+  - src: https://helpdesk.bitrix24.com/open/24127550/
+  - impact: visibility is a declared rule, not a model of Bitrix24's roles.
+- [unknown] (D3 · Does an administrator always see everything?) An administrator whose CRM role is restricted may not see every record through REST. Spike S-C.1.
+  - impact: until proven, a non-installer administrator is compared against the mirror in shadow, and an `installer_blind` alarm blocks promotion.
+- [unknown] (D4 · A user with no lead rights) Whether `crm.item.list {entityTypeId: 1}` answers ACCESS_DENIED or an empty list. Spike S-C.3.
+  - impact: the lead probe treats a denial as "leads hidden" and cross-checks an empty answer against the mirror.
+- [verified] (D5 · BI Connector is not an extraction path) Its keys are created by hand in the portal UI, and no REST method creates them.
+  - src: https://helpdesk.bitrix24.com/open/18374896/
+  - impact: a Marketplace app cannot use it to mirror a portal it is installed on.
+
+**Spikes still open** (each gates a milestone; results go to `docs/spike-crm-mirror.md`):
+
+- **S-B, events.** Offline binding as administrator and refusal for a non-administrator, a real `EVENT_DATA`, `feature.get` on the portal's plan, `minTimeout`, `event.get` across an app update, recycle-bin delete and restore, the `updatedTime` bump matrix, merge, and whether `event.offline.get clear=1` honours its filter. It writes to the portal's configuration, so it needs the owner's approval.
+- **S-C, visibility and cost.** A restricted-role administrator, non-admin `crm.category.list` and `crm.dealcategory.list`, the no-lead-rights answer, range-count cost on a large portal, contact merge.
+- **S-D, tabs.** `crm.activity.list` keyset and `@ID`, activities bound to several records, `crm.item.get` ACCESS_DENIED for lead, contact and company.
+- **S-E, calls.** The cost of a `voximplant.statistic.get` range total, whether a statistics row can be deleted, and whether Bitrix24's retention removes old calls.
+
 
 ### Corrections to brief
 - Brief says telephony roles are 'Administrator/Manager/Operator'. Official helpdesk lists default roles Administrator, Chief executive, Head of department, Manager; there is no 'Operator' default role. The 'Call statistics' permission has four values: Only their own calls / Calls from their department / Any calls / No access.
@@ -299,7 +382,7 @@ nothing before this touched leads as DATA, and nothing touched UTM at all.
 - [verified] ((e) request intensity limits) Leaky-bucket per Bitrix24 account: non-Enterprise plans drain 2 requests/sec with a burst threshold of 50; Enterprise 5/sec with threshold 250. Exceeding gives HTTP 503 {"error":"QUERY_LIMIT_EXCEEDED","error_description":"Too many requests"}. Intensity is counted per Bitrix24 instance and per source IP, so multiple apps on one server IP share one bucket. Recommendation: retry with increasing delay, do not run parallel series.
   - src: https://apidocs.bitrix24.com/settings/performance/limits.html
   - impact: Backfill must be serial per portal with a token bucket of ~2 req/s (Basic plan), exponential backoff on 503/QUERY_LIMIT_EXCEEDED. Because the limit is per portal, the scheduler can run portals in parallel but must never fan out inside one portal. Since all tenants come from one Hetzner IP, keep a global concurrency cap too.
-- [verified] ((e) time block & operating-time limit) Every response's time{} has start, finish, duration, processing, date_start, date_finish, and (cloud) operating = accumulated execution time of this method for this app/webhook in the last 10 one-minute baskets, operating_reset_at = unix timestamp when the oldest basket drops out. If operating exceeds 480 s per 10 min (cloud; self-hosted default 420 s) the method is blocked with HTTP 429 OPERATION_TIME_LIMIT for all apps/webhooks of that account until baskets expire; recommendation is to suspend calls until operating_reset_at from the last successful response.
+- [verified] ((e) time block & operating-time limit) Every response's time{} has start, finish, duration, processing, date_start, date_finish, and (cloud) operating = accumulated execution time of this method for this app/webhook in the last 10 one-minute baskets, operating_reset_at = unix timestamp when the oldest basket drops out. If operating exceeds the limit (in the cloud the value is set by Bitrix24's configuration and 480 s per 10 min is the documented example; self-hosted has the limit disabled by default, 420 s when enabled) the method is blocked with HTTP 429 OPERATION_TIME_LIMIT *for this app or webhook only* — other apps, webhooks and methods continue (corrected 2026-09-15 against the current limits page; the earlier "all apps of that account" reading was wrong) — until baskets expire; recommendation is to suspend calls until operating_reset_at from the last successful response.
   - src: https://apidocs.bitrix24.com/settings/performance/limits.html
   - impact: Persist last time.operating / operating_reset_at per (portal, method); if operating approaches ~400 s pause the backfill until operating_reset_at. On 429 OPERATION_TIME_LIMIT, sleep until operating_reset_at, do not retry immediately. Log time{} with every REST call (also satisfies the 3-day log requirement).
 - [verified] ((e) batch) batch executes up to 50 sub-requests (more => ERROR_BATCH_LENGTH_EXCEEDED, HTTP 400); nested batch is prohibited. halt=0 runs all and collects errors in result_error; halt=1 stops at the first error. HTTP 200 response: result.result{cmd:...}, result.result_error{cmd:{error,error_description}}, result.result_next{cmd:start}, result.result_total{cmd:total}, result.result_time{cmd:time{}}. Sub-results can be referenced with $result[cmd][field]. The batch HTTP call itself is one request for intensity and is 'not accounted for in operating', but each nested method is executed separately and its execution time counts toward the per-method operating limit.
@@ -342,7 +425,7 @@ nothing before this touched leads as DATA, and nothing touched UTM at all.
 - Do CALL_VOTE and COMMENT change after the row is created (e.g. vote given in the call card after hangup)? Undocumented; the trailing re-scan window mitigates it but its size should be tuned from real data.
 - Is the internal ID strictly monotonic with row creation across all telephony providers on the portal (assumed, since it is the statistics table primary key)? Verify on a portal with mixed built-in + external lines before relying on it as the sync cursor.
 - Does the QUERY_LIMIT_EXCEEDED response carry any Retry-After header or a time block? Docs only give the status/code; capture a real 503 body during load testing.
-- Exact operating-time limit on the target on-premise (self-hosted) builds: docs say default 420 s and admin-configurable; the sync throttle should read time.operating adaptively rather than hardcode 480.
+- Exact operating-time limit per portal: the cloud value is Bitrix24's own configuration (480 s is the documented example), and self-hosted builds have the limit off by default, 420 s when enabled. *Answered by design, 2026-09-15:* the throttle learns the limit per (portal, method) from time.operating and from a 429 instead of hardcoding 480 (docs/architecture.md decision 27).
 
 ## Research block
 - [verified] (placement.bind parameters) placement.bind accepts PLACEMENT (string, required), HANDLER (string, required, widget handler URL), TITLE (string, optional; tab name / menu item name), DESCRIPTION (string, optional; 'Not used in practice'), GROUP_NAME (string, optional; grouping for multiple handlers, only some widget types), LANG_ALL (object keyed by language code, each with TITLE/DESCRIPTION/GROUP_NAME), OPTIONS (object; currently used only by messenger widgets, PAGE_BACKGROUND_WORKER and CRM_XXX_DETAIL_ACTIVITY), USER_ID (integer; only PAGE_BACKGROUND_WORKER). Scope: placement (+ scope of the placement, e.g. crm for CRM tabs). Executed by administrator only. Returns result:true/false.

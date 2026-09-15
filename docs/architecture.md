@@ -12,14 +12,14 @@ Bitrix24 Marketplace application: one deployment serves many portals, reads only
 4. **Any write of the portal sync credential requires a proven administrator**: the token must pass `user.current` + `user.admin = true` at the OAuth-derived `client_endpoint` before it is stored. This holds for `/install/`, self-heal, re-authorize and every lifecycle event; a non-admin token can never become the worker's credential (which would silently cache only that user's calls).
 5. **Lifecycle events are verified by `application_token` first**: if a token is stored, constant-time equality is required for every event including `ONAPPINSTALL`/`ONAPPUSERREADY`. `ONAPPUPDATE` is the only event that may replace it, and only when its `auth[access_token]` proves `user.admin=true` at the stored endpoint **and** its `auth[refresh_token]` exchanges to the same `member_id`.
 6. **Cookie-free sessions: a stateless HS256 JWT minted per open, handed to the SPA by a tiny inline-script page (`location.replace`), never in a `Location` header** — third-party cookies are unreliable in the Bitrix24 iframe, and a bearer token in a redirect header would be written to the reverse-proxy access log on every open of every tenant. The page forwards Bitrix24's **original query string verbatim** (`DOMAIN`, `PROTOCOL`, `LANG`, `APP_SID`), because the BX24 JS SDK needs `APP_SID` to talk to the parent frame.
-7. **Permissions are Bitrix24's answer, resolved at every open: `user.admin` + (for non-admins) one `voximplant.statistic.get` probe with the user's own token → `all | own | denied`** — no role system of our own; `denied` renders the mandated explanatory state, never an empty screen.
+7. **Permissions are Bitrix24's answer, resolved at every open: `user.admin` + (for non-admins) one `voximplant.statistic.get` probe with the user's own token → `all | own | denied`** — no role system of our own; `denied` renders the mandated explanatory state, never an empty screen. The CRM reports keep this gate in front of them and narrow `own` further by decision 28.
 8. **Structural isolation: Row-Level Security ENABLED and FORCED on customer-data tables, runtime role `ca_app` is `NOBYPASSRLS`, and every transaction that touches them starts with `SET LOCAL app.portal_id`** — a query that forgets the context returns zero rows instead of another tenant's rows. Because RLS fails *silently* closed, every job that writes or deletes customer rows (purge, upserts, CRM context) must open `tenant_session(portal_id)` **per transaction**, and the purge verifies emptiness before declaring success.
-9. **Sync cursor is the statistics record `ID`, never `CALL_START_DATE`; upsert key `(portal_id, bx_id)`** — rows are created at call finish and may carry backdated start dates, so only the monotonic ID captures late-finished calls without overlap windows.
+9. **Sync cursor is the statistics record `ID`, never `CALL_START_DATE`; upsert key `(portal_id, bx_id)`** — rows are created at call finish and may carry backdated start dates, so only the monotonic ID captures late-finished calls without overlap windows. CRM items key on `(portal_id, entity_type_id, id)`: the id keyset walks their history, and edits arrive through change signals and an `updatedTime` sweep (§5.10).
 10. **A batch cursor advances only across the longest error-free *prefix* of its commands** — one failed sub-command in a 50-page batch would otherwise leave a permanent 50-row hole that neither the forward nor the backward cursor ever revisits.
 11. **Bitrix24 data is never allowed to poison a chunk**: no CHECK constraints on Bitrix-controlled enums, wide string columns, per-row parsing with quarantine (`portal_events(row_rejected)`), in-chunk dedupe by `bx_id`, and a SAVEPOINT retry — a single unexpected value can never stall the cursor forever.
 12. **`head_fetch` of the newest 2,500 rows first, then a descending backfill (`<low_id`), with a fixed batch size of 20 pages (halving to 5 under limit errors)** — the moderator's dashboard shows recent days within seconds of install; the `<low_id` window is immutable so offsets in one batch cannot drift. `head_fetch` is idempotent and re-runs from `pending` *or* `head`, so a crash between its two steps cannot wedge the portal.
 13. **Worker writes are fenced**: every cursor/upsert transaction updates `portal_sync` `WHERE lease_owner = :me AND lease_expires_at > now() AND sync_generation = :gen` and aborts on zero rows; uninstall/reinstall bump `sync_generation`, so an in-flight run can never re-insert rows after a purge or clobber a newer runner's cursor. All REST calls carry a 120 s timeout, far below the 5-minute lease.
-14. **Late updates are handled by an ID-window rescan (72 h, with a persisted `rescan_from_id`) plus a per-row recording recheck budget (max 2) plus an on-demand refresh flag** — recordings/votes/comments are attached after the row exists and Bitrix24 exposes no modified date.
+14. **Late updates are handled by an ID-window rescan (72 h, with a persisted `rescan_from_id`) plus a per-row recording recheck budget (max 2) plus an on-demand refresh flag** — recordings/votes/comments are attached after the row exists and Bitrix24 exposes no modified date. CRM records, which do carry one, use signals, sweep, reconciliation and patrol instead (§5.10–§5.12).
 15. **Durable state instead of a job queue: every unit of work is derivable from `portal_sync` / `portals` columns; APScheduler is only a ticker and dispatch is `asyncio.create_task` under a semaphore** — a worker crash loses nothing, and a leased-but-undispatched portal is never charged a phantom failure.
 16. **Single-flight token refresh with `token_version` under `SELECT ... FOR UPDATE`; refresh only on `expired_token`, on imminent expiry, when the chain is dead/aged, or on an explicit "Re-authorize"** — never on a routine open and never on a schedule, and rate-limited per `member_id`/IP so an employee cannot script refresh exchanges against our client_id.
 17. **Uninstall makes no REST calls; the webhook flips status, wipes API tokens, keeps `application_token`, bumps `sync_generation`, and the worker purges rows in 10k chunks under tenant context; retries older than `install_completed_at` are ignored** — API access is already revoked at that moment, and a stale retry must not wipe a fresh reinstall.
@@ -27,10 +27,15 @@ Bitrix24 Marketplace application: one deployment serves many portals, reads only
 19. **Tokens encrypted at rest with an AES-256-GCM envelope carrying a key id and AAD = `member_id:column`** — a ciphertext copied between rows or tenants does not decrypt. v1 ships one key; the envelope's `key_id` byte keeps rotation a later background task, not a migration.
 20. **`rest_log` records every outbound REST/OAuth call and every inbound Bitrix24 POST, recursively redacted, written in its own short transaction, kept 7 days (configuration refuses < 3)** — the moderation requirement plus the `time{}` block the throttle needs; a failed work transaction must still leave the exchange logged.
 21. **Recording playback is credential-safe by construction**: `GET /api/v1/calls/{id}/record?t=<short-lived signed URL token>` (an `<audio src>` cannot send an `Authorization` header); for non-admin viewers the proxy uses the **viewer's own** token so Bitrix24's separate "listen to recordings" right is enforced; `call_record_url` is never returned to the browser, is stored with credential-bearing query parameters stripped, is excluded from change detection, and `RECORDING_MODE=redirect` is forbidden unless the spike proves the URL carries no credential.
-22. **Deal tab context is resolved at open time with the *opener's* token and cached in `crm_contexts`; if any CRM command errors the tab renders a "no access to this item" state and no entity JWT is minted** — a cached context resolved by a privileged user must never be served to a user who cannot see the entity.
+22. **Deal tab context is resolved at open time with the *opener's* token and cached in `crm_contexts`; if any CRM command errors the tab renders a "no access to this item" state and no entity JWT is minted** — a cached context resolved by a privileged user must never be served to a user who cannot see the entity. Under the mirror the per-record check stays live with the opener's token and extends to lead, contact and company tabs; only the matching data comes from Postgres (§4.14).
 23. **`GET /app/` self-heals a broken endpoint**: a transport-level failure of the open batch (portal renamed, custom domain connected) triggers one refresh exchange to re-learn `client_endpoint`, then one retry — otherwise a rename would deadlock the tenant permanently.
 24. **Every non-happy path is a rendered, translated state page**, and all Bitrix24-facing endpoints use strict input allowlists with a rendered "bad request" page. A scanner sees nothing exploitable and nothing blank.
 25. **Capability probe at install (`method.get voximplant.statistic.get`) recorded in `portals.capabilities`, plus a runtime filter-honoured assertion** — on-premise builds lag the cloud; a missing method or an ignored `>ID` operator becomes an explicit terminal portal state instead of a mysterious failure or a hot loop.
+26. **CRM reports read a Postgres mirror, not Bitrix24** (owner decisions D-1..D-9 of 2026-09-14/15, superseding §4.12 constraint 4 and §4.13 constraint 1) — deals, leads, their stage history, funnels and stages, and call activities are synced by the worker with the installer credential; `/deals`, `/utm` and the CRM tab read the mirror, so no report depends on request-time REST, the per-method operating limit or a 92-day cap. The select is pinned to exactly the fields the privacy policy lists (`api/app/bitrix/crm_items.py`), never a title, a person, a comment or a custom field (§4.14, §5.10–§5.13).
+27. **Operating time is budgeted per (portal, method)** — `time.operating` is a per-method accumulator (docs/spike-crm-mirror.md, S-A.6). `portal_sync.operating_*` is the statistics method's; every other method has a `sync_method_budgets` row (0003), so one method's limit parks only that method and never the call sync.
+28. **Mirror visibility is a declared rule, checked live at every open** — administrator: everything; everyone else: records assigned to them, deals only inside the funnels `crm.category.list` returns for their own token, leads only when a lead probe with their token succeeds. Nothing else of Bitrix24's CRM roles is modelled; a department head sees their own records.
+29. **A mirrored record is tombstoned only on `crm.item.get` NOT_FOUND, with an admin-verified credential and an error-free confirmation** — absence from a list proves nothing, because a narrowed token looks identical. A tombstone nulls every data column at once and keeps only the id for 35 days; a record restored from the recycle bin arrives as a new id.
+30. **Schema ships one release ahead of the code that uses it** — `deploy/ci-deploy.sh` runs `alembic upgrade head` on rollback as well as on deploy, so a release that carries a migration cannot be rolled back past it.
 
 ---
 
@@ -127,6 +132,7 @@ Bitrix24 Marketplace application: one deployment serves many portals, reads only
 │   │   │   └── crm_context.py             # resolve + cache deal/lead/contact/company → entity keys and activity ids
 │   │   ├── sync/
 │   │   │   ├── throttle.py                # per-portal pacing, backoff, Retry-After, operating-time guard (floored)
+│   │   │   ├── budgets.py                 # sync_method_budgets: the same guard per (portal, method), statistics excepted
 │   │   │   ├── fetch.py                   # one batch of N statistic.get pages; contiguous-prefix cursor rule
 │   │   │   ├── upsert.py                  # dedupe, SAVEPOINT chunks, quarantine, ON CONFLICT, content_changed_at
 │   │   │   ├── head_fetch.py              # newest 2,500 rows at install, idempotent (§5.2)
@@ -193,7 +199,7 @@ Caddy (host, outside compose): `/app/*`, `/install/*`, `/settings/*`, `/events/*
 
 ## 3. Database schema — PostgreSQL 16
 
-Rules: surrogate `portal_id` on every tenant row; `member_id` unique on `portals` with a format check; customer-data tables (`calls`, `employees`, `crm_contexts`) carry FORCED RLS bound to the transaction-local `app.portal_id`; control-plane tables (`portals`, `portal_sync`, `rest_log`, `portal_events`) have no RLS because the worker tick and support must scan across portals and they hold no call data. **No CHECK constraint is placed on a value Bitrix24 controls** — unknown enum values are stored raw and mapped in the UI; only values we generate are constrained. Encrypted columns are `bytea` and end in `_enc`: envelope `key_id(1) || nonce(12) || ciphertext || tag(16)`, AAD = `member_id || ':' || column_name`.
+Rules: surrogate `portal_id` on every tenant row; `member_id` unique on `portals` with a format check; customer-data tables (`calls`, `employees`, `crm_contexts`) carry FORCED RLS bound to the transaction-local `app.portal_id`; control-plane tables (`portals`, `portal_sync`, `sync_method_budgets`, `rest_log`, `portal_events`) have no RLS because the worker tick and support must scan across portals and they hold no call data. **No CHECK constraint is placed on a value Bitrix24 controls** — unknown enum values are stored raw and mapped in the UI; only values we generate are constrained. Encrypted columns are `bytea` and end in `_enc`: envelope `key_id(1) || nonce(12) || ciphertext || tag(16)`, AAD = `member_id || ':' || column_name`.
 
 ```sql
 -- ===================== roles (docker/postgres/init.sql; run once by ops) =====================
@@ -491,6 +497,21 @@ CREATE INDEX portal_events_portal_idx ON portal_events (portal_id, created_at DE
 
 COMMENT ON TABLE  portal_events IS 'First thing on-call greps: install | reinstall | admin_open | token_reseeded | refresh_failed | domain_changed | app_update | event_rejected | row_rejected | sync_blocked | sync_unblocked | uninstall | uninstall_inferred | purge_done | purge_incomplete. details never contains tokens.';
 
+-- ===================== 0003_sync_method_budgets =====================
+-- ---------- sync_method_budgets: operating-time state per (portal, method), statistics excepted ----------
+CREATE TABLE sync_method_budgets (
+    portal_id            bigint      NOT NULL REFERENCES portals(id) ON DELETE CASCADE,
+    method               varchar(64) NOT NULL,
+    operating_seconds    numeric(8,2),      -- the method's own time.operating accumulator, last seen
+    operating_reset_at   timestamptz,
+    blocked_until        timestamptz,       -- soft-limit stop or 429 on THIS method
+    limit_s              numeric(8,2),      -- learned limit; NULL = default 480
+    throttle_hits        integer     NOT NULL DEFAULT 0,
+    clean_visits         smallint    NOT NULL DEFAULT 0,
+    updated_at           timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (portal_id, method)
+);
+
 -- ---------- Row-Level Security: structural tenant isolation ----------
 ALTER TABLE calls        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE calls        FORCE  ROW LEVEL SECURITY;
@@ -520,12 +541,13 @@ ALTER DEFAULT PRIVILEGES FOR ROLE ca_owner IN SCHEMA public GRANT SELECT, INSERT
 ALTER DEFAULT PRIVILEGES FOR ROLE ca_owner IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO ca_app;
 ```
 
-`alembic_version` is created by Alembic. Seven tables total; nothing else in v1.
+`alembic_version` is created by Alembic. Eight tables total: the seven of the baseline plus `sync_method_budgets` (0003). The one list of which tables are customer tables is `app/db/tenancy.py`; CI's `python -m app.tools.check_tenancy` fails when the catalog disagrees with it.
 
 ### Per-table rationale
 
 - **`portals`** — tenant registry and the single portal credential in one row: minimal, and the `token_version` / `FOR UPDATE` single-flight needs exactly one row to lock. `member_id` has a format CHECK so garbage never becomes a tenant, but it is treated as public data. `client_endpoint` is written only from the OAuth response. `token_admin_verified_at` records that the stored credential belongs to a proven administrator. `token_status` is the one column the settings page and dashboard banner read to explain why sync stopped. `application_token_enc` survives uninstall so late/duplicate lifecycle events still verify. `last_event_ts` makes event delivery idempotent and stops a retried uninstall from wiping a fresh reinstall. `purge_pending`/`purge_bodies` make uninstall cleanup (including the CLEAN=1 body wipe) durable without a queue. The ONAPPUSERREADY system-user credential is **not** stored in v1 (unused, and a stored 180-day token is a liability).
 - **`portal_sync`** — everything the worker needs to resume from any crash, plus the two safety columns the review demanded: `sync_generation` (fencing) and `rescan_from_id` (no NULL-derived full rescans). `throttle_hits` separates "the portal is busy" from "the portal is broken". `run_started_at` distinguishes a crashed run from a dispatch miss. Separate from `portals` because it is rewritten after every batch and must never contend with the credential row's lock.
+- **`sync_method_budgets`** — Bitrix24 accounts operating time per method, and `time.operating` is that method's own accumulator (docs/spike-crm-mirror.md, S-A.6). `portal_sync.operating_*` stays the statistics method's, because that row also schedules the portal; every other method the worker calls gets a row, so one method's limit parks only that method. Numbers and timestamps only, so no RLS; deleted with the cursors on install, reinstall and uninstall.
 - **`calls`** — the cache. Natural key `(portal_id, bx_id)` is the upsert target; the surrogate `id` is only for the API's opaque row ids. Generated `has_record` and `result_group` make the recording and result mappings identical in filters, summaries and jobs; the API then collapses `result_group` to two outcomes in one place (`answered` / `no_answer`) so the filter and the charts cannot drift apart, while the raw `call_failed_code` stays on the row for the cell's title. Constraints on Bitrix-supplied values were removed and string widths raised so a novel `CALL_TYPE`, a `DEAL` entity type or a long failure code cannot abort a 500-row chunk. The range index is covering so summary/heatmap/per-employee aggregation is an index-only scan.
 - **`employees`** — `user_brief` fields only (scope), which includes the internal extension `phone_inner` and excludes email and personal phone. `fetched_at` NULL placeholders are inserted by the call upsert so the refresh job never has to `SELECT DISTINCT` over `calls`; `found=false` stops retrying deleted users every cycle. Dismissed users are kept because their calls remain.
 - **`crm_contexts`** — the resolved matching set for a CRM tab, written only by a successful resolution by the *current* opener and read only when at least as fresh as the JWT, so a privileged user's resolution is never replayed for someone who lacks CRM rights.
@@ -600,9 +622,10 @@ Same handler as `/app/`; lands on `/settings` for admins, "administrators only" 
 - `acc='denied'`: only `GET /me` answers; every data endpoint returns 403 `{"code":"no_stats_permission"}` and the SPA renders the mandated text plus a link to the portal's own call statistics when obtainable.
 - `acc='own'`: `services/calls_repo.py::scope_filter(principal)` appends `portal_user_id = principal.user_id` to every read; the employee filter is hidden and a banner says "You see your own calls only". `acc='all'`: no extra predicate. `scope_filter` is the single place; every read (dashboard, calls, filters, record, refresh) goes through `calls_repo`.
 - This collapses Bitrix24's four levels (own / department / any / none) to admin / own / denied, as the brief mandates; documented in `docs/moderation-checklist.md` as a deliberate v1 simplification. The recording-listen permission is separate and is enforced by using the **viewer's own token** for non-admin playback (§9).
+- **CRM reports** (§4.14) sit behind the same gate — `denied` sees no CRM page — and narrow `own` further by decision 28 through `services/crm_repo.py::crm_scope`, the CRM counterpart of `scope_filter` and, like it, the single place.
 
 ### 4.8 CRM tab reads
-`GET /api/v1/calls` with `ent` in the JWT loads `crm_contexts(portal_id, ent.t, ent.id)`; the row must have `resolved_at >= JWT.iat` (or `resolved_by_user_id = sub`), otherwise 409 `context_missing` and the SPA runs the session exchange, which re-resolves with the current user's token. Matching: `(crm_entity_type, crm_entity_id) IN entity_keys` **OR** `crm_activity_id = ANY(activity_ids)` **OR** `(crm_entity_type = ent.t AND crm_entity_id = ent.id)` — the last clause covers portals that do emit `DEAL` (or other undocumented types) in the statistics rows. Then `scope_filter`, then period/paging.
+`GET /api/v1/calls` with `ent` in the JWT loads `crm_contexts(portal_id, ent.t, ent.id)`; the row must have `resolved_at >= JWT.iat` (or `resolved_by_user_id = sub`), otherwise 409 `context_missing` and the SPA runs the session exchange, which re-resolves with the current user's token. Matching: `(crm_entity_type, crm_entity_id) IN entity_keys` **OR** `crm_activity_id = ANY(activity_ids)` **OR** `(crm_entity_type = ent.t AND crm_entity_id = ent.id)` — the last clause covers portals that do emit `DEAL` (or other undocumented types) in the statistics rows. Then `scope_filter`, then period/paging. Under the mirror (§4.14) `entity_keys` and `activity_ids` come from `crm_items` and `crm_activities` instead of the open-time REST read; the permission half of this section does not change.
 
 ### 4.9 `POST /events/` — lifecycle events and verification
 Registered in the vendor cabinet as the "Event installation handler URL" (assumption), also reachable through the `event=` dispatch of §4.2, and additionally subscribed best-effort by `event.bind` at install. Parses PHP-bracket forms; logs every inbound event (`kind=event`, recursively redacted — including `data{}` of `ONAPPUSERREADY`, which carries long-lived tokens). Rules, in order:
@@ -613,6 +636,8 @@ Registered in the vendor cabinet as the "Event installation handler URL" (assump
 5. **`ONAPPINSTALL` / `ONAPPUSERREADY` on a known portal**: after rule 2 they are no-ops beyond storing `application_token_enc` when none is stored yet (in which case the token must additionally pass the admin proof of rule 4). The system-user credential is logged and discarded — v1 never syncs with it (regular-employee rights would silently truncate the cache).
 6. **Token-bearing events on an unknown portal**: authenticate by a refresh exchange with `auth[refresh_token]` (authoritative `member_id`, rate-limited) **and** a `user.admin` proof at the returned `client_endpoint`; only then create the portal row. A non-admin token creates nothing.
 7. Events without tokens for an unknown portal → 200, ignored, logged. An optional Caddy IP allowlist from `dl.bitrix24.com/webhook/app-world.json` is documented as defence in depth; the `application_token` compare plus the admin proof is the primary control.
+
+CRM change events (§5.11) go to a separate `POST /events/crm/` and never through this ladder: they only mark ids dirty, never read or write `last_event_ts`, and cannot uninstall, update or create a portal.
 
 ### 4.10 Frame embedding, TLS, headers
 `web/middleware.ts` sets `Content-Security-Policy: frame-ancestors 'self' https://<DOMAIN>` (or `http://` when `PROTOCOL=0`) after validating `DOMAIN` as a hostname; without a valid `DOMAIN` it sets `frame-ancestors 'none'` and the page renders "Open this app from Bitrix24". `install.html`/`handoff.html`/`state.html` carry the same header. No `X-Frame-Options` anywhere. API and handoff responses carry `Cache-Control: no-store`. Caddy: automatic TLS, HSTS, HTTP→HTTPS redirect, and an access-log filter that removes `resp_headers>Location` and request query strings. `lib/bx24.ts` injects the SDK once and exposes `ready()`; the layout calls `BX24.fitWindow()` after first paint and on every debounced `ResizeObserver` change; CRM links use `BX24.openPath('/crm/<type>/details/<id>/')`.
@@ -651,7 +676,9 @@ rows of its own.
 2. Rows group by funnel (`CATEGORY_ID`).
 3. A deal counts if it was **created, modified or closed** inside the period; the operator
    is `ASSIGNED_BY_ID`.
-4. **Nothing is stored** — no table, no migration, no sync phase.
+4. ~~**Nothing is stored** — no table, no migration, no sync phase.~~ *Superseded
+   2026-09-14 by the CRM mirror (decision 26, §4.14). Until a portal is switched to the
+   mirror, this section describes the live read it still serves.*
 
 Two reference columns cannot be reproduced and are not faked. `Главный оператор` needs the
 `department` scope, a vendor-cabinet change that re-lists the app and forces every installed
@@ -782,7 +809,9 @@ holds no rows of its own.
 
 **The owner's four constraints** (given 2026-09-12, not re-litigated in code):
 
-1. **Live CRM read** — no table, no migration, no sync phase, exactly as §4.12.
+1. ~~**Live CRM read** — no table, no migration, no sync phase, exactly as §4.12.~~
+   *Superseded 2026-09-14 by the CRM mirror (decision 26, §4.14). Until a portal is switched
+   to the mirror, this section describes the live read it still serves.*
 2. **One unified funnel** — a row carries leads *and* deals *and* the money, so a reader
    compares channels rather than two separate reports.
 3. **Creation date only.** Deliberately DIFFERENT from §4.12's created-or-modified-or-closed.
@@ -1036,6 +1065,26 @@ Both the capability cache and both limiters are **process-local**, correct only 
 runs exactly one `api` container. A second replica silently doubles every budget and halves
 the hit rate.
 
+### 4.14 CRM mirror reads — `GET /api/v1/deals`, `GET /api/v1/utm`, CRM tabs (decision 26; built from milestone M9)
+
+Replaces the live reads of §4.12 and §4.13 one portal at a time. Constraints:
+
+1. **No request-time CRM REST for a report.** A portal with `crm_mode = mirror` serves `/deals` and `/utm` as `GET` from Postgres: no viewer token, no `crm.item.list`, no per-report operating budget, and periods up to 366 days. The `POST` live reads answer only while `crm_mode` is `off`, `sync` or `shadow`, and are deleted after acceptance (milestone M14a).
+2. **Visibility is decision 28, applied in one place.** `services/crm_repo.py::crm_scope(principal)` is the only producer of CRM predicates.
+   - Administrator: no predicate.
+   - `own`: `assigned_by_id = sub`; deals also `category_id = ANY(funnels)` from the viewer's `crm_viewer_scopes` row; leads only when that row's `lead_status = 'ok'`.
+   - A missing or stale scope row → 409 `crm_scope_missing`, and the SPA runs one session exchange; a scope Bitrix24 would not resolve → 503 `crm_funnels_unavailable`.
+   - Dictionaries, pickers and names sent to an `own` viewer are intersected with the same funnels, and a funnel or stage parameter from the client is ANDed with them.
+3. **The scope is read live at every open.** `crm.category.list` and a one-row lead probe run with the viewer's own token inside the existing open and exchange batches — no extra HTTP request — and replace the viewer's row. Nothing is carried over from an older JWT.
+4. **Coverage is explicit.** Responses carry `data_as_of`, `coverage {window_from, history_complete, progress_pct}` and `stale {since, reason}`. A period that starts before the loaded history renders "history is still loading, N %", never a silently short report; a portal whose build fails the keyset gets an explicit "not supported" state.
+5. **Same wire, proven by parity.** The mirror queries feed the same response builders as the live read, and the golden fixtures of `test_deal_aggregate.py` and `test_utm_aggregate.py` must produce identical bodies through both paths before any portal is promoted. Amounts are in each deal's own currency: Bitrix24 does not return the account-currency amount to list calls (docs/spike-crm-mirror.md).
+6. **CRM tabs keep a live per-record check.** For all four entity types the open batch runs `crm.item.get` with the opener's token; ACCESS_DENIED or NOT_FOUND renders "no access to this item" and mints no entity JWT (decision 22). The call match then comes from mirrored contact and company links and call activities, without the 250-activity cap.
+7. **Employee pickers follow the page.** Call pages list employees with calls; `/deals` and `/utm` list CRM assignees.
+8. **Rollout is per portal and reversible.** `python -m app.tools.crm_mode` moves a portal `off → sync → shadow → mirror`.
+   - Every eligible portal, existing or new, starts syncing as soon as the code ships; the owner dropped D-7's 14-day wait on 2026-09-15. Administrators see an informational notice, and a portal whose administrator turned CRM analytics off neither syncs nor serves the Deals and Sources reports, live or mirrored.
+   - `shadow` recomputes every successful live report from the mirror in the background and keeps the differences for 30 days.
+   - A fleet-wide kill switch stops all CRM REST.
+
 ---
 
 ## 5. Sync design
@@ -1073,6 +1122,7 @@ Each chunk also inserts `employees` placeholders (`fetched_at NULL`, `ON CONFLIC
 ### 5.6 Rate limits, backoff, time block (`sync/throttle.py`)
 - Pacing: ≥ 500 ms between HTTP requests per portal (2 req/s leaky bucket on non-Enterprise plans; `SYNC_RATE_PER_SEC` configurable). A batch is one request for the intensity bucket.
 - Operating time: every response's `time.operating` / `time.operating_reset_at` (batch: max over `result_time`) is stored. Soft limit = `OPERATING_SOFT_RATIO` (0.8) × `capabilities.operating_limit_s` (default 480). Above it → `next_run_at = operating_reset_at + 60 s`, stop the visit.
+- **Per method** (0003): the guard above is the statistics method's. Every other method the worker calls (`user.get`, `app.info` now; the CRM mirror's methods next) has a `sync_method_budgets` row run through the same rules — soft limit, 429 attribution and limit learning, recovery after `CLEAN_VISITS_TO_RECOVER` clean visits. A soft limit or a 429 on such a method sets its `blocked_until` and skips that method's phases; it never parks the portal, never halves `batch_pages`, and never touches `throttle_hits` of the call sync. A 503 stays portal-wide: the leaky bucket is per source IP.
 - `429 OPERATION_TIME_LIMIT`: `next_run_at = operating_reset_at + 60 s`, `batch_pages` halved (min 5). The observed limit is lowered **only** when our own last observed `operating` was within 20 % of the current limit (a 429 can be caused by another app on the same account) and never below `OPERATING_LIMIT_FLOOR` (300 s); it is restored to the default after `CLEAN_VISITS_TO_RECOVER` (5) clean visits, so a foreign 429 cannot throttle a portal permanently.
 - `503 QUERY_LIMIT_EXCEEDED` / `OVERLOAD_LIMIT` (HTTP level or per-command): honour `Retry-After` if present, else exponential 2, 4, 8 … 300 s into `next_run_at`, `batch_pages` halved.
 - **Throttling is not failure**: 429/503 increment `throttle_hits`, never `consecutive_failures`, so a legitimately busy backfill is never dropped into the 6 h failure pause. `batch_pages` is restored to 20 after `CLEAN_VISITS_TO_RECOVER` clean visits.
@@ -1101,11 +1151,31 @@ Terminal states set `token_status` and `next_run_at='infinity'`: OAuth `invalid_
 
 ### 5.9 Job layer, tick and durability
 - `jobs/protocol.py`: `JobBackend` with `schedule_periodic(name, seconds)` and `run_now(name, **kwargs)`. `jobs/definitions.py`: plain async functions — `tick()`, `sync_portal(portal_id)`, `purge_portal(portal_id)`, `purge_rest_log()`, `purge_crm_contexts()`. `apscheduler_backend.py` is the only file importing APScheduler and schedules **only** `tick` (every 15 s) and the daily purges.
-- `tick()` (control transaction): (a) `SELECT portal_id … WHERE status='active' AND token_status='ok' AND NOT purge_pending AND next_run_at <= now() AND (lease_expires_at IS NULL OR lease_expires_at < now()) ORDER BY next_run_at LIMIT <free slots> FOR UPDATE SKIP LOCKED`, set `lease_owner`, `lease_expires_at = now() + 5 min`, `run_started_at = NULL`, and dispatch each portal as `asyncio.create_task` under a `Semaphore(GLOBAL_PORTAL_CONCURRENCY)` — never awaited inline, never a shared APScheduler job id (which would silently drop concurrent dispatches). An expired lease **with** `run_started_at` set is a crashed run → `consecutive_failures++`; an expired lease without it is a dispatch miss and is simply re-leased. (b) `SELECT id FROM portals WHERE purge_pending LIMIT 1` → `purge_portal`.
-- `sync_portal(portal_id)` sets `run_started_at`, then in order: refresh_requested rows → head_fetch (pending/head) → incremental (if due) → backfill (up to 20 batches) → rescan (if due) → recheck (if due) → employees refresh (if due) → `app.info` + `user.admin` (daily). Heartbeat: `lease_expires_at` extended after every batch. On exit: lease cleared, `next_run_at = now() + SYNC_INTERVAL_SEC` (or `now() + 2 s` while backfilling).
+- `tick()` (control transaction): (a) `SELECT portal_id … WHERE status='active' AND token_status='ok' AND NOT purge_pending AND next_run_at <= now() AND (lease_expires_at IS NULL OR lease_expires_at < now()) ORDER BY next_run_at LIMIT <free slots> FOR UPDATE SKIP LOCKED`, set `lease_owner`, `lease_expires_at = now() + 5 min`, `run_started_at = NULL`, and dispatch each portal as `asyncio.create_task` under a `Semaphore(GLOBAL_PORTAL_CONCURRENCY)` — never awaited inline, never a shared APScheduler job id (which would silently drop concurrent dispatches). An expired lease **with** `run_started_at` set is a crashed run → `consecutive_failures++`; an expired lease without it is a dispatch miss and is simply re-leased. A visit that ends frees its slot at once: its done-callback runs the same lease-and-dispatch step (under one lock with the tick), so the worker is not capped at `GLOBAL_PORTAL_CONCURRENCY` visits per 15 s; a cancelled visit refills nothing. (b) `SELECT id FROM portals WHERE purge_pending LIMIT 1` → `purge_portal`.
+- `sync_portal(portal_id)` sets `run_started_at`, then in order: refresh_requested rows → head_fetch (pending/head) → incremental (if due) → backfill (up to 20 batches) → rescan (if due) → recheck (if due) → employees refresh (if due) → `app.info` + `user.admin` (daily). A stop skips the phases of the method that stopped - a soft limit, a 429, or `blocked_until` in `sync_method_budgets` - and never the rest of the visit, so a statistics soft limit no longer costs the employee refresh or the daily admin check; only a 503, a transport failure or a terminal state ends a visit early. Heartbeat: `lease_expires_at` extended after every batch. On exit: lease cleared, `next_run_at = now() + SYNC_INTERVAL_SEC` (or `now() + 2 s` while backfilling).
 - `purge_portal(portal_id)` runs **inside `tenant_txn(portal_id)`, opened afresh for every chunk** (RLS is transaction-local and fails silently closed): pre-count under tenant context, then `DELETE FROM calls WHERE portal_id = X AND id IN (SELECT id … LIMIT 10000)` per transaction until none, same for `employees` and `crm_contexts`. If the pre-count was > 0 and the first `DELETE` affected 0 rows, abort with `last_error_code='purge_incomplete'`, leave `purge_pending=true` and log `portal_events(purge_incomplete)`. After the loop, a final `SELECT count(*)` under the same context must be 0 before `purge_pending=false` and `portal_events(purge_done)`. When `purge_bodies` is set (uninstall with `data[CLEAN]=1`), the same job NULLs `rest_log.request`/`response` for that `portal_id` (keeping method/status/time rows so the exchange log itself survives).
 - Durability without a queue: every job derives its work from columns; a crash at any point is resumed by the next tick from committed state.
 - **Celery swap**: add `jobs/celery_backend.py` where beat schedules the same periodic names and a task wraps each definition; set `JOB_BACKEND=celery`. Job functions, tables, cursors, lease and fencing are unchanged.
+
+### 5.10 CRM mirror: lanes and budgets (decision 26; built from milestone M4)
+- **Lanes** per portal, each with its own due time, cursor and failure state, all inside the one portal lease: `dict` (funnels, stages, field maps, hourly), `window` (a 366-day bootstrap of the deals' created ∨ updated ∨ closed-and-moved legs, newest window first, so a report is correct before the full history lands), `backfill` (disjoint id ranges newest first, each walked by the keyset `>id`, ascending, `start:-1`), `sweep` (`>=updatedTime` from the server-clock watermark minus an overlap, keyset inside), `history` (`crm.stagehistory.list` keyset `>ID` plus a trailing `CREATED_TIME` window), `signals` and `dirty` (§5.11), `reconcile` and `patrol` (§5.12). A park, a 429 or a crash on one lane never moves another lane or the call sync.
+- **Budgets**: every CRM method is accounted in `sync_method_budgets` (decision 27). Light lanes may use 0.8 of the learned limit, sweep and dictionaries 0.6, heavy lanes (window, backfill, reconcile, patrol) 0.5; while a portal still serves the live reports, heavy lanes on `crm.item.list` also leave the live pages their headroom.
+- **Extraction facts** are measured, not assumed: docs/spike-crm-mirror.md (S-A) — keyset and `@id` behaviour, `total`/`next` null under `start:-1`, the `operating` accumulator, and the fields a real portal returns (`opportunityAccount` is not one of them, so money is native only).
+- **Freshness targets**: an edit visible within 5 minutes at p95 where offline events are available and 10 minutes without; a deletion within 5 minutes, or 24 hours if its signal was lost; a funnel move within 30 minutes; a dictionary rename within 60 minutes; an edit that does not bump `updatedTime` within the patrol cycle.
+
+### 5.11 CRM change signals (built from milestone M6)
+- **Offline events are the durable channel**: bound with the installer credential (offline binding and the queue methods require an administrator), drained with reserve and confirm (`event.offline.get clear=0` then `event.offline.clear process_id`) where `feature.get rest_offline_extended` allows it, otherwise listed and cleared with an id-and-timestamp guard. A reserved `process_id` is written before the batch is processed and recovered after a crash; error rows are drained daily. Records only mark ids dirty — the stored row always comes from a re-read.
+- **`ONOFFLINEEVENT` is only a wake-up**: its `minTimeout` drops the notifications it suppresses, so a timer poll every 5 minutes stays as the backstop.
+- **Online fallback**: where offline binding is refused, CRM events are bound to `POST /events/crm/`, a route separate from lifecycle `/events/`. It verifies the stored `application_token`, marks the id dirty in one statement guarded by the portal being active, answers 200 at once, and never reads or writes `last_event_ts`. An online DELETE never tombstones by itself.
+- **Bindings are reconciled** with `event.get` on install, `ONAPPUPDATE`, an administrator's open after 24 hours, and daily; a binding found missing triggers gap recovery (§5.12). `ONCRMDEALMOVETOCATEGORY` is bound because a funnel move sends no update event, and stage history `TYPE_ID=5` is the pull backstop for it.
+
+### 5.12 CRM deletes, reconciliation and gap recovery (built from milestones M6–M7)
+- **Tombstones** follow decision 29. The guards: `token_admin_verified_at` within 26 hours and no suspected demotion; an error-free confirmation; a per-visit delete-ratio ceiling. `ACCESS_DENIED` marks a row unreadable instead, raises a visibility alarm past a threshold, hides the row after 7 days and evicts it after 30.
+- **Reconciliation** runs daily by count bisection over id ranges (`select [id]`, bounded `start:0` counts), listing only the ranges whose counts disagree; ids present locally and absent at the source are confirmed through `crm.item.get`, ids present at the source are fetched. **Patrol** re-reads values on a 7-day cycle (adapting between 2 and 28 days) for edits that do not bump `updatedTime`.
+- **Gap recovery** runs after a credential re-seed, a missing binding, an expired reserved batch or a database restore: sweep watermarks rewind to the last clean signal drain, a full reconciliation and a short patrol become due. Pages show "data as of" while a lane is parked.
+
+### 5.13 Calls deletion detection (built in milestone M11)
+- A call deleted in Bitrix24 within 90 days of the call is removed after two error-free range passes at least 72 hours apart, each with a recently verified administrator credential and under a ratio guard. Calls older than 90 days are never removed on absence, because Bitrix24's own retention prunes old statistics. A call that reappears clears its mark.
 
 ---
 
@@ -1114,6 +1184,13 @@ Terminal states set `token_status` and `next_run_at='infinity'`: OAuth `invalid_
 - `handlers/*` write one row per inbound Bitrix24 POST (`direction=in`, `kind=open|install|event`). Rejected events are logged with `portal_id` NULL and `member_id` kept.
 - **Redaction is recursive** (`security/redact.py`): every dict/list is walked and any key matching `/(token|secret|auth|password)/i` at any depth is replaced by `[redacted]`, plus `auth=`/`token=`/`client_secret=` parameters inside URL strings. This covers `auth[*]`, `data{}` of `ONAPPUSERREADY`, refresh responses and future payload shapes. The same filter is attached to the root log handler; `httpx` and `httpcore` loggers are pinned to `WARNING` so their INFO request lines (which contain the full OAuth URL with `client_secret` and `refresh_token`) can never reach stdout. The FastAPI exception handler never logs request bodies, and `/api/v1/session/exchange` and `/api/v1/portal/reauthorize` are explicitly excluded from any body capture. `tests/test_secret_logging.py` runs a mocked refresh and asserts no secret substring appears in captured output.
 - Retention: `purge_rest_log` daily deletes `ts < now() − REST_LOG_RETENTION_DAYS` (default 7) in batches of 10,000; `config.py` refuses values < 3. `purge_crm_contexts` deletes rows older than 30 days.
+- CRM mirror retention (§5.12):
+  - a confirmed-deleted record has its values nulled at once and its id kept 35 days;
+  - a record unreadable for 7 days is hidden, and evicted after 30;
+  - `crm_viewer_scopes` and shadow samples are kept 30 days;
+  - every CRM row is deleted on uninstall and when an administrator disables CRM analytics.
+
+  CRM batches go to `rest_log` as envelope timing and payload shape only, never row values.
 - Container stdout JSON logs (request id, method, status, no bodies) rotated by Docker `json-file` are the second trail. Caddy's access log has `resp_headers>Location` and request query strings removed.
 
 ---
@@ -1157,7 +1234,7 @@ Run after milestone 4 (real rows exist), on the dev cloud portal (kz region) and
 
 ## 11. Assumptions
 1. The statistics record `ID` is strictly monotonic with row creation per portal for all telephony providers; both cursors and the immutable `<low_id` window rely on it. A build that ignores the `>ID`/`<ID` operators is detected at runtime and stops the portal with `filter_unsupported` rather than looping.
-2. Statistics rows are not deleted in bulk; a rare deletion shifts at most one offset inside a single batch, absorbed by the in-chunk dedupe, the upsert and the rescan.
+2. Statistics rows are not deleted in bulk; a rare deletion shifts at most one offset inside a single batch, absorbed by the in-chunk dedupe, the upsert and the rescan. Calls Bitrix24 deleted within 90 days of the call are removed by §5.13.
 3. A user access token issued for portal A is rejected when presented at portal B's `client_endpoint`, so verification at the stored endpoint defeats `member_id` spoofing. `member_id` itself is public.
 4. Installation is restricted to portal administrators and administrators always have full telephony access, so a credential proven to be admin-owned returns the complete call history; this is re-verified daily.
 5. `user.admin=true` implies full "Call statistics" visibility; non-admins with "department" or "any" level are shown their own calls only in v1 (documented simplification). The probe is skipped for admins.
@@ -1170,16 +1247,16 @@ Run after milestone 4 (real rows exist), on the dev cloud portal (kz region) and
 12. Browsers execute the handoff page's `location.replace` (no redirect/fragment assumptions remain).
 13. A separate `worker` container (same image) is acceptable despite the brief's three-service list; `SCHEDULER_INLINE=1` collapses it into `api`.
 14. Rate limits of the Basic plan apply (2 req/s, burst 50; operating 480 s / 10 min cloud, 420 s on-premise); pacing 500 ms, global concurrency 4, batch 20 pages, adaptive limit floored at 300 s and recovered after clean visits.
-15. A 72-hour ID-window rescan plus two targeted rechecks up to 30 days captures late-attached recordings, transcripts, votes and comments; edits beyond that are accepted as missed.
+15. A 72-hour ID-window rescan plus two targeted rechecks up to 30 days captures late-attached recordings, transcripts, votes and comments; edits beyond that are accepted as missed. CRM records do not rely on this: they use change signals, an `updatedTime` sweep, reconciliation and patrol (§5.10–§5.12).
 16. `user.current` under `user_brief` returns `TIME_ZONE`; fallback is the installer's timezone, then UTC. Aggregations are computed live in SQL over a covering index; custom periods are capped at 366 days.
 17. `user.get` with `ADMIN_MODE=true` under the portal token returns dismissed users when not filtered by `ACTIVE`; if `ADMIN_MODE` errors, plain `user.get` is used.
-18. Deal tab = calls linked to the deal's contacts/company, calls whose `CRM_ACTIVITY_ID` is among the deal's call activities (capped at 250 = the handler's 5-page budget), **and** any row a portal happens to emit with `CRM_ENTITY_TYPE='DEAL'`.
+18. Deal tab = calls linked to the deal's contacts/company, calls whose `CRM_ACTIVITY_ID` is among the deal's call activities (capped at 250 = the handler's 5-page budget), **and** any row a portal happens to emit with `CRM_ENTITY_TYPE='DEAL'`. Once a tab reads the mirror (§4.14) the cap goes: activities are matched from the mirrored call activities.
 19. Disk/volume and backup encryption on the Hetzner host is handled by ops; only OAuth and application tokens are application-encrypted; phone numbers stay plaintext for filtering. `call_record_url` is stripped of credentials and never leaves the server.
 20. Fully isolated on-premise boxes with a custom auth provider (no refresh token) are **out of scope in v1**: they get an explicit state page and no database row. Ordinary on-premise portals, which refresh through `oauth.bitrix.info`, are fully supported.
 21. Cached calls, employees and crm_contexts are purged on uninstall regardless of `data[CLEAN]`; `CLEAN=1` additionally wipes `rest_log` bodies for that portal. `portals` and `portal_events` are kept forever.
 22. `RECORDING_MODE=off` until the spike is answered; `redirect` is available only if the captured URL carries no credential.
 23. Bitrix24 gates app access at the product level; the app implements only the admin / own / denied split.
-24. The ONAPPUSERREADY system-user credential is deliberately not stored: it carries regular-employee rights, would silently truncate the cache if ever used, and a stored 180-day token is a liability.
+24. The ONAPPUSERREADY system-user credential is deliberately not stored. Current Bitrix24 docs say the system user inherits the installer's access groups but not elevated structure roles, and whether it is an administrator is unverified; the worker, the CRM mirror included, therefore syncs only with the proven installer credential (decision 4), and a stored 180-day token nobody uses would be a liability.
 
 ---
 
@@ -1200,3 +1277,15 @@ Run after milestone 4 (real rows exist), on the dev cloud portal (kz region) and
 14. **LANG values from kz-region portals** — `ru`, `kz` or `en`? *Default: fallback map `kz→ru`, unknown→`en`; confirm in milestone 3.*
 15. **Employee filter for `own` users** — hidden with a banner (current) or shown disabled? *Default: hidden.*
 16. **Optional source-IP allowlist on `/events/`** — add the `dl.bitrix24.com/webhook/app-world.json` check as defence in depth, accepting that a stale list can reject real events? *Default: documented but off; the `application_token` + admin proof is the control.*
+17. **CRM mirror** — *answered 2026-09-14/15.* Decisions D-1..D-9 of the plan, recorded here because they bind the code:
+    - replace live CRM reads with a mirror (decision 26);
+    - visibility as decision 28, with a lead probe so no employee sees more leads than today;
+    - the mirror for every region, like calls;
+    - minimal fields only, funnel and stage names included;
+    - tombstoned ids kept 35 days;
+    - transitions and "stage at the end of the period" counted over the report's own selection;
+    - employee pickers per page (people with calls on the call pages, CRM assignees on /deals and /utm);
+    - calls deletion only within 90 days;
+    - a portal whose build has only the legacy list methods and fails the keyset gets an explicit "not supported" state;
+    - storage starts at once on every install; administrators see an informational notice and can turn CRM analytics off (the original 14-day wait was dropped on 2026-09-15);
+    - CRM pages stay behind the telephony `acc` gate.

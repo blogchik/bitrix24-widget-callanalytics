@@ -1218,6 +1218,11 @@ Replaces the live reads of §4.12 and §4.13 one portal at a time. Constraints:
    - Built in M4b: the switch is `POST /api/v1/portal/crm-analytics` (admin only). Off stamps `crm_opt_out_at`, raises the fence (`sync_generation + 1`) and queues `crm_purge_pending`; the tick's purge slot then runs `sync/purge.py::purge_crm_data`, which deletes `CRM_TENANT_TABLES` under tenant context with the same three verification rules as the uninstall purge and keeps calls. On clears the stamp; storage resumes only once the purge has finished. `/me.crm` carries `analytics_enabled` for every viewer and `notice_visible` for administrators, and `python -m app.tools.crm_mode` is the operator's view and mode switch.
    - `shadow` recomputes every successful live report from the mirror in the background and keeps the differences for 30 days.
    - A fleet-wide kill switch stops all CRM REST.
+   - Built in M9a, narrower than the constraints above in four stated ways:
+     - `GET /api/v1/deals` and `GET /api/v1/utm` read the mirror through `services/crm_repo.py` for **administrators** on a `mirror` portal, and `/me.crm.read` tells each viewer which path their pages take. `crm_scope` refuses every other viewer with 409 `crm_mirror_unavailable` until M8 stores their funnels, so the live `POST` stays open in every mode (constraint 1 applies from M8).
+     - The mirror SQL feeds the live read's own `_build_response`; `tests/test_crm_mirror_reports.py` folds the same records through the live `_fold` and through `crm_items` and compares the two bodies whole (constraint 5).
+     - Coverage comes from the backfill lanes: `history_complete` when the deal backfill (and the lead backfill, unless leads are refused) is done, `progress_pct` from their counters, `data_as_of` from the oldest sweep's last completed pass. `window_from` stays null until the window lane ships. `python -m app.tools.crm_mode set PORTAL mirror` refuses a portal whose deal backfill is not done, unless `--force`.
+     - `shadow` logs one line of counts per compared report (`crm_shadow: deals compared`, `crm_shadow: utm compared`) and keeps no rows until `crm_shadow_diffs` ships. Counts only: no id, name or tag value reaches a log.
 
 ---
 

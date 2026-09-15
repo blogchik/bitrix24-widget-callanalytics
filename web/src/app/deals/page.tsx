@@ -26,6 +26,9 @@
  * 3. **Its period control stops at 92 days** while the neighbouring pages offer 366. A live
  *    REST scan cannot honestly promise a year, and a control that offered one would spend
  *    twenty seconds to refuse.
+ *
+ * A portal promoted to the CRM mirror (§4.14) lifts all three for the viewers `/me.crm.read`
+ * names: the page GETs the same report from Postgres, with no token and 366 days.
  * ---------------------------------------------------------------------------------
  *
  * Everything else is the by-hour page's skeleton, deliberately unchanged: the `useMe` gate,
@@ -38,6 +41,7 @@ import { usePathname } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { ErrorState, LoadingBlock, PageShell, StaleNotice } from '@/components/AppFrame';
+import CrmCoverageNotice from '@/components/CrmCoverageNotice';
 import DealStageTable, {
   DEAL_CSS,
   DealSummaryStrip,
@@ -57,14 +61,17 @@ import {
 import PageNav, { NAV_CSS } from '@/components/PageNav';
 import StateCard from '@/components/StateCard';
 import { DateRange, MultiSelect, SegmentedControl, type SelectOption } from '@/components/ui';
-import { ApiError, apiFetch, deniedBodyKey, useMe } from '@/lib/api';
+import { ApiError, apiFetch, deniedBodyKey, useMe, type MirrorReportMeta } from '@/lib/api';
 import { fitWindow } from '@/lib/bx24';
 import { viewerAccessToken } from '@/lib/calls';
 import { withExtension } from '@/lib/format';
 import { VIZ_CSS } from '@/lib/viz';
 
-/** The response `POST /api/v1/deals` answers with. Mirrors `services/deal_stats.py`. */
-interface DealsResponse {
+/**
+ * The response `POST /api/v1/deals` answers with. Mirrors `services/deal_stats.py`; the
+ * mirror's `GET` answers the same body plus `MirrorReportMeta`.
+ */
+interface DealsResponse extends MirrorReportMeta {
   range: { from: string; to: string; days: number; timezone: string; preset: string };
   filters: { employees: number[] };
   stages: StageColumn[];
@@ -95,6 +102,9 @@ const DEFAULT_PRESET = 'd30' as const;
 /** Mirrors `DEAL_REPORT_MAX_PERIOD_DAYS`; the server refuses anything longer. */
 const MAX_DEAL_PERIOD_DAYS = 92;
 
+/** Mirrors `MAX_PERIOD_DAYS`, which a report from the CRM mirror shares with the call pages. */
+const MIRROR_MAX_PERIOD_DAYS = 366;
+
 /** How long to wait after a change before asking Bitrix24 to resize the slider. */
 const FIT_DEBOUNCE_MS = 140;
 
@@ -114,6 +124,8 @@ export default function DealsPage() {
   // D-7: with CRM analytics turned off the report is closed, so nothing is fetched for it.
   const crmOff = me.data?.crm?.analytics_enabled === false;
   const canRead = (access === 'all' || access === 'own') && !crmOff;
+  // §4.14: the server decides which path this viewer takes; the page only follows it.
+  const mirror = me.data?.crm?.read === 'mirror';
 
   // The default period is thirty days *in the viewer's zone*, so it cannot be computed
   // before `GET /me` has answered with that zone.
@@ -149,7 +161,19 @@ export default function DealsPage() {
     return () => controller.abort();
   }, [canRead]);
 
-  const report = useDeals(canRead ? filters : null, employees);
+  const report = useDeals(canRead ? filters : null, employees, mirror);
+
+  // The portal's report path changed under an open page. `/me` is read again once; if it still
+  // names the same path, the refusal is shown rather than retried forever.
+  const reread = useRef(false);
+  const reloadMe = me.reload;
+  useEffect(() => {
+    const changed = report.error instanceof ApiError && report.error.code === 'crm_mirror_unavailable';
+    if (changed && !reread.current) {
+      reread.current = true;
+      reloadMe();
+    }
+  }, [reloadMe, report.error]);
 
   // §4.10: the page height changes when the tables do, so the slider is re-measured.
   const fitTimer = useRef<number | undefined>(undefined);
@@ -260,8 +284,9 @@ export default function DealsPage() {
                         setFilters({ ...filters, preset: 'custom', from: next.from, to: next.to })
                       }
                       timeZone={timezone}
-                      // Tighter than the other pages on purpose; see the docblock.
-                      maxSpanDays={MAX_DEAL_PERIOD_DAYS}
+                      // Tighter than the other pages on purpose, unless the report reads the
+                      // mirror; see the docblock.
+                      maxSpanDays={mirror ? MIRROR_MAX_PERIOD_DAYS : MAX_DEAL_PERIOD_DAYS}
                     />
                   </div>
                 ) : null}
@@ -292,6 +317,15 @@ export default function DealsPage() {
           </div>
         ) : null}
 
+        {data ? (
+          <CrmCoverageNotice
+            report={data}
+            locale={locale}
+            timeZone={timezone}
+            t={t}
+            className="ca-deals-note"
+          />
+        ) : null}
         {report.error && data ? <StaleNotice error={report.error} onRetry={report.reload} /> : null}
 
         {!data ? (
@@ -378,7 +412,11 @@ interface DealsResource {
  * that never goes blank, and inside a slider a disappearing panel also costs a resize
  * round trip.
  */
-function useDeals(filters: DashboardFilters | null, employees: readonly string[]): DealsResource {
+function useDeals(
+  filters: DashboardFilters | null,
+  employees: readonly string[],
+  mirror: boolean,
+): DealsResource {
   const [data, setData] = useState<DealsResponse | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [pending, setPending] = useState(false);
@@ -411,6 +449,10 @@ function useDeals(filters: DashboardFilters | null, employees: readonly string[]
     setPending(true);
 
     const run = async (): Promise<DealsResponse> => {
+      if (mirror) {
+        // §4.14: answered from Postgres. There is no token to fetch and none to send.
+        return await apiFetch<DealsResponse>(`/deals?${query}`, { signal: controller.signal });
+      }
       const token = await viewerAccessToken();
       if (!token) {
         // Outside a Bitrix24 frame, or the SDK refused. There is no report to build and
@@ -459,7 +501,7 @@ function useDeals(filters: DashboardFilters | null, employees: readonly string[]
         }
       });
     return () => controller.abort();
-  }, [attempt, query]);
+  }, [attempt, mirror, query]);
 
   return {
     data,

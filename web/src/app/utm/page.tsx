@@ -36,6 +36,10 @@
  * Everything else is the deals page's skeleton, deliberately unchanged: the `useMe` gate,
  * the three terminal states, stale-while-refetching with `ca-viz-dim` + `aria-busy`, and the
  * debounced `fitWindow` (§4.10, §4.11).
+ *
+ * On a portal promoted to the CRM mirror (§4.14) the viewers `/me.crm.read` names get the
+ * same report by GET from Postgres: no token, no scan, 366 days - and period and employee
+ * stop costing a round trip to Bitrix24 as well.
  */
 
 import { useLocale, useTranslations } from 'next-intl';
@@ -43,6 +47,7 @@ import { usePathname } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { ErrorState, LoadingBlock, PageShell, Section, StaleNotice } from '@/components/AppFrame';
+import CrmCoverageNotice from '@/components/CrmCoverageNotice';
 import {
   defaultFilters,
   rangeForPreset,
@@ -86,6 +91,9 @@ const DEFAULT_PRESET = 'd30' as const;
 /** Mirrors `UTM_REPORT_MAX_PERIOD_DAYS`; the server refuses anything longer. */
 const MAX_UTM_PERIOD_DAYS = 92;
 
+/** Mirrors `MAX_PERIOD_DAYS`, which a report from the CRM mirror shares with the call pages. */
+const MIRROR_MAX_PERIOD_DAYS = 366;
+
 /** How long to wait after a change before asking Bitrix24 to resize the slider. */
 const FIT_DEBOUNCE_MS = 140;
 
@@ -108,6 +116,8 @@ export default function UtmPage() {
   const timezone = me.data?.timezone ?? 'UTC';
   // D-7: with CRM analytics turned off the report is closed, so nothing is fetched for it.
   const crmOff = me.data?.crm?.analytics_enabled === false;
+  // §4.14: the server decides which path this viewer takes; the page only follows it.
+  const mirror = me.data?.crm?.read === 'mirror';
 
   useEffect(() => {
     if (!me.data || filters || crmOff) {
@@ -137,8 +147,20 @@ export default function UtmPage() {
     };
   }, [crmOff, me.data]);
 
-  const report = useUtm(filters, employees);
+  const report = useUtm(filters, employees, mirror);
   const data = report.data;
+
+  // The portal's report path changed under an open page: `/me` is read again once, exactly as
+  // the deals page does.
+  const reread = useRef(false);
+  const reloadMe = me.reload;
+  useEffect(() => {
+    const changed = report.error instanceof ApiError && report.error.code === 'crm_mirror_unavailable';
+    if (changed && !reread.current) {
+      reread.current = true;
+      reloadMe();
+    }
+  }, [reloadMe, report.error]);
 
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
@@ -253,7 +275,7 @@ export default function UtmPage() {
                       setFilters({ ...filters, preset: 'custom', from: next.from, to: next.to })
                     }
                     timeZone={timezone}
-                    maxSpanDays={MAX_UTM_PERIOD_DAYS}
+                    maxSpanDays={mirror ? MIRROR_MAX_PERIOD_DAYS : MAX_UTM_PERIOD_DAYS}
                   />
                 </div>
               ) : null}
@@ -307,6 +329,15 @@ export default function UtmPage() {
           </div>
         ) : null}
 
+        {data ? (
+          <CrmCoverageNotice
+            report={data}
+            locale={locale}
+            timeZone={timezone}
+            t={t}
+            className="ca-utm-note"
+          />
+        ) : null}
         {report.error && data ? <StaleNotice error={report.error} onRetry={report.reload} /> : null}
 
         {!data || !view ? (
@@ -476,7 +507,11 @@ interface UtmResource {
  * on nothing else, so every tag control on the page re-renders a `useMemo` instead of
  * spending a live CRM scan.
  */
-function useUtm(filters: DashboardFilters | null, employees: readonly string[]): UtmResource {
+function useUtm(
+  filters: DashboardFilters | null,
+  employees: readonly string[],
+  mirror: boolean,
+): UtmResource {
   const [data, setData] = useState<UtmResponse | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [pending, setPending] = useState(false);
@@ -508,6 +543,10 @@ function useUtm(filters: DashboardFilters | null, employees: readonly string[]):
     setPending(true);
 
     const run = async (): Promise<UtmResponse> => {
+      if (mirror) {
+        // §4.14: answered from Postgres. There is no token to fetch and none to send.
+        return await apiFetch<UtmResponse>(`/utm?${query}`, { signal: controller.signal });
+      }
       const token = await viewerAccessToken();
       if (!token) {
         // Outside a Bitrix24 frame, or the SDK refused. There is no report to build and no
@@ -553,7 +592,7 @@ function useUtm(filters: DashboardFilters | null, employees: readonly string[]):
         }
       });
     return () => controller.abort();
-  }, [attempt, query]);
+  }, [attempt, mirror, query]);
 
   return {
     data,

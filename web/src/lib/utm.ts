@@ -26,6 +26,7 @@
  * ---------------------------------------------------------------------------------
  */
 
+import type { MirrorReportMeta } from '@/lib/api';
 import { seriesVar } from '@/lib/viz';
 
 /** The five tags, in the fixed order `combinations[].k` is positional against. */
@@ -108,7 +109,7 @@ export interface UtmEntityScan {
   utm_fields?: string[];
 }
 
-export interface UtmResponse {
+export interface UtmResponse extends MirrorReportMeta {
   range: { from: string; to: string; days: number; timezone: string; preset: string };
   filters: { employees: number[] };
   dimensions: Dimension[];

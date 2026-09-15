@@ -25,7 +25,9 @@ from typing import TYPE_CHECKING, Any, Final
 from app.bitrix.errors import (
     AccessDenied,
     BitrixError,
+    InvalidArgValue,
     InvalidCredentials,
+    NotFound,
     UnknownBitrixError,
     UserAccessError,
     classify,
@@ -67,6 +69,10 @@ _ADMIN_MODE_RETRYABLE: Final[tuple[type[BitrixError], ...]] = (
     AccessDenied,
     UserAccessError,
     UnknownBitrixError,
+    # Both used to arrive as UnknownBitrixError; they got names for the CRM mirror, and the
+    # ADMIN_MODE fallback keeps answering them exactly as it did before.
+    InvalidArgValue,
+    NotFound,
 )
 
 _TRUE_STRINGS: Final[frozenset[str]] = frozenset({"y", "yes", "true", "1"})

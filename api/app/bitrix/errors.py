@@ -17,12 +17,16 @@ hence the case-insensitive compare - and that the published list is *not* closed
 __all__ = [
     "AccessDenied",
     "BitrixError",
+    "EntityTypeNotSupported",
     "ExpiredToken",
     "InsufficientScope",
+    "IntranetUserOnly",
+    "InvalidArgValue",
     "InvalidCredentials",
     "InvalidGrant",
     "MethodNotFound",
     "NoAuthFound",
+    "NotFound",
     "OperationTimeLimit",
     "PaymentRequired",
     "PortalDeleted",
@@ -139,6 +143,40 @@ class MethodNotFound(BitrixError):
     default_code = "ERROR_METHOD_NOT_FOUND"
 
 
+class NotFound(BitrixError):
+    """The record does not exist (`crm.item.get`) - the one answer that may tombstone a row.
+
+    Kept apart from `AccessDenied` on purpose: a list silently omits a deleted record and a
+    record the token may no longer read alike, so only this code, on a `get`, proves a
+    deletion (docs/spike-crm-mirror.md, S-A.7). Legacy `crm.deal.get` answers "Not found"
+    with no code at all, which stays `UnknownBitrixError` and proves nothing.
+    """
+
+    default_code = "NOT_FOUND"
+
+
+class InvalidArgValue(BitrixError):
+    """A filter or parameter the method refused.
+
+    Also what the NEXT command of a `$result`-chained keyset answers after a short page
+    (docs/spike-crm-mirror.md, C6): an end of data rather than a broadened result.
+    """
+
+    default_code = "INVALID_ARG_VALUE"
+
+
+class EntityTypeNotSupported(BitrixError):
+    """`crm.item.*` or `crm.stagehistory.list` refuses this entity type on this build."""
+
+    default_code = "ENTITY_TYPE_NOT_SUPPORTED"
+
+
+class IntranetUserOnly(BitrixError):
+    """The token belongs to an extranet or technical account that CRM lists refuse."""
+
+    default_code = "allowed_only_intranet_user"
+
+
 class PortalDeleted(BitrixError):
     """§5.8 terminal: `status='uninstalled'`, `purge_pending=true`."""
 
@@ -176,6 +214,10 @@ _BY_ERROR_CODE: dict[str, type[BitrixError]] = {
     "overload_limit": QueryLimitExceeded,
     "operation_time_limit": OperationTimeLimit,
     "error_method_not_found": MethodNotFound,
+    "not_found": NotFound,
+    "invalid_arg_value": InvalidArgValue,
+    "entity_type_not_supported": EntityTypeNotSupported,
+    "allowed_only_intranet_user": IntranetUserOnly,
     "portal_deleted": PortalDeleted,
     "payment_required": PaymentRequired,
     "invalid_grant": InvalidGrant,

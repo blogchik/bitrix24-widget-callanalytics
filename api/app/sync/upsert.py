@@ -41,7 +41,7 @@ from typing import Any, Final
 
 from sqlalchemy import case, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import DataError, IntegrityError
+from sqlalchemy.exc import DataError, DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
@@ -52,7 +52,7 @@ from app.services.employees import upsert_placeholders
 from app.services.portals import record_event
 from app.sync.lease import Fence, fenced_update
 
-__all__ = ["CHUNK_SIZE", "DATA_COLUMNS", "UpsertResult", "upsert_calls"]
+__all__ = ["CHUNK_SIZE", "DATA_COLUMNS", "UpsertResult", "row_fault", "upsert_calls"]
 
 log = get_logger(__name__)
 
@@ -116,6 +116,26 @@ class UpsertResult:
     #: cursor, so a cursor derived from these still steps over the poison row.
     max_bx_id: int | None
     min_bx_id: int | None
+
+
+#: SQLSTATE classes one row can cause: 22 data exception (a value too long for its column, a
+#: number out of range) and 23 integrity violation.
+_ROW_FAULT_CLASSES: Final[tuple[str, ...]] = ("22", "23")
+
+
+def row_fault(exc: DBAPIError) -> bool:
+    """Whether a statement failed because of a row's value rather than the database's state.
+
+    Read off the SQLSTATE, not only the Python type: asyncpg surfaces some data exceptions -
+    `value too long for type character varying` among them - as a bare `DBAPIError` rather
+    than `DataError`, and a check on the type alone let a 300-character phone number escape
+    the quarantine and fail the whole visit, again on every visit.
+    """
+    if isinstance(exc, (IntegrityError, DataError)):
+        return True
+    orig = getattr(exc, "orig", None)
+    state = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return isinstance(state, str) and state[:2] in _ROW_FAULT_CLASSES
 
 
 def _reason(exc: Exception) -> str:
@@ -204,16 +224,17 @@ async def _write_chunk(
 ) -> tuple[int, list[tuple[int | None, str]]]:
     """One chunk in a SAVEPOINT; on a value the database refuses, retry row by row.
 
-    Only `IntegrityError` and `DataError` trigger the retry, never `DBAPIError` at
-    large: an `OperationalError` (connection gone, deadlock, statement timeout) is not
-    the fault of any particular row, and retrying 500 rows individually against a dead
-    connection would quarantine the entire chunk - turning a transient outage into
-    permanent data loss.
+    Only a row's fault triggers the retry (`row_fault`), never `DBAPIError` at large: an
+    `OperationalError` (connection gone, deadlock, statement timeout) is not the fault of
+    any particular row, and retrying 500 rows individually against a dead connection would
+    quarantine the entire chunk - turning a transient outage into permanent data loss.
     """
     savepoint = await session.begin_nested()
     try:
         await session.execute(_insert(chunk))
-    except (IntegrityError, DataError):
+    except DBAPIError as exc:
+        if not row_fault(exc):
+            raise
         await savepoint.rollback()
     else:
         await savepoint.commit()
@@ -225,7 +246,9 @@ async def _write_chunk(
         row_savepoint = await session.begin_nested()
         try:
             await session.execute(_insert([row]))
-        except (IntegrityError, DataError) as exc:
+        except DBAPIError as exc:
+            if not row_fault(exc):
+                raise
             await row_savepoint.rollback()
             rejected.append((int(row["bx_id"]), _reason(exc)))
         else:

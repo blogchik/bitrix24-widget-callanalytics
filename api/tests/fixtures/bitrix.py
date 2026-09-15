@@ -636,6 +636,7 @@ async def seed_portal(
     low_id: int | None = None,
     backfill_status: str = "pending",
     sync_generation: int = 0,
+    crm_mode: str = "off",
 ) -> SeededPortal:
     """Create one `portals` + `portal_sync` pair in the state a test needs.
 
@@ -657,7 +658,7 @@ async def seed_portal(
                             token_user_id, access_token_enc, refresh_token_enc,
                             token_expires_at, token_refreshed_at, token_admin_verified_at,
                             token_version, token_status, application_token_enc,
-                            install_completed_at, uninstalled_at
+                            install_completed_at, uninstalled_at, crm_mode
                         ) VALUES (
                             :member_id, :domain, true, :client_endpoint, :server_endpoint,
                             :status, 'crm,telephony,user_brief,placement', 'ru', 'Asia/Tashkent',
@@ -665,7 +666,7 @@ async def seed_portal(
                             :token_user_id, :access_enc, :refresh_enc,
                             :expires_at, :refreshed_at, :verified_at,
                             :token_version, :token_status, :app_enc,
-                            :install_completed_at, :uninstalled_at
+                            :install_completed_at, :uninstalled_at, :crm_mode
                         ) RETURNING id
                         """
                     ),
@@ -693,6 +694,9 @@ async def seed_portal(
                         ),
                         "install_completed_at": now - timedelta(days=7) if install_completed else None,
                         "uninstalled_at": now - timedelta(hours=1) if status == "uninstalled" else None,
+                        # Off unless a test is about the CRM mirror: the statistics suites
+                        # count requests, and CRM lanes would add their own to every visit.
+                        "crm_mode": crm_mode,
                     },
                 )
             ).scalar_one()

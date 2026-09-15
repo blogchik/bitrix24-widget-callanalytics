@@ -158,6 +158,24 @@ class Settings(BaseSettings):
     #: turns them back on wants it to expire on demand rather than in an hour.
     utm_capability_ttl_sec: int = Field(default=3600, ge=0)
 
+    # ---- CRM mirror (§4.14, §5.10), synced by the worker ----
+    #: Batches all CRM lanes of one visit may send together. A yield rather than a budget,
+    #: like BACKFILL_BATCHES_PER_VISIT: the visit ends and the portal is due again in 2 s.
+    crm_batches_per_visit: int = Field(default=8, ge=1)
+    #: Commands per CRM batch - also how many id ranges a backfill walks at once.
+    crm_batch_commands: int = Field(default=20, ge=1, le=50)
+    #: How often the `updatedTime` sweep re-reads what changed. Until change signals exist
+    #: (milestone M6) this is how long an edit takes to reach the mirror.
+    crm_sweep_interval_sec: int = Field(default=300, ge=60)
+    #: How far each sweep reaches back before its watermark, for a record whose
+    #: `updatedTime` was stamped a moment before its transaction committed.
+    crm_sweep_overlap_sec: int = Field(default=600, ge=0)
+    #: How often funnel and stage names are re-read.
+    crm_dict_interval_sec: int = Field(default=3600, ge=300)
+    #: The widest id range a backfill plans. Narrower on a small portal, so its whole
+    #: history is walked in parallel ranges instead of one long stream.
+    crm_backfill_range_max: int = Field(default=20_000, ge=50)
+
     # ---- Modes ----
     recording_mode: Literal["off", "proxy"] = "off"
     # §5.9 keeps the Celery swap open; an unknown backend name is a startup error,

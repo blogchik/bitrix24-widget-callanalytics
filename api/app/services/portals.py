@@ -34,7 +34,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func, text
 
-from app.db.models import Portal, PortalEvent, PortalSync, SyncMethodBudget
+from app.db.models import CrmLane, Portal, PortalEvent, PortalSync, SyncMethodBudget
 from app.logging import get_logger
 from app.security.crypto import DecryptionError, decrypt, encrypt
 
@@ -306,6 +306,9 @@ async def store_portal_credential(
         await session.execute(
             delete(SyncMethodBudget).where(SyncMethodBudget.portal_id == portal_id)
         )
+        # The CRM lanes describe mirror rows that a new install does not have (they are
+        # purged on uninstall), so the mirror is rebuilt from nothing, like the call cursors.
+        await session.execute(delete(CrmLane).where(CrmLane.portal_id == portal_id))
     await session.execute(
         pg_insert(PortalSync)
         .values(sync_generation=1, **sync_values)
@@ -534,5 +537,6 @@ async def mark_uninstalled(
         )
     )
     await session.execute(delete(SyncMethodBudget).where(SyncMethodBudget.portal_id == portal_id))
+    await session.execute(delete(CrmLane).where(CrmLane.portal_id == portal_id))
     await record_event(session, portal_id, kind, user_id=user_id, details=details)
     return True

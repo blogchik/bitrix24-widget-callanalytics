@@ -19,7 +19,7 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
-from urllib.parse import parse_qsl, unquote_plus
+from urllib.parse import parse_qsl
 
 import httpx
 import pytest
@@ -149,7 +149,9 @@ class FilteringBitrix:
 
         for key, raw in commands.items():
             method, _, query = raw.partition("?")
-            cmd_params = dict(parse_qsl(unquote_plus(query), keep_blank_values=True))
+            # One decode: the envelope parse already undid the form encoding. A second one
+            # turned an offset "+" into a space and cut a ">=" filter key at its "=".
+            cmd_params = dict(parse_qsl(query, keep_blank_values=True))
             method = method.strip().lower()
             self.method_calls[method] = self.method_calls.get(method, 0) + 1
             times[key] = _time(self.operating_for.get(method, 0.2))

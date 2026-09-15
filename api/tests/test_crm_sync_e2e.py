@@ -1,0 +1,340 @@
+"""End to end: `sync_portal` mirrors a portal's CRM without touching its call sync (§5.10).
+
+`test_sync_e2e.py`'s filtering fake, extended with `crm.item.list`, `crm.category.list` and
+`crm.status.list` that honour what they are asked. The claims:
+
+1. a fresh portal's deals, leads, funnels and stages all land, and assignees get names;
+2. an edit reaches the mirror through the sweep;
+3. a CRM refusal or a CRM 429 stays on the CRM lanes - the calls still import and the
+   portal's own failure and throttle counters never move;
+4. `crm_mode = off` and the fleet kill switch each mean no CRM request at all;
+5. an uninstall forgets the lanes, so a reinstall mirrors from nothing.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from typing import Any
+
+import pytest
+import pytest_asyncio
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from app.db.session import control_txn, tenant_txn
+from app.services.portals import mark_uninstalled
+from app.sync import crm_backfill
+from tests.conftest import TENANT_TABLES
+from tests.fixtures.bitrix import SeededPortal, delete_portal, patch_httpx, seed_portal
+from tests.test_sync_e2e import FilteringBitrix, _count_calls, _drive, _sync_row
+
+pytestmark = pytest.mark.asyncio
+
+CALLS = 60
+DEALS = 260
+LEADS = 90
+
+_CATEGORIES = [
+    {"id": 0, "name": "Main", "sort": 10, "isDefault": "Y"},
+    {"id": 3, "name": "B2B", "sort": 20, "isDefault": "N"},
+]
+_STATUSES: dict[str, list[dict[str, Any]]] = {
+    "DEAL_STAGE": [
+        {"STATUS_ID": "NEW", "NAME": "New", "SORT": "10", "SEMANTICS": None},
+        {"STATUS_ID": "WON", "NAME": "Won", "SORT": "20", "SEMANTICS": "S"},
+    ],
+    "DEAL_STAGE_3": [{"STATUS_ID": "C3:NEW", "NAME": "New", "SORT": "10", "SEMANTICS": None}],
+    "STATUS": [
+        {"STATUS_ID": "NEW", "NAME": "New", "SORT": "10", "SEMANTICS": None},
+        {"STATUS_ID": "CONVERTED", "NAME": "Converted", "SORT": "20", "SEMANTICS": "S"},
+    ],
+}
+
+
+def _deal(item_id: int) -> dict[str, Any]:
+    funnel = 3 if item_id % 4 == 0 else 0
+    return {
+        "id": item_id,
+        "categoryId": funnel,
+        "stageId": "C3:NEW" if funnel else "NEW",
+        "stageSemanticId": "P",
+        "assignedById": 100 + item_id % 3,
+        "createdTime": "2026-08-01T10:00:00+03:00",
+        "updatedTime": "2026-08-02T10:00:00+03:00",
+        "movedTime": "2026-08-01T10:00:00+03:00",
+        "closed": "N",
+        "opportunity": "1000.50",
+        "currencyId": "UZS",
+        "leadId": 0,
+        "contactIds": [item_id],
+        "companyId": 0,
+        "utmSource": "google" if item_id % 2 else "",
+        "utmMedium": "",
+        "utmCampaign": "",
+        "utmContent": "",
+        "utmTerm": "",
+        "title": "customer content the mirror must never ask for",
+    }
+
+
+def _lead(item_id: int) -> dict[str, Any]:
+    return {
+        "id": item_id,
+        "stageId": "NEW",
+        "stageSemanticId": "P",
+        "assignedById": 100 + item_id % 3,
+        "createdTime": "2026-08-01T10:00:00+03:00",
+        "updatedTime": "2026-08-02T10:00:00+03:00",
+        "movedTime": "2026-08-01T10:00:00+03:00",
+        "contactIds": [],
+        "contactId": item_id,
+        "companyId": 0,
+        "utmSource": "",
+        "utmMedium": "",
+        "utmCampaign": "",
+        "utmContent": "",
+        "utmTerm": "",
+        "name": "a person's name",
+    }
+
+
+def _instant(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+class CrmBitrix(FilteringBitrix):
+    """The call statistics of `FilteringBitrix` plus a CRM that filters like a real portal."""
+
+    def __init__(self) -> None:
+        super().__init__(total=CALLS)
+        self.tables: dict[int, dict[int, dict[str, Any]]] = {
+            2: {item_id: _deal(item_id) for item_id in range(1, DEALS + 1)},
+            1: {item_id: _lead(item_id) for item_id in range(1, LEADS + 1)},
+        }
+        self.selected: set[str] = set()
+
+    def _dispatch(self, method: str, params: dict[str, str]) -> Any:
+        if method == "crm.item.list":
+            return self._items(params)
+        if method == "crm.category.list":
+            return {"categories": _CATEGORIES}
+        if method == "crm.status.list":
+            return _STATUSES.get(params.get("filter[ENTITY_ID]", ""), [])
+        return super()._dispatch(method, params)
+
+    def _items(self, params: dict[str, str]) -> dict[str, Any]:
+        table = self.tables[int(params["entityTypeId"])]
+        ids = sorted(table)
+        flat = {
+            key[7:-1]: value
+            for key, value in params.items()
+            if key.startswith("filter[") and key.count("[") == 1
+        }
+        exact = {int(value) for key, value in params.items() if key.startswith("filter[@id][")}
+        if ">id" in flat:
+            ids = [i for i in ids if i > int(flat[">id"])]
+        if "<id" in flat:
+            ids = [i for i in ids if i < int(flat["<id"])]
+        if ">=id" in flat:
+            ids = [i for i in ids if i >= int(flat[">=id"])]
+        if exact:
+            ids = [i for i in ids if i in exact]
+        if ">=updatedTime" in flat:
+            since = _instant(flat[">=updatedTime"])
+            ids = [i for i in ids if _instant(table[i]["updatedTime"]) >= since]
+        if params.get("order[id]", "ASC").upper() == "DESC":
+            ids.reverse()
+        select = [value for key, value in params.items() if key.startswith("select[")]
+        self.selected.update(select)
+        return {"items": [{name: table[i][name] for name in select if name in table[i]} for i in ids[:50]]}
+
+
+@pytest_asyncio.fixture()
+async def crm_portal(app_engine: AsyncEngine) -> AsyncIterator[tuple[SeededPortal, CrmBitrix]]:
+    fake = CrmBitrix()
+    seeded = await seed_portal(backfill_status="pending", high_id=0, low_id=None, crm_mode="sync")
+    fake.member_id = seeded.member_id
+    try:
+        with patch_httpx(fake):  # type: ignore[arg-type]
+            yield seeded, fake
+    finally:
+        async with tenant_txn(seeded.portal_id) as session:
+            for table in TENANT_TABLES:
+                await session.execute(
+                    text(f"DELETE FROM {table} WHERE portal_id = :pid"),  # noqa: S608
+                    {"pid": seeded.portal_id},
+                )
+        await delete_portal(seeded.member_id)
+
+
+async def _lanes(portal_id: int) -> dict[str, dict[str, Any]]:
+    async with control_txn() as session:
+        rows = (
+            await session.execute(
+                text("SELECT * FROM crm_lanes WHERE portal_id = :pid"), {"pid": portal_id}
+            )
+        ).mappings().all()
+    return {row["lane"]: dict(row) for row in rows}
+
+
+async def _count(portal_id: int, sql: str) -> int:
+    async with tenant_txn(portal_id) as session:
+        return int((await session.execute(text(sql))).scalar_one())
+
+
+async def _mirror(portal_id: int, *, max_visits: int = 12) -> dict[str, dict[str, Any]]:
+    for _ in range(max_visits):
+        await _drive(portal_id, visits=1)
+        lanes = await _lanes(portal_id)
+        if all(lanes.get(name, {}).get("status") == "done" for name in ("deal.backfill", "lead.backfill")):
+            return lanes
+    raise AssertionError(f"the CRM backfill did not finish in {max_visits} visits: {await _lanes(portal_id)}")
+
+
+async def test_a_fresh_portal_mirrors_deals_leads_funnels_and_stages(
+    crm_portal: tuple[SeededPortal, CrmBitrix],
+) -> None:
+    seeded, fake = crm_portal
+    lanes = await _mirror(seeded.portal_id)
+    await _drive(seeded.portal_id, visits=1)  # the employee refresh names the assignees
+
+    pid = seeded.portal_id
+    assert await _count(pid, "SELECT count(*) FROM crm_items WHERE entity_type_id = 2") == DEALS
+    assert await _count(pid, "SELECT count(*) FROM crm_items WHERE entity_type_id = 1") == LEADS
+    assert lanes["deal.backfill"]["progress_done"] == DEALS
+    assert await _count(pid, "SELECT count(*) FROM crm_funnels") == 3, "Main, B2B and the lead pipeline"
+    assert await _count(pid, "SELECT count(*) FROM crm_stages WHERE entity_type_id = 2") == 3
+    assert await _count(pid, "SELECT count(*) FROM crm_items WHERE category_id = 3") == DEALS // 4
+    assert await _count(pid, "SELECT count(*) FROM crm_items WHERE utm_source = 'google'") == DEALS // 2
+    assert await _count(pid, "SELECT count(*) FROM employees WHERE fetched_at IS NOT NULL") == 3
+    assert await _count(pid, "SELECT count(*) FROM calls") == CALLS
+    assert "title" not in fake.selected and "name" not in fake.selected, "D-3: never select content"
+
+
+async def test_an_edit_reaches_the_mirror_through_the_sweep(
+    crm_portal: tuple[SeededPortal, CrmBitrix],
+) -> None:
+    seeded, fake = crm_portal
+    await _mirror(seeded.portal_id)
+
+    # After the fake's server clock (2026-09-07T10:00Z), which became the sweep's watermark.
+    fake.tables[2][7].update(stageId="WON", stageSemanticId="S", updatedTime="2026-09-08T10:00:00+03:00")
+    async with control_txn() as session:
+        await session.execute(
+            text(
+                "UPDATE crm_lanes SET due_at = now() - interval '1 second' "
+                "WHERE portal_id = :pid AND lane LIKE '%.sweep'"
+            ),
+            {"pid": seeded.portal_id},
+        )
+    await _drive(seeded.portal_id, visits=1)
+
+    async with tenant_txn(seeded.portal_id) as session:
+        stage = (
+            await session.execute(
+                text("SELECT stage_id, stage_semantic FROM crm_items WHERE entity_type_id = 2 AND id = 7")
+            )
+        ).one()
+    assert tuple(stage) == ("WON", "S")
+
+
+async def test_a_crm_refusal_stays_on_its_lanes_and_the_calls_still_sync(
+    crm_portal: tuple[SeededPortal, CrmBitrix],
+) -> None:
+    seeded, fake = crm_portal
+    fake.method_errors["crm.item.list"] = "ACCESS_DENIED"
+    await _drive(seeded.portal_id, visits=4)
+
+    assert await _count_calls(seeded.portal_id) == CALLS
+    sync = await _sync_row(seeded.portal_id)
+    assert int(sync["consecutive_failures"]) == 0 and sync["last_error_code"] is None, (
+        "a CRM refusal reached the call sync's failure counter"
+    )
+    lanes = await _lanes(seeded.portal_id)
+    for name in ("deal.backfill", "lead.backfill", "deal.sweep", "lead.sweep"):
+        assert lanes[name]["block_reason"] == "ACCESS_DENIED"
+        assert lanes[name]["failures"] == 0
+        assert lanes[name]["paused_until"] > datetime.now(UTC)
+    assert lanes["dict"]["last_clean_at"] is not None, "the dictionary is another method"
+
+
+async def test_a_429_on_crm_item_list_blocks_only_that_method(
+    crm_portal: tuple[SeededPortal, CrmBitrix],
+) -> None:
+    seeded, fake = crm_portal
+    fake.method_errors["crm.item.list"] = "OPERATION_TIME_LIMIT"
+    await _drive(seeded.portal_id, visits=4)
+
+    assert await _count_calls(seeded.portal_id) == CALLS
+    sync = await _sync_row(seeded.portal_id)
+    assert int(sync["throttle_hits"]) == 0 and int(sync["consecutive_failures"]) == 0
+    async with control_txn() as session:
+        blocked = (
+            await session.execute(
+                text(
+                    "SELECT blocked_until FROM sync_method_budgets "
+                    "WHERE portal_id = :pid AND method = 'crm.item.list'"
+                ),
+                {"pid": seeded.portal_id},
+            )
+        ).scalar_one()
+    assert blocked > datetime.now(UTC)
+    assert fake.method_calls["crm.item.list"] == 1, "a blocked method is skipped, not retried"
+
+
+async def test_crm_off_and_the_kill_switch_each_mean_no_crm_request(
+    crm_portal: tuple[SeededPortal, CrmBitrix],
+) -> None:
+    seeded, fake = crm_portal
+    async with control_txn() as session:
+        await session.execute(
+            text("UPDATE portals SET crm_mode = 'off' WHERE id = :pid"), {"pid": seeded.portal_id}
+        )
+    await _drive(seeded.portal_id, visits=2)
+    assert not [method for method in fake.method_calls if method.startswith("crm.")]
+
+    async with control_txn() as session:
+        await session.execute(
+            text("UPDATE portals SET crm_mode = 'sync' WHERE id = :pid"), {"pid": seeded.portal_id}
+        )
+        await session.execute(text("UPDATE app_flags SET enabled = false WHERE name = 'crm_mirror'"))
+    try:
+        await _drive(seeded.portal_id, visits=2)
+    finally:
+        async with control_txn() as session:
+            await session.execute(text("UPDATE app_flags SET enabled = true WHERE name = 'crm_mirror'"))
+    assert not [method for method in fake.method_calls if method.startswith("crm.")]
+    assert await _count_calls(seeded.portal_id) == CALLS
+
+
+async def test_a_defect_in_a_crm_lane_never_reaches_the_call_sync(
+    crm_portal: tuple[SeededPortal, CrmBitrix], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bug in CRM code is a lane failure, not a portal failure: the calls keep importing."""
+    seeded, _fake = crm_portal
+
+    def broken(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("a bug in the backfill planner")
+
+    monkeypatch.setattr(crm_backfill, "plan", broken)
+    await _drive(seeded.portal_id, visits=4)
+
+    assert await _count_calls(seeded.portal_id) == CALLS
+    sync = await _sync_row(seeded.portal_id)
+    assert int(sync["consecutive_failures"]) == 0 and sync["last_error_code"] is None
+    lanes = await _lanes(seeded.portal_id)
+    assert lanes["deal.backfill"]["last_error_code"] == "internal_error"
+    assert lanes["deal.backfill"]["failures"] >= 1
+    assert lanes["deal.sweep"]["last_clean_at"] is not None, "the other lanes carry on"
+
+
+async def test_an_uninstall_forgets_the_lanes(crm_portal: tuple[SeededPortal, CrmBitrix]) -> None:
+    seeded, _fake = crm_portal
+    await _drive(seeded.portal_id, visits=1)
+    assert await _lanes(seeded.portal_id)
+
+    async with control_txn() as session:
+        assert await mark_uninstalled(session, seeded.portal_id)
+
+    assert await _lanes(seeded.portal_id) == {}

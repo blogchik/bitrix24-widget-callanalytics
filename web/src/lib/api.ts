@@ -111,6 +111,10 @@ const OWN_MESSAGE_CODES: ReadonlySet<string> = new Set([
   // none of them has a §4.11 state to borrow: the reader has to narrow the period, sign in
   // to Bitrix24 again, or drop a parameter, and only a sentence can say which.
   'deal_scan_too_large',
+  // The scan ran out of its wall clock rather than over the cap. It used to share
+  // `deal_scan_too_large`'s sentence, which then told a reader inside the cap that they were
+  // over it; the two need different advice and so need different sentences.
+  'deal_scan_deadline',
   'deal_report_failed',
   'viewer_token_required',
   'unsupported_filter',
@@ -119,6 +123,7 @@ const OWN_MESSAGE_CODES: ReadonlySet<string> = new Set([
   // generic state page would tell a reader something went wrong and not that their period is
   // twice too wide.
   'utm_scan_too_large',
+  'utm_scan_deadline',
   'utm_report_failed',
   'utm_unsupported',
   'bad_dimension',

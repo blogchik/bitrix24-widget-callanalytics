@@ -476,11 +476,11 @@ async def _run_batch(
     """
     remaining = budget.remaining()
     if remaining <= 0:
-        raise DealReportError("deal_scan_too_large", 400)
+        raise _deadline(None, None)
     try:
         result = await asyncio.wait_for(client.batch(list(commands)), timeout=max(0.5, remaining))
     except TimeoutError:
-        raise DealReportError("deal_scan_too_large", 400) from None
+        raise _deadline(None, None) from None
     except BitrixError as exc:
         raise _classify(exc) from exc
     budget.requests += 1
@@ -812,6 +812,27 @@ def _too_large(deals_total: int, days: int) -> DealReportError:
     )
 
 
+def _deadline(deals_total: int | None, days: int | None) -> DealReportError:
+    """The scan ran out of wall clock - which is NOT the count refusal above.
+
+    Both failures used to raise `deal_scan_too_large`, and the result was a sentence that
+    contradicted itself: a portal with 4,857 deals and a cap of 6,000 was told it had "too
+    many deals (4857) - more than the limit of 6000". The numbers were right and the cause
+    was wrong, and the advice that follows differs - a count refusal needs a narrower
+    selection, a deadline may simply need retrying at a quieter moment.
+
+    `deals_total` and `days` are attached when the caller knows them, for the log and for
+    support; the sentence itself carries no placeholders, because two of the four call
+    sites (inside `_run_batch`) have neither number in hand.
+    """
+    extra: dict[str, Any] = {}
+    if deals_total is not None:
+        extra["deals"] = deals_total
+    if days is not None:
+        extra["days"] = days
+    return DealReportError("deal_scan_deadline", 400, **extra)
+
+
 async def _scan(
     client: BitrixClient,
     budget: _Budget,
@@ -879,13 +900,14 @@ async def _scan(
     while pending:
         remaining = budget.remaining()
         if remaining <= 0:
-            raise _too_large(deals_total, filters.days)
+            raise _deadline(deals_total, filters.days)
         # Refuse BEFORE spending the batches that cannot finish, not after. The projection
         # uses the cost actually observed on this portal rather than a guess, so a fast
-        # portal is allowed the whole cap and a slow one is stopped early with the same
-        # explanation the preflight gate gives.
+        # portal is allowed the whole cap and a slow one is stopped early - with the
+        # DEADLINE explanation, not the preflight gate's count one: this selection was
+        # inside the cap and still could not be read in the time allowed.
         if page_cost > 0 and len(pending) * page_cost > remaining:
-            raise _too_large(deals_total, filters.days)
+            raise _deadline(deals_total, filters.days)
 
         size = _PAGE_BATCH
         if page_cost > 0:

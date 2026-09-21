@@ -50,6 +50,9 @@ __all__ = [
     "Command",
     "ItemRow",
     "MirrorDialect",
+    "census_command",
+    "census_key",
+    "census_proven",
     "get_command",
     "high_id_command",
     "ids_command",
@@ -236,8 +239,28 @@ def _check_minimal(dialect: MirrorDialect) -> None:
         raise ValueError(f"{dialect.name} selects fields D-3 forbids: {offending}")
 
 
+def _check_census(dialect: MirrorDialect) -> None:
+    """The viewer census must be spellable on every dialect, and honest about funnels.
+
+    `census_proven` compares a returned row field-by-field against what was filtered on, so
+    a missing wire entry there is not a failed filter - it is a comparison against `None`
+    that would pass for any row. Asserting the spellings at import is how that stays a
+    deploy-time error instead of a silently widened scope on one portal's dialect.
+    """
+    for column in ("id", "assigned_by_id"):
+        if column not in dialect.wire:
+            raise ValueError(f"{dialect.name} cannot be censused: no {column} field")
+    has_category = "category_id" in dialect.wire
+    if (dialect.entity_type_id == ENTITY_DEAL) != has_category:
+        raise ValueError(
+            f"{dialect.name}: a deal dialect needs category_id and a lead dialect must not "
+            "have one - crm_items.category_id is NULL for every lead"
+        )
+
+
 for _dialect in DIALECTS:
     _check_minimal(_dialect)
+    _check_census(_dialect)
 
 
 # --- commands ---------------------------------------------------------------------------
@@ -320,6 +343,51 @@ def get_command(entity_type_id: int, key: str, item_id: int) -> Command:
     return (key, CRM_ITEM_GET, {"entityTypeId": int(entity_type_id), "id": int(item_id)})
 
 
+def census_key(dialect: MirrorDialect, *, assigned_by_id: int, category_id: int | None) -> str:
+    """The batch key of one census cell.
+
+    `client.batch` caps a key at 32 characters of `[A-Za-z0-9_.-]` and raises on a duplicate,
+    so the spelling lives here next to the command it names rather than in the caller. `n`
+    stands in for "no funnel" and cannot collide with funnel 0, which is a real category id
+    on some portals even though the lead pipeline is stored as one.
+    """
+    funnel = "n" if category_id is None else str(int(category_id))
+    return f"{'d' if dialect.entity_type_id == ENTITY_DEAL else 'l'}.{funnel}.{int(assigned_by_id)}"
+
+
+def census_command(
+    dialect: MirrorDialect,
+    key: str,
+    *,
+    assigned_by_id: int,
+    category_id: int | None = None,
+) -> Command:
+    """One cell of the viewer census: "may you see anything assigned to U in funnel C?"
+
+    Sent with the VIEWER's own token, never the installer credential, because the question is
+    about that viewer's CRM rights and Bitrix24 is the only thing that knows them - it exposes
+    no permission data to read instead (`crm.role.list` and every sibling answer
+    ERROR_METHOD_NOT_FOUND).
+
+    `start: -1` for the reason `high_id_command` gives: the answer needed is "is there at
+    least one row", and a COUNT of a permission-filtered selection is the expensive way to
+    learn it. Nothing downstream may read `total` from a census answer.
+
+    The select is the three fields `census_proven` echoes back, and only those: the census
+    must not become a way to read record content it has no D-3 mandate for.
+    """
+    if category_id is not None and "category_id" not in dialect.wire:
+        # Both lead dialects land here: a lead has no funnel, and `crm_items.category_id` is
+        # NULL for every lead row. Asking anyway would send `filter[None]` or a KeyError.
+        raise ValueError(f"{dialect.name} has no category_id to filter on")
+    filter: dict[str, Any] = {dialect.wire["assigned_by_id"]: int(assigned_by_id)}
+    select = [dialect.id_field, dialect.wire["assigned_by_id"]]
+    if category_id is not None:
+        filter[dialect.wire["category_id"]] = int(category_id)
+        select.append(dialect.wire["category_id"])
+    return _list_command(dialect, key, select=select, filter=filter)
+
+
 # --- parsing ----------------------------------------------------------------------------
 
 
@@ -363,6 +431,46 @@ def page_rows(result: Any, dialect: MirrorDialect) -> list[Any] | None:
         # PHP renders a non-sequential array as an object; its values are the rows.
         return list(result.values())
     return None
+
+
+def census_proven(
+    result: Any,
+    dialect: MirrorDialect,
+    *,
+    assigned_by_id: int,
+    category_id: int | None = None,
+) -> bool | None:
+    """Did Bitrix24 answer the question `census_command` asked? True / False / unusable.
+
+    * `True`  - at least one row came back and EVERY row echoes the assignee (and funnel)
+                that was filtered on.
+    * `False` - an honest zero, or a row that does not match. Not proven, and that is a
+                normal answer: a viewer with no rights in this cell sees nothing in it.
+    * `None`  - the shape is unusable. `page_rows` returns `None` rather than `[]` precisely
+                so a broken answer cannot pass for an empty one, and the caller must treat
+                this as "this entity could not be censused" rather than as a narrow scope.
+
+    The echo is the whole safety property. An unknown filter key may be IGNORED rather than
+    refused (research block (g)), and a command whose filter was dropped returns the viewer's
+    newest readable rows - which would "prove" a cell nobody granted. The per-row test is the
+    same one `sync/crm_fetch.py` applies to a stray id: one row that was not asked for
+    neuters the whole command.
+    """
+    rows = page_rows(result, dialect)
+    if rows is None:
+        return None
+    if not rows:
+        return False
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            return None
+        if as_int(raw.get(dialect.wire["assigned_by_id"])) != int(assigned_by_id):
+            return False
+        if category_id is not None and as_int(raw.get(dialect.wire["category_id"])) != int(
+            category_id
+        ):
+            return False
+    return True
 
 
 def row_id(raw: Any, dialect: MirrorDialect) -> int | None:

@@ -715,3 +715,93 @@ class PortalEvent(Base):
         postgresql.JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
     created_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
+
+
+class CrmViewerScope(Base):
+    """What Bitrix24 proved one viewer may read from the CRM mirror (0005, §4.14).
+
+    Evidence, not configuration. Every cell in here came back from a `crm.item.list` issued
+    with that viewer's own token, and survived the row echo: the returned rows carried back
+    the assignee and funnel the command filtered on. Bitrix24 exposes no CRM permission data
+    to read instead — `crm.role.list` and every sibling answer ERROR_METHOD_NOT_FOUND — so
+    asking it about records is the only way to learn what a person may see.
+
+    The row is cache and is safe to delete: the next open pays one census for it. It is
+    deliberately NOT where an administrator's manual decision lives; that is
+    `CrmViewerGrant`, and keeping the two apart is what makes "why can this person see that?"
+    answerable.
+    """
+
+    __tablename__ = "crm_viewer_scopes"
+    __table_args__ = (
+        CheckConstraint(
+            "deal_verdict IN ('ok','empty','unprovable')", name="crm_viewer_scopes_deal_verdict_chk"
+        ),
+        CheckConstraint(
+            "lead_verdict IN ('ok','empty','unprovable')", name="crm_viewer_scopes_lead_verdict_chk"
+        ),
+    )
+
+    portal_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("portals.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    resolved_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
+    # A reinstall bumps `portal_sync.sync_generation`, which orphans every row here rather
+    # than letting a proof outlive the install it was taken under.
+    sync_generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    dialects: Mapped[dict[str, Any]] = mapped_column(
+        postgresql.JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    deal_verdict: Mapped[str] = mapped_column(String(12), nullable=False)
+    lead_verdict: Mapped[str] = mapped_column(String(12), nullable=False)
+    deal_reason: Mapped[str] = mapped_column(String(40), nullable=False, server_default=text("''"))
+    lead_reason: Mapped[str] = mapped_column(String(40), nullable=False, server_default=text("''"))
+    #: `[[category_id, assignee_id], ...]`, a positive allow-list. A funnel created after the
+    #: census is absent until the next one — narrower than Bitrix24, never wider.
+    deal_cells: Mapped[list[Any]] = mapped_column(
+        postgresql.JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    #: Leads carry no funnel: `crm_items.category_id` is NULL for every lead, and neither
+    #: lead dialect has a `category_id` wire field to filter on.
+    lead_assignees: Mapped[list[Any]] = mapped_column(
+        postgresql.JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    truncated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    commands: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default=text("0")
+    )
+
+
+class CrmViewerGrant(Base):
+    """An administrator's decision that one viewer may read more than Bitrix24 shows them.
+
+    This table can widen access beyond the portal's own CRM permissions. That is what it is
+    for, and it is why it is separate from `CrmViewerScope`: one holds what Bitrix24 answered,
+    the other holds what a person decided, and a support question about either must never have
+    to guess which it is looking at. Every write is audited to `portal_events`.
+    """
+
+    __tablename__ = "crm_viewer_grants"
+    __table_args__ = (
+        CheckConstraint("kind IN ('portal','departments')", name="crm_viewer_grants_kind_chk"),
+        CheckConstraint(
+            "kind <> 'departments' OR cardinality(department_ids) > 0",
+            name="crm_viewer_grants_departments_chk",
+        ),
+    )
+
+    portal_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("portals.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: Resolved against `employees.departments`, which the employee refresh already keeps.
+    department_ids: Mapped[list[int]] = mapped_column(
+        postgresql.ARRAY(Integer), nullable=False, server_default=text("'{}'")
+    )
+    granted_by: Mapped[int] = mapped_column(Integer, nullable=False)
+    granted_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
+    note: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("''"))

@@ -24,7 +24,11 @@ from app.bitrix.crm_items import (
     LEAD_LEGACY,
     ItemRow,
     MirrorDialect,
+    _check_census,
     _check_minimal,
+    census_command,
+    census_key,
+    census_proven,
     get_command,
     high_id_command,
     ids_command,
@@ -234,6 +238,85 @@ def test_page_shapes() -> None:
 def test_every_dialect_is_checked_at_import() -> None:
     for dialect in DIALECTS:
         _check_minimal(dialect)
+
+
+# --- the viewer census: what a cell may and may not prove --------------------------------
+
+
+def test_every_dialect_can_be_censused() -> None:
+    for dialect in DIALECTS:
+        _check_census(dialect)
+
+
+def test_a_deal_cell_filters_and_selects_the_fields_it_will_echo() -> None:
+    """The select is exactly what `census_proven` compares, and `start` disables the COUNT."""
+    key, method, params = census_command(DEAL_ITEM, "d.16.7", assigned_by_id=7, category_id=16)
+    assert (key, method) == ("d.16.7", "crm.item.list")
+    assert params["filter"] == {"assignedById": 7, "categoryId": 16}
+    assert set(params["select"]) == {"id", "assignedById", "categoryId"}
+    assert params["start"] == -1, "a census asks whether a row exists, never how many"
+    assert params["entityTypeId"] == 2
+
+
+def test_a_legacy_deal_cell_speaks_upper_snake() -> None:
+    """The one thing that breaks silently: a camelCase filter on a legacy method is ignored."""
+    _, method, params = census_command(DEAL_LEGACY, "d.16.7", assigned_by_id=7, category_id=16)
+    assert method == "crm.deal.list"
+    assert params["filter"] == {"ASSIGNED_BY_ID": 7, "CATEGORY_ID": 16}
+    assert "entityTypeId" not in params
+
+
+@pytest.mark.parametrize("dialect", [LEAD_ITEM, LEAD_LEGACY])
+def test_a_lead_cell_refuses_a_funnel(dialect: MirrorDialect) -> None:
+    """Neither lead dialect has a funnel, and `crm_items.category_id` is NULL for every lead."""
+    with pytest.raises(ValueError, match="category_id"):
+        census_command(dialect, "l.0.7", assigned_by_id=7, category_id=0)
+    _, _, params = census_command(dialect, "l.n.7", assigned_by_id=7)
+    assert set(params["filter"]) == {dialect.wire["assigned_by_id"]}
+
+
+def test_census_keys_are_unique_short_and_collision_free() -> None:
+    """`client.batch` caps a key at 32 chars and raises on a duplicate."""
+    keys = {
+        census_key(DEAL_ITEM, assigned_by_id=7, category_id=0),
+        census_key(DEAL_ITEM, assigned_by_id=7, category_id=None),
+        census_key(DEAL_ITEM, assigned_by_id=70, category_id=None),
+        census_key(LEAD_ITEM, assigned_by_id=7, category_id=None),
+    }
+    assert len(keys) == 4, "funnel 0 and no-funnel must not share a key"
+    assert all(len(key) <= 32 and key.replace(".", "").isalnum() for key in keys)
+
+
+def test_a_cell_is_proven_only_when_every_row_echoes_the_filter() -> None:
+    """The safety property. An ignored filter key returns rows nobody asked about."""
+    asked: dict[str, Any] = {"assigned_by_id": 7, "category_id": 16}
+    good = {"items": [{"id": 1, "assignedById": 7, "categoryId": 16}]}
+    assert census_proven(good, DEAL_ITEM, **asked) is True
+
+    # Bitrix24 ignored `categoryId` and answered with the viewer's newest readable deal.
+    ignored = {"items": [{"id": 1, "assignedById": 7, "categoryId": 99}]}
+    assert census_proven(ignored, DEAL_ITEM, **asked) is False
+
+    # One stray row among good ones neuters the whole command, as a stray id does in
+    # `sync/crm_fetch.py`.
+    mixed = {"items": [{"id": 1, "assignedById": 7, "categoryId": 16}, {"id": 2, "assignedById": 8}]}
+    assert census_proven(mixed, DEAL_ITEM, **asked) is False
+
+
+def test_an_honest_zero_and_an_unusable_shape_are_different_answers() -> None:
+    """`False` narrows this viewer's scope; `None` must stop the census believing anything."""
+    asked: dict[str, Any] = {"assigned_by_id": 7, "category_id": 16}
+    assert census_proven({"items": []}, DEAL_ITEM, **asked) is False
+    # A universal answer that is a bare list is a shape we cannot read - not an empty one.
+    assert census_proven([], DEAL_ITEM, **asked) is None
+    assert census_proven("x", DEAL_ITEM, **asked) is None
+    assert census_proven({"items": ["not a row"]}, DEAL_ITEM, **asked) is None
+
+
+def test_a_lead_cell_is_proven_on_the_assignee_alone() -> None:
+    rows = [{"ID": "5", "ASSIGNED_BY_ID": "7"}]
+    assert census_proven(rows, LEAD_LEGACY, assigned_by_id=7) is True
+    assert census_proven([{"ID": "5", "ASSIGNED_BY_ID": "8"}], LEAD_LEGACY, assigned_by_id=7) is False
 
 
 # --- the error codes the mirror branches on ---------------------------------------------

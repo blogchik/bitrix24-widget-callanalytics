@@ -13,6 +13,7 @@ import datetime as dt
 
 import pytest
 from sqlalchemy import func, select, text
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.config import settings
 from app.db.models import CrmItem
@@ -49,7 +50,7 @@ def _scope(
     )
 
 
-async def _count(portal_id: int, predicate) -> int:  # noqa: ANN001 - a SQLAlchemy clause
+async def _count(portal_id: int, predicate: ColumnElement[bool]) -> int:
     async with tenant_txn(portal_id) as session:
         return int(
             (

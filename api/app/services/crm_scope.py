@@ -293,7 +293,10 @@ async def run_census(
                 chunk = commands[start : start + size]
                 try:
                     batch = await client.batch(chunk, halt=0)
-                except Exception as exc:  # noqa: BLE001 - a verdict, never a raise
+                # Broad on purpose: a Bitrix24 failure is a VERDICT here, never a raise.
+                # A viewer whose census could not be taken belongs on the live read, and a
+                # transport error that escaped would take their report down instead.
+                except Exception as exc:
                     deal_broken = lead_broken = True
                     deal_reason = lead_reason = f"batch:{type(exc).__name__}"
                     break

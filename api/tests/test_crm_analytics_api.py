@@ -25,6 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.db.session import control_txn, tenant_txn
+from app.db.tenancy import CRM_TENANT_TABLES
 from app.jobs import definitions
 from app.main import create_app
 from app.security.session_token import issue_session
@@ -47,7 +48,10 @@ ME_PATH: Final[str] = "/api/v1/me"
 ADMIN: Final[int] = 7
 OTHER_ADMIN: Final[int] = 8
 EMPLOYEE: Final[int] = 9
-_CRM_TABLES: Final[tuple[str, ...]] = ("crm_items", "crm_funnels", "crm_stages", "crm_dirty")
+#: Not a second copy of the list: `app/db/tenancy.py` is the only one, for the reason its
+#: docstring gives. A CRM table added there extends these assertions by itself, which is what
+#: catching a missed purge depends on.
+_CRM_TABLES: Final[tuple[str, ...]] = CRM_TENANT_TABLES
 _PERIOD: Final[dict[str, str]] = {"period": "custom", "from": "2026-06-01", "to": "2026-06-30"}
 
 

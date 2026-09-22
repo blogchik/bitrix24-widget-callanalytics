@@ -29,8 +29,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.config import settings
 from app.db.session import tenant_txn
 from app.main import create_app
-from app.services import utm_stats
 from app.security.session_token import issue_session
+from app.services import utm_stats
 from tests.fixtures.bitrix import (
     USER_AUTH,
     Err,

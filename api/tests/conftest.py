@@ -329,6 +329,36 @@ async def _seed_portal(index: int) -> PortalFixture:
             ),
             {"pid": portal_id},
         )
+        # One row in each of 0005's tables, for the same reason every table above has one:
+        # `test_isolation.py` walks TENANT_TABLES and an empty table proves nothing about
+        # the policy on it. The two are seeded separately because they mean different
+        # things - evidence Bitrix24 gave, and a decision an administrator made.
+        await session.execute(
+            text(
+                """
+                INSERT INTO crm_viewer_scopes (portal_id, user_id, sync_generation,
+                                               deal_verdict, lead_verdict, deal_cells,
+                                               lead_assignees)
+                VALUES (:pid, :uid, 1, 'ok', 'ok', CAST(:cells AS jsonb),
+                        CAST(:leads AS jsonb))
+                """
+            ),
+            {
+                "pid": portal_id,
+                "uid": user_ids[0],
+                "cells": f"[[0, {user_ids[0]}]]",
+                "leads": f"[{user_ids[0]}]",
+            },
+        )
+        await session.execute(
+            text(
+                """
+                INSERT INTO crm_viewer_grants (portal_id, user_id, kind, granted_by, note)
+                VALUES (:pid, :uid, 'portal', :by, 'seeded by the test fixture')
+                """
+            ),
+            {"pid": portal_id, "uid": user_ids[1], "by": user_ids[0]},
+        )
 
     return PortalFixture(
         portal_id=portal_id,

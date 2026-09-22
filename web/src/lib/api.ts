@@ -459,6 +459,71 @@ export function dismissCrmNotice(): Promise<unknown> {
   return apiFetch<unknown>('/portal/crm-notice/dismiss', { method: 'POST', body: {} });
 }
 
+/** How much of the CRM mirror one employee may read, when an administrator has said so. */
+export type CrmGrantKind = 'portal' | 'departments';
+
+export interface CrmGrant {
+  user_id: number;
+  kind: CrmGrantKind;
+  department_ids: number[];
+  /** The administrator who decided, so the page can name who is accountable. */
+  granted_by: number;
+  granted_at: string;
+  note: string;
+}
+
+export interface CrmScopeEmployee {
+  user_id: number;
+  name: string;
+  position: string;
+  active: boolean;
+  department_ids: number[];
+}
+
+export interface CrmScopeDepartment {
+  id: number;
+  /** Empty when `department.get` could not be reached; the page then shows the bare id. */
+  name: string;
+}
+
+export interface CrmScopeSettings {
+  grants: CrmGrant[];
+  employees: CrmScopeEmployee[];
+  departments: CrmScopeDepartment[];
+  /** Always true today, and read as a flag rather than assumed: the page warns from it. */
+  widens_beyond_bitrix24: boolean;
+}
+
+/**
+ * The grants, the people and the departments in one call.
+ *
+ * One request rather than three because the picker cannot render without all of them, and
+ * an administrator opening the section always wants the whole picture.
+ */
+export function fetchCrmGrants(signal?: AbortSignal): Promise<CrmScopeSettings> {
+  return apiFetch<CrmScopeSettings>('/portal/crm-grants', { signal });
+}
+
+/** Grant one employee a scope, or replace the one they have. Administrators only. */
+export function setCrmGrant(input: {
+  user_id: number;
+  kind: CrmGrantKind;
+  department_ids?: number[];
+  note?: string;
+}): Promise<CrmGrant> {
+  return apiFetch<CrmGrant>('/portal/crm-grants', { method: 'POST', body: input });
+}
+
+/**
+ * Remove one employee's grant.
+ *
+ * This returns them to whatever Bitrix24 says rather than taking their access away, which
+ * is the sentence the page shows next to the button.
+ */
+export function clearCrmGrant(userId: number): Promise<{ removed: boolean }> {
+  return apiFetch<{ removed: boolean }>(`/portal/crm-grants/${userId}`, { method: 'DELETE' });
+}
+
 export interface Resource<T> {
   data: T | null;
   error: unknown;

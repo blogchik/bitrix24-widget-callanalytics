@@ -38,6 +38,7 @@ import {
   PageShell,
   Section,
 } from '@/components/AppFrame';
+import CrmScopeSection from '@/components/CrmScopeSection';
 import StateCard from '@/components/StateCard';
 import { apiFetch, setCrmAnalytics, useMe, type Me } from '@/lib/api';
 import { getAuth, refreshAuth } from '@/lib/bx24';
@@ -537,6 +538,11 @@ export default function SettingsPage() {
           <p className="mt-2 text-[13px]">{t('app.settings.crm.failed')}</p>
         ) : null}
       </Section>
+
+      {/* ------------------------------------------------------ crm scope ------- */}
+      {/* Only while CRM analytics is on: with the mirror turned off there is nothing to
+          scope, and a picker over a deleted copy would be a promise the app cannot keep. */}
+      {crmOn ? <CrmScopeSection /> : null}
 
       {/* ----------------------------------------------------------- token ------- */}
       <Section title={t('app.settings.tokenSection')}>

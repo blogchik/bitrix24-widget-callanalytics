@@ -43,10 +43,29 @@ __all__ = [
 ]
 
 #: The CRM mirror's customer tables (0004, §4.14): what turning CRM analytics off deletes.
-CRM_TENANT_TABLES: Final[tuple[str, ...]] = ("crm_items", "crm_funnels", "crm_stages", "crm_dirty")
+#: `crm_viewer_scopes` (0005) belongs here because it is EVIDENCE derived from the mirror -
+#: cache that costs one census to rebuild - and an administrator who turns CRM analytics off
+#: has asked for the CRM data and everything computed from it to go.
+CRM_TENANT_TABLES: Final[tuple[str, ...]] = (
+    "crm_items",
+    "crm_funnels",
+    "crm_stages",
+    "crm_dirty",
+    "crm_viewer_scopes",
+)
 
 #: The FORCED-RLS customer tables, in the fixed order the purge deletes and audits them.
-TENANT_TABLES: Final[tuple[str, ...]] = ("calls", "employees", "crm_contexts", *CRM_TENANT_TABLES)
+#: `crm_viewer_grants` (0005) is deliberately NOT in `CRM_TENANT_TABLES`: it holds decisions an
+#: administrator made about who may see more than Bitrix24 shows them, it exists nowhere else,
+#: and turning CRM analytics off and on again must not silently forget them. An uninstall still
+#: takes it, like every other tenant row.
+TENANT_TABLES: Final[tuple[str, ...]] = (
+    "calls",
+    "employees",
+    "crm_contexts",
+    "crm_viewer_grants",
+    *CRM_TENANT_TABLES,
+)
 
 #: Every other table that names a portal, with the reason it is not RLS-bound. A new table
 #: with a `portal_id` column belongs in exactly one of these two lists.

@@ -56,7 +56,14 @@ if [ ! -s "$OUT" ] || ! gzip -t "$OUT"; then
 fi
 
 # The dump must actually contain the table that cannot be rebuilt.
-if ! gunzip -c "$OUT" | grep -q "COPY public.portals"; then
+# `grep -q` stops reading at its first match, which SIGPIPEs `gunzip`; under the
+# `set -o pipefail` above that turns a PASSING check into exit 141, so this script
+# declared every complete dump "has no portals data" and exited 1 - which also meant
+# the retention sweep below never ran. `grep -c` reads to EOF, so nothing is signalled.
+# `|| true` because `grep -c` exits 1 on a count of zero, which is the case we report
+# ourselves rather than let `set -e` swallow.
+portals_rows="$(gunzip -c "$OUT" | grep -c '^COPY public\.portals ' || true)"
+if [ "$portals_rows" -eq 0 ]; then
     echo "backup has no portals data: ${OUT}" >&2
     exit 1
 fi

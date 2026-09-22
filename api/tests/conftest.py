@@ -172,14 +172,32 @@ class PortalFixture:
         return len(self.entity_ids)
 
     @property
+    def crm_viewer_scopes(self) -> int:
+        """One census row. It is evidence derived from the mirror, so a CRM purge takes it."""
+        return 1
+
+    @property
+    def crm_viewer_grants(self) -> int:
+        """One administrator grant. A tenant row but NOT a CRM one: only an uninstall takes it,
+        because turning CRM analytics off and on again must not forget a decision."""
+        return 1
+
+    @property
     def crm_rows(self) -> int:
-        """Rows across the CRM mirror tables: each item plus its dirty mark, one funnel, one stage."""
-        return 2 * len(self.item_ids) + 2
+        """Rows across the CRM mirror tables: each item plus its dirty mark, one funnel, one
+        stage, and the viewer census derived from them."""
+        return 2 * len(self.item_ids) + 2 + self.crm_viewer_scopes
 
     @property
     def customer_rows(self) -> int:
         """Every seeded row in `TENANT_TABLES` - what a complete purge must remove."""
-        return self.calls + self.employees + self.crm_contexts + self.crm_rows
+        return (
+            self.calls
+            + self.employees
+            + self.crm_contexts
+            + self.crm_rows
+            + self.crm_viewer_grants
+        )
 
 
 @dataclass(frozen=True)
@@ -328,6 +346,36 @@ async def _seed_portal(index: int) -> PortalFixture:
                 "VALUES (:pid, 2, 0, 'NEW', 'New')"
             ),
             {"pid": portal_id},
+        )
+        # One row in each of 0005's tables, for the same reason every table above has one:
+        # `test_isolation.py` walks TENANT_TABLES and an empty table proves nothing about
+        # the policy on it. The two are seeded separately because they mean different
+        # things - evidence Bitrix24 gave, and a decision an administrator made.
+        await session.execute(
+            text(
+                """
+                INSERT INTO crm_viewer_scopes (portal_id, user_id, sync_generation,
+                                               deal_verdict, lead_verdict, deal_cells,
+                                               lead_assignees)
+                VALUES (:pid, :uid, 1, 'ok', 'ok', CAST(:cells AS jsonb),
+                        CAST(:leads AS jsonb))
+                """
+            ),
+            {
+                "pid": portal_id,
+                "uid": user_ids[0],
+                "cells": f"[[0, {user_ids[0]}]]",
+                "leads": f"[{user_ids[0]}]",
+            },
+        )
+        await session.execute(
+            text(
+                """
+                INSERT INTO crm_viewer_grants (portal_id, user_id, kind, granted_by, note)
+                VALUES (:pid, :uid, 'portal', :by, 'seeded by the test fixture')
+                """
+            ),
+            {"pid": portal_id, "uid": user_ids[1], "by": user_ids[0]},
         )
 
     return PortalFixture(

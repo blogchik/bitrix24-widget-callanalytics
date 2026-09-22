@@ -512,6 +512,27 @@ def _too_large(scan: _Scan, days: int) -> UtmReportError:
     )
 
 
+def _deadline(scan: _Scan, days: int) -> UtmReportError:
+    """The scan ran out of wall clock - which is NOT the count refusal above.
+
+    Both failures used to raise `utm_scan_too_large`, so a report that was well inside the
+    cap could still be told it was over it. The counts travel for the log and for support;
+    the sentence carries no placeholders, because the advice for a deadline is not the
+    advice for a count and does not need the numbers to be actionable.
+    """
+    leads = scan.totals[KIND_LEAD]
+    deals = scan.totals[KIND_DEAL]
+    return UtmReportError(
+        "utm_scan_deadline",
+        400,
+        leads=leads,
+        deals=deals,
+        total=leads + deals,
+        days=days,
+    )
+
+
+
 async def _run_batch(
     client: BitrixClient,
     commands: Sequence[tuple[str, str, dict[str, Any]]],
@@ -526,11 +547,11 @@ async def _run_batch(
     """
     remaining = budget.remaining()
     if remaining <= 0:
-        raise _too_large(scan, days)
+        raise _deadline(scan, days)
     try:
         result = await asyncio.wait_for(client.batch(list(commands)), timeout=max(0.5, remaining))
     except TimeoutError:
-        raise _too_large(scan, days) from None
+        raise _deadline(scan, days) from None
     except BitrixError as exc:
         raise _classify(exc) from exc
     budget.requests += 1
@@ -912,13 +933,14 @@ async def _run_scan(
     while pending:
         remaining = budget.remaining()
         if remaining <= 0:
-            raise _too_large(scan, filters.days)
+            raise _deadline(scan, filters.days)
         # Refuse BEFORE spending the batches that cannot finish, not after. The projection
         # uses the cost actually observed on this portal rather than a guess, so a fast
-        # portal is allowed the whole cap and a slow one is stopped early with the same
-        # explanation the preflight gate gives.
+        # portal is allowed the whole cap and a slow one is stopped early - with the
+        # DEADLINE explanation, not the preflight gate's count one: this selection was
+        # inside the cap and still could not be read in the time allowed.
         if page_cost > 0 and len(pending) * page_cost > remaining:
-            raise _too_large(scan, filters.days)
+            raise _deadline(scan, filters.days)
 
         size = _PAGE_BATCH
         if page_cost > 0:

@@ -26,9 +26,11 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.config import settings
 from app.db.session import tenant_txn
 from app.main import create_app
 from app.security.session_token import issue_session
+from app.services import utm_stats
 from tests.fixtures.bitrix import (
     USER_AUTH,
     Err,
@@ -704,6 +706,29 @@ async def test_a_selection_past_the_cap_is_refused_before_a_single_page(
     assert body["days"] == 30
     # The preflight batch, and nothing after it.
     assert fake.rest_count == 2
+
+
+async def test_running_out_of_time_is_not_reported_as_a_count_refusal(
+    client: httpx.AsyncClient, portal: SeededPortal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Sources half of the same regression the Deals report carried.
+
+    Every wall-clock exit used to raise `utm_scan_too_large`, so a selection well inside the
+    cap could be told it was over it. A deadline and a count need different advice.
+    """
+    monkeypatch.setattr(
+        utm_stats, "settings", settings.model_copy(update={"utm_scan_deadline_sec": 0.0})
+    )
+    fake = cold_fake(lead_total=10, deal_total=10)
+    with patch_httpx(fake):
+        response = await post_utm(client, session_for(portal))
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["code"] == "utm_scan_deadline"
+    # Well inside the cap: the old code would have said otherwise, in the same breath.
+    assert body["total"] < 6000
+    assert "max_total" not in body
 
 
 async def test_a_period_longer_than_the_page_allows_costs_no_rest(

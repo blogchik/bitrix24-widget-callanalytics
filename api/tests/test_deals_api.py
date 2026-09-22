@@ -28,9 +28,11 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.config import settings
 from app.db.session import tenant_txn
 from app.main import create_app
 from app.security.session_token import issue_session
+from app.services import deal_stats
 from tests.fixtures.bitrix import (
     USER_AUTH,
     Err,
@@ -427,6 +429,31 @@ async def test_a_selection_past_the_cap_is_refused_with_its_numbers(
     assert body["deals"] == 999_999
     assert body["max_deals"] > 0
     assert body["days"] == 30
+
+
+async def test_running_out_of_time_is_not_reported_as_a_count_refusal(
+    client: httpx.AsyncClient, portal: SeededPortal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression this test exists for, observed on a real portal.
+
+    A report of 4,857 deals against a cap of 6,000 was refused with "too many deals (4857) -
+    more than the limit of 6000". Both numbers were right and the sentence was nonsense,
+    because the scan had run out of its wall clock and every budget exit reused the count
+    refusal's code. The two causes need different advice, so they need different codes.
+    """
+    monkeypatch.setattr(
+        deal_stats, "settings", settings.model_copy(update={"deal_scan_deadline_sec": 0.0})
+    )
+    fake = cold_fake()
+    with patch_httpx(fake):
+        response = await post_deals(client, session_for(portal))
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["code"] == "deal_scan_deadline"
+    # The refusal must not claim a cap it did not hit: naming `max_deals` here is exactly
+    # what made the old sentence contradict itself.
+    assert "max_deals" not in body
 
 
 async def test_a_period_longer_than_the_page_allows_is_refused(

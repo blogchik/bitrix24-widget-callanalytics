@@ -58,9 +58,9 @@ __all__ = [
     "report_gate",
     "reset_report_gate",
     "serves_mirror",
-    "viewer_grant",
     "utm_counts",
     "utm_days",
+    "viewer_grant",
 ]
 
 _log = get_logger(__name__)

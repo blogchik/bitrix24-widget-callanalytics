@@ -148,16 +148,15 @@ async def _learned_dialects(portal_id: int) -> dict[str, MirrorDialect]:
     """
     lanes = {_DEAL: crm_lanes.DEAL_BACKFILL, _LEAD: crm_lanes.LEAD_BACKFILL}
     async with control_txn() as session:
-        rows = dict(
-            (
-                await session.execute(
-                    select(CrmLane.lane, CrmLane.cursor).where(
-                        CrmLane.portal_id == portal_id,
-                        CrmLane.lane.in_(tuple(lanes.values())),
-                    )
+        found = (
+            await session.execute(
+                select(CrmLane.lane, CrmLane.cursor).where(
+                    CrmLane.portal_id == portal_id,
+                    CrmLane.lane.in_(tuple(lanes.values())),
                 )
-            ).all()
-        )
+            )
+        ).all()
+    rows: dict[str, Any] = {str(row[0]): row[1] for row in found}
     out: dict[str, MirrorDialect] = {}
     for entity, lane in lanes.items():
         cursor = rows.get(lane)
@@ -209,7 +208,7 @@ async def _candidate_grid(portal_id: int) -> tuple[list[tuple[int, int]], list[i
             )
         ).all()
     truncated = len(deal_rows) > cap or len(lead_rows) > cap
-    cells = [(int(cat), int(uid)) for cat, uid in deal_rows[:cap]]
+    cells = [(int(row[0]), int(row[1])) for row in deal_rows[:cap]]
     leads = [int(row[0]) for row in lead_rows[:cap]]
     return cells, leads, truncated
 

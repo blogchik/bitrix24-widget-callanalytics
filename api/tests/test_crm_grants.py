@@ -29,6 +29,11 @@ UNGRANTED: int = 4242
 GRANTEE: int = 4343
 
 
+def _access(grant: crm_grants.ViewerGrant) -> crm_repo.ViewerAccess:
+    """What the routes hand the gates: at most one of grant and census, never both."""
+    return crm_repo.ViewerAccess(grant=grant)
+
+
 def _principal(portal_id: int, user_id: int, *, access: str, admin: bool = False) -> Principal:
     return Principal(
         portal_id=portal_id,
@@ -150,13 +155,13 @@ async def test_a_granted_employee_reads_the_mirror_and_an_ungranted_one_does_not
     grant = await crm_grants.set_grant(
         a.portal_id, GRANTEE, kind="portal", granted_by=a.user_ids[0]
     )
-    assert crm_repo.serves_mirror(portal, granted, grant) is True
-    assert crm_repo.crm_scope(granted, grant) is None, "a portal grant is the whole mirror"
+    assert crm_repo.serves_mirror(portal, granted, _access(grant)) is True
+    assert crm_repo.crm_scope(granted, _access(grant)) is None, "a portal grant is the whole mirror"
 
     ungranted = _principal(a.portal_id, UNGRANTED, access="own")
-    assert crm_repo.serves_mirror(portal, ungranted, None) is False
+    assert crm_repo.serves_mirror(portal, ungranted, crm_repo.ViewerAccess()) is False
     with pytest.raises(PrincipalError) as refusal:
-        crm_repo.crm_scope(ungranted, None)
+        crm_repo.crm_scope(ungranted, crm_repo.ViewerAccess())
     assert refusal.value.code == crm_repo.MIRROR_UNAVAILABLE
 
 
@@ -170,9 +175,9 @@ async def test_a_denied_viewer_is_refused_even_holding_a_grant(two_portals: TwoP
     )
     denied = _principal(a.portal_id, GRANTEE, access="denied")
 
-    assert crm_repo.serves_mirror(portal, denied, grant) is False
+    assert crm_repo.serves_mirror(portal, denied, _access(grant)) is False
     with pytest.raises(PrincipalError) as refusal:
-        crm_repo.crm_scope(denied, grant)
+        crm_repo.crm_scope(denied, _access(grant))
     assert refusal.value.http_status == 403
 
 
@@ -186,7 +191,8 @@ async def test_a_grant_cannot_open_a_portal_that_was_never_promoted(
         a.portal_id, GRANTEE, kind="portal", granted_by=a.user_ids[0]
     )
     assert portal.crm_mode != "mirror"
-    assert crm_repo.serves_mirror(portal, _principal(a.portal_id, GRANTEE, access="own"), grant) is False
+    viewer = _principal(a.portal_id, GRANTEE, access="own")
+    assert crm_repo.serves_mirror(portal, viewer, _access(grant)) is False
 
 
 async def test_crm_analytics_off_beats_a_grant(two_portals: TwoPortals) -> None:
@@ -203,7 +209,8 @@ async def test_crm_analytics_off_beats_a_grant(two_portals: TwoPortals) -> None:
     grant = await crm_grants.set_grant(
         a.portal_id, GRANTEE, kind="portal", granted_by=a.user_ids[0]
     )
-    assert crm_repo.serves_mirror(portal, _principal(a.portal_id, GRANTEE, access="own"), grant) is False
+    viewer = _principal(a.portal_id, GRANTEE, access="own")
+    assert crm_repo.serves_mirror(portal, viewer, _access(grant)) is False
 
 
 # --- what a department grant selects -----------------------------------------------------

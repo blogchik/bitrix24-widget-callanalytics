@@ -64,6 +64,7 @@ import { DateRange, MultiSelect, SegmentedControl, type SelectOption } from '@/c
 import { ApiError, apiFetch, deniedBodyKey, useMe, type MirrorReportMeta } from '@/lib/api';
 import { fitWindow } from '@/lib/bx24';
 import { viewerAccessToken } from '@/lib/calls';
+import { useCrmCensus } from '@/lib/crmScope';
 import { withExtension } from '@/lib/format';
 import { VIZ_CSS } from '@/lib/viz';
 
@@ -126,6 +127,9 @@ export default function DealsPage() {
   const canRead = (access === 'all' || access === 'own') && !crmOff;
   // §4.14: the server decides which path this viewer takes; the page only follows it.
   const mirror = me.data?.crm?.read === 'mirror';
+  // One census, once, before the first report: firing a live read that a census is
+  // about to make unnecessary costs the viewer the very deadline this page had.
+  const census = useCrmCensus(me);
 
   // The default period is thirty days *in the viewer's zone*, so it cannot be computed
   // before `GET /me` has answered with that zone.
@@ -161,7 +165,7 @@ export default function DealsPage() {
     return () => controller.abort();
   }, [canRead]);
 
-  const report = useDeals(canRead ? filters : null, employees, mirror);
+  const report = useDeals(canRead && !census.running ? filters : null, employees, mirror);
 
   // The portal's report path changed under an open page. `/me` is read again once; if it still
   // names the same path, the refusal is shown rather than retried forever.

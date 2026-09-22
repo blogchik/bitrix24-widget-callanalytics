@@ -389,6 +389,13 @@ export interface MeCrm {
    * answered from Postgres, `live` the POST that asks Bitrix24 on the viewer's own token.
    */
   read?: 'mirror' | 'live' | null;
+  /**
+   * True when a census would change this viewer's answer and there is not one yet. The SPA
+   * spends one Bitrix24 token on `POST /crm/scope`, once, rather than paying for a census on
+   * every page load - and is never asked when an administrator already granted this person a
+   * scope, because a grant replaces a census.
+   */
+  scope_needed?: boolean | null;
   /** An administrator who has not dismissed the informational notice. It gates nothing. */
   notice_visible?: boolean | null;
   /** Admin-only. */
@@ -522,6 +529,27 @@ export function setCrmGrant(input: {
  */
 export function clearCrmGrant(userId: number): Promise<{ removed: boolean }> {
   return apiFetch<{ removed: boolean }>(`/portal/crm-grants/${userId}`, { method: 'DELETE' });
+}
+
+export interface CrmScopeResult {
+  /** Which path this viewer's reports take now that the census has been taken. */
+  read: 'mirror' | 'live';
+  scope: { state: 'ready' | 'none'; [key: string]: unknown };
+  /** The portal's grid was larger than the census budget; the viewer sees less, never more. */
+  truncated: boolean;
+}
+
+/**
+ * Ask Bitrix24, with this viewer's own token, which CRM cells they may read.
+ *
+ * A POST carrying the token rather than work bolted onto `/me`: the census costs seconds,
+ * `/me` is read on every page load, and the mirror's own GETs are tokenless by design.
+ */
+export function requestCrmScope(token: string): Promise<CrmScopeResult> {
+  return apiFetch<CrmScopeResult>('/crm/scope', {
+    method: 'POST',
+    body: { access_token: token },
+  });
 }
 
 export interface Resource<T> {

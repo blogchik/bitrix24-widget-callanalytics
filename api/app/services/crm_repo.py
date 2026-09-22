@@ -40,6 +40,7 @@ from app.db.session import control_txn, tenant_txn
 from app.logging import get_logger
 from app.security.principal import Principal, PrincipalError
 from app.services.crm_grants import ViewerGrant, grant_scope, load_grant
+from app.services.crm_scope import ViewerScope, load_scope, scope_predicate
 from app.services.stats import CallFilters
 from app.sync import crm_lanes
 
@@ -50,7 +51,9 @@ __all__ = [
     "Coverage",
     "StageCount",
     "UtmCount",
+    "ViewerAccess",
     "ViewerGrant",
+    "ViewerScope",
     "coverage",
     "crm_scope",
     "deal_dictionary",
@@ -60,7 +63,7 @@ __all__ = [
     "serves_mirror",
     "utm_counts",
     "utm_days",
-    "viewer_grant",
+    "viewer_access",
 ]
 
 _log = get_logger(__name__)
@@ -86,19 +89,45 @@ _global_gate: asyncio.Semaphore | None = None
 # --- who may read what ---------------------------------------------------------------------
 
 
-async def viewer_grant(principal: Principal) -> ViewerGrant | None:
-    """The grant to weigh for this viewer, or None - the one read both gates share.
+@dataclass(frozen=True)
+class ViewerAccess:
+    """Everything outside the JWT that widens one viewer, resolved once per request.
 
-    An administrator costs no read at all: they already see the whole mirror, and a grant
-    could only say something narrower, which `crm_scope` would refuse to apply anyway.
+    At most one of the two is ever set, and that is the rule "a grant replaces the derived
+    scope" expressed where it cannot be forgotten rather than in two call sites.
+    """
+
+    grant: ViewerGrant | None = None
+    scope: ViewerScope | None = None
+
+    @property
+    def widens(self) -> bool:
+        return self.grant is not None or self.scope is not None
+
+
+async def viewer_access(principal: Principal) -> ViewerAccess:
+    """The one read both gates share: what an administrator said, else what Bitrix24 proved.
+
+    An administrator costs no read at all - they already see the whole mirror, and neither
+    a grant nor a census could say anything but something narrower, which `crm_scope` would
+    refuse to apply anyway.
+
+    A grant short-circuits the census on purpose. Merging the two would make "why can this
+    person see that?" unanswerable; taking the grant alone leaves exactly one answer, and
+    `portal_events` holds who gave it.
     """
     if principal.access == _ALL:
-        return None
-    return await load_grant(principal.portal_id, principal.user_id)
+        return ViewerAccess()
+    grant = await load_grant(principal.portal_id, principal.user_id)
+    if grant is not None:
+        return ViewerAccess(grant=grant)
+    if not settings.crm_scope_enabled:
+        return ViewerAccess()
+    return ViewerAccess(scope=await load_scope(principal.portal_id, principal.user_id))
 
 
 def serves_mirror(
-    portal: Portal, principal: Principal, grant: ViewerGrant | None = None
+    portal: Portal, principal: Principal, access: ViewerAccess | None = None
 ) -> bool:
     """True when this viewer's Deals and Sources pages read Postgres rather than Bitrix24.
 
@@ -106,21 +135,21 @@ def serves_mirror(
     which `tools/crm_mode.py` refuses before the deal history is loaded); its administrator
     has not turned CRM analytics off; and the viewer is one `crm_scope` can answer for.
 
-    A grant satisfies the third condition and ONLY the third: it cannot open a portal that
-    was never promoted, and it cannot reopen one whose administrator turned CRM analytics
-    off. Nor does it reach a `denied` viewer - `denied` means the statistics probe said this
-    person may see no telephony at all (§4.7), which is a decision about the whole app and
-    not about how much CRM they get.
+    A grant or a census satisfies the third condition and ONLY the third: neither can open
+    a portal that was never promoted, and neither can reopen one whose administrator turned
+    CRM analytics off. Nor do they reach a `denied` viewer - `denied` means the statistics
+    probe said this person may see no telephony at all (§4.7), which is a decision about
+    the whole app and not about how much CRM they get.
     """
     if portal.crm_opt_out_at is not None or portal.crm_mode != _MIRROR_MODE:
         return False
     if principal.access == _ALL:
         return True
-    return principal.access == _OWN and grant is not None
+    return principal.access == _OWN and access is not None and access.widens
 
 
 def crm_scope(
-    principal: Principal, grant: ViewerGrant | None = None
+    principal: Principal, access: ViewerAccess | None = None
 ) -> ColumnElement[bool] | None:
     """The CRM row predicate for this viewer, or None when the whole mirror is visible.
 
@@ -130,7 +159,9 @@ def crm_scope(
     * `own` WITH a grant -> what the grant says, and nothing merged into it. An
       administrator decided this, `portal_events` records who and when, and that is the
       whole answer to "why can this person see that?".
-    * `own` without one -> 409 `crm_mirror_unavailable`, and the SPA reads Bitrix24 live on
+    * `own` with a census -> the cells Bitrix24 itself proved that viewer may read, asked
+      with their own token (`services/crm_scope.py`).
+    * `own` with neither -> 409 `crm_mirror_unavailable`, and the SPA reads Bitrix24 live on
       that viewer's own token. Refusing is what keeps a salesperson from being served the
       administrator's view by default.
 
@@ -141,8 +172,10 @@ def crm_scope(
         return None
     if principal.access == _DENIED:
         raise PrincipalError("no_stats_permission", 403)
-    if grant is not None:
-        return grant_scope(principal.portal_id, grant)
+    if access is not None and access.grant is not None:
+        return grant_scope(principal.portal_id, access.grant)
+    if access is not None and access.scope is not None:
+        return scope_predicate(access.scope)
     raise PrincipalError(MIRROR_UNAVAILABLE, 409)
 
 

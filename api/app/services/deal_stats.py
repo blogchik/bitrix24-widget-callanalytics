@@ -1282,7 +1282,7 @@ async def load_deal_report_mirror(
     principal: Principal,
     portal: Portal,
     filters: CallFilters,
-    grant: crm_repo.ViewerGrant | None = None,
+    access: crm_repo.ViewerAccess | None = None,
 ) -> dict[str, Any]:
     """`GET /api/v1/deals`: the same report, from Postgres (§4.14).
 
@@ -1291,7 +1291,7 @@ async def load_deal_report_mirror(
     in front of Postgres and a statement of coverage, because a mirror still loading history
     must say so rather than draw a short report as a complete one.
     """
-    scope = crm_repo.crm_scope(principal, grant)
+    scope = crm_repo.crm_scope(principal, access)
     gate = crm_repo.report_gate()
     try:
         await asyncio.wait_for(gate.acquire(), _ADMIT_WAIT_S)

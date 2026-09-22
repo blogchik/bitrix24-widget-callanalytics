@@ -226,13 +226,19 @@ async def clear_grant(portal_id: int, user_id: int, *, cleared_by: int) -> bool:
     derived scope says, which today is the live read.
     """
     async with tenant_txn(portal_id) as session:
-        result = await session.execute(
-            delete(CrmViewerGrant).where(
-                CrmViewerGrant.portal_id == portal_id,
-                CrmViewerGrant.user_id == user_id,
+        # `RETURNING` rather than `rowcount`: the async `Result` does not carry one, and the
+        # id coming back is a stronger statement anyway - the row that went is named, not
+        # merely counted, which is what the audit row below claims.
+        removed = (
+            await session.execute(
+                delete(CrmViewerGrant)
+                .where(
+                    CrmViewerGrant.portal_id == portal_id,
+                    CrmViewerGrant.user_id == user_id,
+                )
+                .returning(CrmViewerGrant.user_id)
             )
-        )
-        removed = bool(result.rowcount)
+        ).scalar_one_or_none() is not None
         if removed:
             await record_event(
                 session,

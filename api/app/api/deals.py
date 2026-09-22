@@ -177,11 +177,12 @@ async def deals_from_mirror(
     portal = await _active_portal(principal.portal_id)
     if portal.crm_opt_out_at is not None:
         return JSONResponse({"code": "crm_analytics_off"}, status_code=409)
-    if not crm_repo.serves_mirror(portal, principal):
+    grant = await crm_repo.viewer_grant(principal)
+    if not crm_repo.serves_mirror(portal, principal, grant):
         return JSONResponse({"code": crm_repo.MIRROR_UNAVAILABLE}, status_code=409)
 
     try:
-        report = await load_deal_report_mirror(principal, portal, filters)
+        report = await load_deal_report_mirror(principal, portal, filters, grant)
     except DealReportError as exc:
         _log.info(
             "deals: mirror report refused",

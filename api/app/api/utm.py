@@ -182,11 +182,12 @@ async def utm_from_mirror(
     portal = await _active_portal(principal.portal_id)
     if portal.crm_opt_out_at is not None:
         return JSONResponse({"code": "crm_analytics_off"}, status_code=409)
-    if not crm_repo.serves_mirror(portal, principal):
+    grant = await crm_repo.viewer_grant(principal)
+    if not crm_repo.serves_mirror(portal, principal, grant):
         return JSONResponse({"code": crm_repo.MIRROR_UNAVAILABLE}, status_code=409)
 
     try:
-        report = await load_utm_report_mirror(principal, portal, filters, dimensions)
+        report = await load_utm_report_mirror(principal, portal, filters, dimensions, grant)
     except UtmReportError as exc:
         _log.info(
             "utm: mirror report refused",

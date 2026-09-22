@@ -48,8 +48,8 @@ from app.bitrix.oauth import (
 )
 from app.bitrix.placements import bind_all, get_bound_placements
 from app.config import settings
-from app.db.models import CrmLane, Portal, PortalSync
-from app.db.session import control_txn
+from app.db.models import CrmLane, Employee, Portal, PortalSync
+from app.db.session import control_txn, tenant_txn
 from app.logging import get_logger, get_request_id
 from app.security.principal import (
     Principal,
@@ -57,6 +57,7 @@ from app.security.principal import (
     PrincipalErrorRoute,
     get_principal,
 )
+from app.services import crm_grants
 from app.services.portals import (
     decrypt_portal_token,
     dismiss_crm_notice,
@@ -636,3 +637,188 @@ async def rebind_placements(
         )
 
     return JSONResponse({"placements": placements, "event_bind": event_bind})
+
+
+# --- GET/POST/DELETE /portal/crm-grants (0005) ---------------------------------------
+
+
+def _read_grant_body(payload: Any) -> tuple[int, str, list[int], str] | None:
+    """`{"user_id", "kind", "department_ids"?, "note"?}` and nothing else, or None.
+
+    Shape only. Whether the combination makes sense is `crm_grants.set_grant`'s decision,
+    because that is the single writer and the CHECK constraints behind it are the backstop.
+    """
+    if not isinstance(payload, dict):
+        return None
+    user_id = payload.get("user_id")
+    kind = payload.get("kind")
+    if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
+        return None
+    if not isinstance(kind, str):
+        return None
+    raw_departments = payload.get("department_ids", [])
+    if not isinstance(raw_departments, list) or len(raw_departments) > crm_grants.MAX_DEPARTMENTS:
+        return None
+    departments: list[int] = []
+    for value in raw_departments:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        departments.append(value)
+    note = payload.get("note", "")
+    if not isinstance(note, str) or len(note) > crm_grants.MAX_NOTE_CHARS * 2:
+        return None
+    return user_id, kind, departments, note
+
+
+async def _department_names(portal_id: int) -> dict[int, str]:
+    """`department.get` on the STORED credential, or an empty map.
+
+    Names are a convenience for the person choosing a department, never a permission input:
+    the predicate resolves membership from `employees.departments` at query time. So a
+    failure here degrades the page to bare ids rather than refusing the page - which is why
+    every error is swallowed with its class recorded and nothing else.
+    """
+    try:
+        endpoint = (await _load(portal_id))[0].client_endpoint
+
+        async def call(token: str) -> Any:
+            client = BitrixClient(endpoint=endpoint, access_token=token, portal_id=portal_id)
+            try:
+                return await client.call("department.get", {})
+            finally:
+                await client.aclose()
+
+        rows = await with_portal_token(portal_id, call)
+    except (BitrixError, CredentialUnavailable, ValueError) as exc:
+        _log.info(
+            "portal: department names unavailable",
+            extra={"portal_id": portal_id, "error": type(exc).__name__},
+        )
+        return {}
+    names: dict[int, str] = {}
+    if isinstance(rows, list):
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                key = int(raw.get("ID"))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            label = raw.get("NAME")
+            names[key] = label[:120] if isinstance(label, str) else ""
+    return names
+
+
+@router.get("/portal/crm-grants")
+async def crm_grants_list(principal: Principal = Depends(get_principal)) -> JSONResponse:
+    """Who has been granted a CRM scope, plus the people and departments to choose from.
+
+    One payload rather than three endpoints: the page cannot render a picker without the
+    employee list, and an administrator opening it always wants all three together.
+    """
+    await _require_admin(principal)
+    portal, _ = await _load(principal.portal_id)
+    if portal.status != _ACTIVE:
+        return _error("portal_inactive", 401)
+
+    grants = await crm_grants.list_grants(portal.id)
+    async with tenant_txn(portal.id) as session:
+        employees = (
+            (
+                await session.execute(
+                    select(Employee)
+                    .where(Employee.portal_id == portal.id)
+                    .order_by(Employee.active.desc(), Employee.last_name, Employee.name)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    department_ids = sorted({dept for row in employees for dept in (row.departments or ())})
+    names = await _department_names(portal.id)
+    return JSONResponse(
+        {
+            "grants": [grant.as_json() for grant in grants],
+            "employees": [
+                {
+                    "user_id": row.bx_user_id,
+                    "name": " ".join(part for part in (row.name, row.last_name) if part).strip(),
+                    "position": row.work_position or "",
+                    "active": bool(row.active),
+                    "department_ids": list(row.departments or ()),
+                }
+                for row in employees
+            ],
+            # Only the departments this portal's people are actually in: a tree of empty
+            # departments is a longer list to read and nothing to grant.
+            "departments": [
+                {"id": dept, "name": names.get(dept, "")} for dept in department_ids
+            ],
+            # The page says so out loud: this is the one control that can show a person more
+            # than Bitrix24 would.
+            "widens_beyond_bitrix24": True,
+        }
+    )
+
+
+@router.post("/portal/crm-grants")
+async def crm_grants_set(
+    request: Request, principal: Principal = Depends(get_principal)
+) -> JSONResponse:
+    """Grant one employee a CRM scope, or replace the one they have."""
+    await _require_admin(principal)
+    raw = await request.body()
+    if not raw or len(raw) > _MAX_BODY_BYTES:
+        return _error("bad_request", 400)
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return _error("bad_request", 400)
+    parsed = _read_grant_body(payload)
+    if parsed is None:
+        return _error("bad_request", 400)
+    user_id, kind, departments, note = parsed
+
+    portal, _ = await _load(principal.portal_id)
+    if portal.status != _ACTIVE:
+        return _error("portal_inactive", 401)
+
+    try:
+        grant = await crm_grants.set_grant(
+            portal.id,
+            user_id,
+            kind=kind,
+            department_ids=departments,
+            granted_by=principal.user_id,
+            note=note,
+        )
+    except ValueError as exc:
+        # The message names the rule, never the body: `set_grant` raises on shapes the CHECK
+        # constraints would also refuse, and the page has a sentence per code.
+        _log.info(
+            "portal: grant refused",
+            extra={"portal_id": portal.id, "subject": user_id, "reason": str(exc)},
+        )
+        return _error("crm_grant_invalid", 400)
+    return JSONResponse(grant.as_json())
+
+
+@router.delete("/portal/crm-grants/{user_id}")
+async def crm_grants_clear(
+    user_id: int, principal: Principal = Depends(get_principal)
+) -> JSONResponse:
+    """Remove one employee's grant.
+
+    This does not take their access away so much as return it to whatever Bitrix24 says,
+    which today means the live read on their own token.
+    """
+    await _require_admin(principal)
+    if user_id <= 0:
+        return _error("bad_request", 400)
+    portal, _ = await _load(principal.portal_id)
+    if portal.status != _ACTIVE:
+        return _error("portal_inactive", 401)
+    removed = await crm_grants.clear_grant(
+        portal.id, user_id, cleared_by=principal.user_id
+    )
+    return JSONResponse({"removed": removed})

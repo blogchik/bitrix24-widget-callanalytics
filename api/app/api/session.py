@@ -188,6 +188,8 @@ async def me(principal: Principal = Depends(get_principal)) -> JSONResponse:
         raise PrincipalError("portal_inactive", 401)
 
     portal, sync = row
+    # One read, shared by the `crm.read` branch below. An administrator costs none.
+    grant = await crm_repo.viewer_grant(principal)
     body: dict[str, Any] = {
         "user_id": principal.user_id,
         "is_admin": principal.is_admin,
@@ -219,7 +221,7 @@ async def me(principal: Principal = Depends(get_principal)) -> JSONResponse:
             "mode": portal.crm_mode,
             # Which path this viewer's Deals and Sources pages take (§4.14): `mirror` is a
             # tokenless GET from Postgres, `live` the POST that asks Bitrix24.
-            "read": "mirror" if crm_repo.serves_mirror(portal, principal) else "live",
+            "read": "mirror" if crm_repo.serves_mirror(portal, principal, grant) else "live",
             # The notice informs and gates nothing; an administrator sees it until dismissed.
             "notice_visible": bool(
                 principal.is_admin

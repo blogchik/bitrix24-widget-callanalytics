@@ -251,9 +251,16 @@ export default function DealsPage() {
           />
         }
         // Not `app.ownScopeBanner`: "you see only your own calls" is wrong on its face on a
-        // page about deals. Every viewer is told the same true thing instead — what they
-        // see is what Bitrix24 lets them see.
-        banner={<span>{t('app.deals.scopeNote')}</span>}
+        // page about deals. What a viewer is told depends on where their scope came from:
+        // Bitrix24 decides it for almost everyone, but a granted reader was given it by an
+        // administrator and may be seeing more than their own CRM profile would show.
+        banner={
+          <span>
+            {mirror && me.data.access !== 'all'
+              ? t('app.deals.scopeGranted')
+              : t('app.deals.scopeNote')}
+          </span>
+        }
       >
         {filters ? (
           <div className={report.pending && data ? 'ca-viz-dim' : undefined}>
@@ -300,7 +307,10 @@ export default function DealsPage() {
                 </label>
               </div>
 
-              {me.data.access === 'all' ? (
+              {/* The picker is for a reader who can see somebody else's records. That is
+                  every administrator, and now also anyone an administrator granted a scope
+                  to - without it "deals by operator" has one row for them. */}
+              {me.data.access === 'all' || mirror ? (
                 <div className="grid items-end gap-3 [grid-template-columns:repeat(auto-fit,minmax(220px,1fr))]">
                   <MultiSelect
                     label={t('app.hours.employees')}

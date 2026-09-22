@@ -244,7 +244,13 @@ export default function UtmPage() {
             ]}
           />
         }
-        banner={<span>{t('app.utm.scopeNote')}</span>}
+        banner={
+          <span>
+            {mirror && me.data.access !== 'all'
+              ? t('app.utm.scopeGranted')
+              : t('app.utm.scopeNote')}
+          </span>
+        }
       >
         {filters ? (
           <div className="flex flex-col gap-3">
@@ -279,7 +285,9 @@ export default function UtmPage() {
                   />
                 </div>
               ) : null}
-              {me.data.access === 'all' ? (
+              {/* Shown to anyone who can see somebody else's records: every administrator,
+                  and anyone an administrator granted a scope to. */}
+              {me.data.access === 'all' || mirror ? (
                 <div className="min-w-0 flex-1 basis-[220px] sm:max-w-[320px]">
                   <MultiSelect
                     label={t('app.hours.employees')}

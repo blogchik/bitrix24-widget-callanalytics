@@ -281,6 +281,7 @@
       "unknownFunnel": "Funnel #{id}",
       "unknownStage": "Stage {id}",
       "blankStage": "No stage",
+      "scopeGranted": "The scope of this report was set by the application administrator — it can differ from what Bitrix24 CRM shows you.",
       "scopeNote": "Showing the deals and funnels you can see in Bitrix24 CRM.",
       "currentStageNote": "Every count is the CURRENT stage of deals that were created, changed or closed in the selected period. It is a snapshot of today, not a picture of the period.",
       "rowsTruncated": "Showing {shown} of {total} operators; the Total row covers all of them.",
@@ -291,6 +292,7 @@
     "utm": {
       "title": "Traffic sources",
       "subtitle": "Which tagged links brought the leads and the deals, and what they were worth.",
+      "scopeGranted": "The scope of this report was set by the application administrator — it can differ from what Bitrix24 CRM shows you.",
       "scopeNote": "Showing the leads and deals you can see in Bitrix24 CRM.",
       "summary": "Totals",
       "trend": "By day",

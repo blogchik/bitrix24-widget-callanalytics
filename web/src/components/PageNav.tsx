@@ -10,12 +10,19 @@
  * know. `aria-current="page"` is what a screen reader reads; the underline is what
  * everyone else does, and neither is the only cue.
  *
- * There is no link to `/settings`: that page is entered through Bitrix24's own settings
- * placement and is administrators only (§4.5). Offering it here would put a door in front
- * of people who cannot open it.
+ * `/settings` is offered to administrators and to nobody else (§4.5) - showing it to a
+ * viewer who cannot open it would put a door in front of them. It used to be left out
+ * entirely, on the reasoning that Bitrix24's own settings placement was the way in. That
+ * was true of the Marketplace registration; a LOCAL application's form has no settings
+ * path at all, so this nav became the only door and there was none.
+ *
+ * Its href carries the Bitrix24 query string for the reason `SyncBanner` gives: `APP_SID`
+ * has to survive the navigation or `BX24.init` never fires on the page it lands on
+ * (§4.4 step 8).
  */
 
 import Link from 'next/link';
+import { useEffect, useState } from 'react';
 
 export interface PageNavItem {
   href: string;
@@ -24,6 +31,8 @@ export interface PageNavItem {
 
 export interface PageNavProps {
   items: readonly PageNavItem[];
+  /** The settings tab's label, already translated. Omitted for a non-administrator. */
+  settingsLabel?: string;
   /** The route that is open now, as `usePathname()` returns it. */
   current: string;
   /** Accessible name for the nav landmark, already translated. */
@@ -67,7 +76,13 @@ export const NAV_CSS = `
 }
 `;
 
-export function PageNav({ items, current, label }: PageNavProps) {
+export function PageNav({ items, current, label, settingsLabel }: PageNavProps) {
+  const [settingsHref, setSettingsHref] = useState('/settings');
+
+  useEffect(() => {
+    setSettingsHref(`/settings${window.location.search}`);
+  }, []);
+
   return (
     <nav className="ca-nav" aria-label={label}>
       {items.map((item) => (
@@ -79,6 +94,14 @@ export function PageNav({ items, current, label }: PageNavProps) {
           {item.label}
         </Link>
       ))}
+      {settingsLabel ? (
+        <Link
+          href={settingsHref}
+          aria-current={current === '/settings' ? 'page' : undefined}
+        >
+          {settingsLabel}
+        </Link>
+      ) : null}
     </nav>
   );
 }

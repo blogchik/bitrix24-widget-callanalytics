@@ -242,12 +242,13 @@ async def set_grant(
     _log.info(
         "crm_grants: grant set",
         # The subject and the kind, never the note: it is free text an administrator wrote.
-        # `kind` is re-derived from this module's own constants rather than echoed: it
-        # arrived in a request body, and §6's rule is that nothing the caller sent reaches a
-        # log line - validated or not, the value that is logged is one of ours.
+        # Everything here is re-derived rather than echoed, because §6's rule is that
+        # nothing the caller sent reaches a log line: `kind` becomes one of this module's
+        # own constants, and `subject` goes through `int()`, which cannot carry the newline
+        # that would forge a second entry.
         extra={
             "portal_id": portal_id,
-            "subject": user_id,
+            "subject": int(user_id),
             "kind": KIND_PORTAL if kind == KIND_PORTAL else KIND_DEPARTMENTS,
             "crm": bool(covers_crm),
             "calls": bool(covers_calls),
@@ -286,7 +287,8 @@ async def clear_grant(portal_id: int, user_id: int, *, cleared_by: int) -> bool:
             )
     if removed:
         _log.info(
-            "crm_grants: grant cleared", extra={"portal_id": portal_id, "subject": user_id}
+            "crm_grants: grant cleared",
+            extra={"portal_id": portal_id, "subject": int(user_id)},
         )
     return removed
 

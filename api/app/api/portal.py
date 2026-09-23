@@ -808,7 +808,9 @@ async def crm_grants_set(
         # rest_log entry for the request, already redacted.
         _log.info(
             "portal: grant refused",
-            extra={"portal_id": portal.id, "subject": user_id},
+            # `int()` and not the value as it arrived: §6 keeps the caller's own bytes out
+            # of a log line, and an integer cannot carry the newline that forges a second one.
+            extra={"portal_id": portal.id, "subject": int(user_id)},
         )
         return _error("crm_grant_invalid", 400)
     return JSONResponse(grant.as_json())

@@ -55,7 +55,7 @@ CRM_TENANT_TABLES: Final[tuple[str, ...]] = (
 )
 
 #: The FORCED-RLS customer tables, in the fixed order the purge deletes and audits them.
-#: `crm_viewer_grants` (0005) is deliberately NOT in `CRM_TENANT_TABLES`: it holds decisions an
+#: `viewer_grants` (0005, renamed in 0006) is deliberately NOT in `CRM_TENANT_TABLES`: it holds decisions an
 #: administrator made about who may see more than Bitrix24 shows them, it exists nowhere else,
 #: and turning CRM analytics off and on again must not silently forget them. An uninstall still
 #: takes it, like every other tenant row.
@@ -63,7 +63,7 @@ TENANT_TABLES: Final[tuple[str, ...]] = (
     "calls",
     "employees",
     "crm_contexts",
-    "crm_viewer_grants",
+    "viewer_grants",
     *CRM_TENANT_TABLES,
 )
 

@@ -35,6 +35,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from app.db.models import Call
 from app.logging import get_logger
 from app.security.principal import Principal, PrincipalError
+from app.services.crm_grants import calls_scope
 
 if TYPE_CHECKING:
     # Type-only: the data layer must not import the service that resolves CRM contexts
@@ -62,6 +63,10 @@ def scope_filter(principal: Principal) -> ColumnElement[bool] | None:
       (research note: no method exposes telephony roles), so the narrowest of the three
       is the only honest choice. The SPA hides the employee filter and shows the "you
       see your own calls only" banner for the same reason.
+    * `own` WITH a grant that covers calls -> what the grant says. An administrator decided
+      that, knowing it overrides Bitrix24's own answer: the probe said this person may see
+      only their own calls, and a call row carries the customer's phone number. The decision
+      is recorded in `portal_events` with who made it.
     * `denied` -> raises. Never reached in practice (`require_data_access` answers 403
       first), which is the point: this is the backstop for an endpoint that forgets the
       dependency, and it fails the request rather than the check.
@@ -72,6 +77,9 @@ def scope_filter(principal: Principal) -> ColumnElement[bool] | None:
     if principal.access == _ALL:
         return None
     if principal.access == _OWN:
+        grant = principal.grant
+        if grant is not None and grant.covers_calls:
+            return calls_scope(principal.portal_id, grant)
         return Call.portal_user_id == principal.user_id
     if principal.access == _DENIED:
         raise PrincipalError("no_stats_permission", 403)

@@ -95,6 +95,10 @@ export default function DashboardPage() {
   const timezone = me.data?.timezone ?? null;
   const access = me.data?.access ?? null;
   const canRead = access === 'all' || access === 'own';
+  // A grant can open the call pages to somebody Bitrix24 pinned to their own rows,
+  // so the employee filter and the "your own calls" banner follow `calls_scope`
+  // rather than `access` - the two stopped meaning the same thing.
+  const callsAll = me.data?.calls_scope === 'all' || access === 'all';
 
   // The default period is "the last 30 days" *in the viewer's zone*, so it cannot be
   // computed before `GET /me` has answered with that zone.
@@ -170,7 +174,7 @@ export default function DashboardPage() {
             settingsLabel={me.data.is_admin ? t('app.nav.settings') : undefined}
           />
         }
-        banner={me.data.access === 'own' ? <span>{t('app.ownScopeBanner')}</span> : undefined}
+        banner={callsAll ? undefined : <span>{t('app.ownScopeBanner')}</span>}
       >
         <SyncBanner sync={me.data.sync} isAdmin={me.data.is_admin} locale={locale} />
         <CrmDataNotice crm={me.data.crm} isAdmin={me.data.is_admin} onChanged={me.reload} />
@@ -180,7 +184,7 @@ export default function DashboardPage() {
             value={filters}
             onChange={setFilters}
             options={options}
-            showEmployee={me.data.access === 'all'}
+            showEmployee={callsAll}
             timeZone={timezone}
             busy={dashboard.pending && data !== null}
           />
@@ -243,7 +247,7 @@ export default function DashboardPage() {
                 <CallsTable
                   query={{ ...filters, period: 'custom' }}
                   timezone={me.data.timezone}
-                  showEmployee={me.data.access === 'all'}
+                  showEmployee={callsAll}
                   importing={Boolean(me.data.sync?.importing)}
                 />
               </div>

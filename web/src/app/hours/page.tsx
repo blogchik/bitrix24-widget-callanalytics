@@ -88,6 +88,10 @@ export default function HoursPage() {
   const timezone = me.data?.timezone ?? null;
   const access = me.data?.access ?? null;
   const canRead = access === 'all' || access === 'own';
+  // A grant can open the call pages to somebody Bitrix24 pinned to their own rows,
+  // so the employee filter and the "your own calls" banner follow `calls_scope`
+  // rather than `access` - the two stopped meaning the same thing.
+  const callsAll = me.data?.calls_scope === 'all' || access === 'all';
 
   // The default period is seven days *in the viewer's zone*, so it cannot be computed
   // before `GET /me` has answered with that zone.
@@ -195,7 +199,7 @@ export default function HoursPage() {
             settingsLabel={me.data.is_admin ? t('app.nav.settings') : undefined}
           />
         }
-        banner={me.data.access === 'own' ? <span>{t('app.ownScopeBanner')}</span> : undefined}
+        banner={callsAll ? undefined : <span>{t('app.ownScopeBanner')}</span>}
       >
         {filters ? (
           <div className={grid.pending && data ? 'ca-viz-dim' : undefined}>
@@ -232,7 +236,7 @@ export default function HoursPage() {
                 ) : null}
               </div>
 
-              {me.data.access === 'all' ? (
+              {callsAll ? (
                 <div className="grid items-end gap-3 [grid-template-columns:repeat(auto-fit,minmax(220px,1fr))]">
                   <MultiSelect
                     label={t('app.hours.employees')}

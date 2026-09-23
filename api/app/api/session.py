@@ -202,6 +202,17 @@ async def me(principal: Principal = Depends(get_principal)) -> JSONResponse:
     body: dict[str, Any] = {
         "user_id": principal.user_id,
         "is_admin": principal.is_admin,
+        # §4.7 plus a grant: which calls this viewer's Summary, By hour and call list show.
+        # `access` alone stopped answering that once an administrator could widen it, and
+        # the pages need to know whether to draw the employee filter at all.
+        "calls_scope": (
+            "denied"
+            if principal.access == _DENIED_LEVEL
+            else "all"
+            if principal.access == _ADMIN_LEVEL
+            or (principal.grant is not None and principal.grant.covers_calls)
+            else "own"
+        ),
         "access": principal.access,
         "locale": resolve_locale(principal.lang),
         "timezone": principal.timezone,

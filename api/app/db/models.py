@@ -728,7 +728,7 @@ class CrmViewerScope(Base):
 
     The row is cache and is safe to delete: the next open pays one census for it. It is
     deliberately NOT where an administrator's manual decision lives; that is
-    `CrmViewerGrant`, and keeping the two apart is what makes "why can this person see that?"
+    `ViewerGrantRow`, and keeping the two apart is what makes "why can this person see that?"
     answerable.
     """
 
@@ -775,22 +775,29 @@ class CrmViewerScope(Base):
     )
 
 
-class CrmViewerGrant(Base):
-    """An administrator's decision that one viewer may read more than Bitrix24 shows them.
+class ViewerGrantRow(Base):
+    """An administrator's decision that one viewer may see more than Bitrix24 shows them.
 
-    This table can widen access beyond the portal's own CRM permissions. That is what it is
-    for, and it is why it is separate from `CrmViewerScope`: one holds what Bitrix24 answered,
-    the other holds what a person decided, and a support question about either must never have
-    to guess which it is looking at. Every write is audited to `portal_events`.
+    Named `...Row` because `services/crm_grants.ViewerGrant` is the object the rest of the
+    app passes around; this is only the storage behind it.
+
+    It can widen access beyond the portal's own permissions - CRM, telephony, or both. That
+    is what it is for, and it is why it is separate from `CrmViewerScope`: one holds what
+    Bitrix24 answered, the other what a person decided, and a support question about either
+    must never have to guess which it is reading. Every write is audited to `portal_events`.
+
+    What it cannot do is make anybody an administrator. The settings page is gated on the
+    JWT's `adm` claim, which comes from Bitrix24's `user.admin`; nothing here reaches it.
     """
 
-    __tablename__ = "crm_viewer_grants"
+    __tablename__ = "viewer_grants"
     __table_args__ = (
-        CheckConstraint("kind IN ('portal','departments')", name="crm_viewer_grants_kind_chk"),
+        CheckConstraint("kind IN ('portal','departments')", name="viewer_grants_kind_chk"),
         CheckConstraint(
             "kind <> 'departments' OR cardinality(department_ids) > 0",
-            name="crm_viewer_grants_departments_chk",
+            name="viewer_grants_departments_chk",
         ),
+        CheckConstraint("covers_crm OR covers_calls", name="viewer_grants_areas_chk"),
     )
 
     portal_id: Mapped[int] = mapped_column(
@@ -801,6 +808,16 @@ class CrmViewerGrant(Base):
     #: Resolved against `employees.departments`, which the employee refresh already keeps.
     department_ids: Mapped[list[int]] = mapped_column(
         postgresql.ARRAY(Integer), nullable=False, server_default=text("'{}'")
+    )
+    #: The Deals and Sources reports.
+    covers_crm: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+    #: The Summary, By hour and call list pages. A wider disclosure than `covers_crm`: a call
+    #: row carries the customer's phone number, and Bitrix24 said this viewer may see only
+    #: their own. Granting it overrides that answer on purpose.
+    covers_calls: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
     )
     granted_by: Mapped[int] = mapped_column(Integer, nullable=False)
     granted_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())

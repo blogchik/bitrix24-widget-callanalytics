@@ -642,7 +642,9 @@ async def rebind_placements(
 # --- GET/POST/DELETE /portal/crm-grants (0005) ---------------------------------------
 
 
-def _read_grant_body(payload: Any) -> tuple[int, str, list[int], str] | None:
+def _read_grant_body(
+    payload: Any,
+) -> tuple[int, str, list[int], str, bool, bool] | None:
     """`{"user_id", "kind", "department_ids"?, "note"?}` and nothing else, or None.
 
     Shape only. Whether the combination makes sense is `crm_grants.set_grant`'s decision,
@@ -667,7 +669,12 @@ def _read_grant_body(payload: Any) -> tuple[int, str, list[int], str] | None:
     note = payload.get("note", "")
     if not isinstance(note, str) or len(note) > crm_grants.MAX_NOTE_CHARS * 2:
         return None
-    return user_id, kind, departments, note
+    # Absent means the CRM reports and nothing else, which is what a 0005-era body meant.
+    covers_crm = payload.get("covers_crm", True)
+    covers_calls = payload.get("covers_calls", False)
+    if not isinstance(covers_crm, bool) or not isinstance(covers_calls, bool):
+        return None
+    return user_id, kind, departments, note, covers_crm, covers_calls
 
 
 async def _department_names(portal_id: int) -> dict[int, str]:
@@ -777,7 +784,7 @@ async def crm_grants_set(
     parsed = _read_grant_body(payload)
     if parsed is None:
         return _error("bad_request", 400)
-    user_id, kind, departments, note = parsed
+    user_id, kind, departments, note, covers_crm, covers_calls = parsed
 
     portal, _ = await _load(principal.portal_id)
     if portal.status != _ACTIVE:
@@ -789,6 +796,8 @@ async def crm_grants_set(
             user_id,
             kind=kind,
             department_ids=departments,
+            covers_crm=covers_crm,
+            covers_calls=covers_calls,
             granted_by=principal.user_id,
             note=note,
         )

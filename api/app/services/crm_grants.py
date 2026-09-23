@@ -36,7 +36,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.sql.elements import ColumnElement
 
-from app.db.models import CrmItem, CrmViewerGrant, Employee
+from app.db.models import CrmItem, ViewerGrantRow, Employee
 from app.db.session import tenant_txn
 from app.logging import get_logger
 from app.services.portals import record_event
@@ -48,6 +48,7 @@ __all__ = [
     "MAX_DEPARTMENTS",
     "MAX_NOTE_CHARS",
     "ViewerGrant",
+    "calls_scope",
     "clear_grant",
     "grant_scope",
     "list_grants",
@@ -77,6 +78,11 @@ class ViewerGrant:
     user_id: int
     kind: str
     department_ids: tuple[int, ...]
+    #: The Deals and Sources reports.
+    covers_crm: bool
+    #: The Summary, By hour and call list pages. A wider disclosure: a call row carries the
+    #: customer's phone number, and Bitrix24 said this viewer may see only their own.
+    covers_calls: bool
     granted_by: int
     granted_at: dt.datetime
     note: str
@@ -87,17 +93,21 @@ class ViewerGrant:
             "user_id": self.user_id,
             "kind": self.kind,
             "department_ids": list(self.department_ids),
+            "covers_crm": self.covers_crm,
+            "covers_calls": self.covers_calls,
             "granted_by": self.granted_by,
             "granted_at": self.granted_at.isoformat(),
             "note": self.note,
         }
 
 
-def _row(row: CrmViewerGrant) -> ViewerGrant:
+def _row(row: ViewerGrantRow) -> ViewerGrant:
     return ViewerGrant(
         user_id=row.user_id,
         kind=row.kind,
         department_ids=tuple(row.department_ids or ()),
+        covers_crm=bool(row.covers_crm),
+        covers_calls=bool(row.covers_calls),
         granted_by=row.granted_by,
         granted_at=row.granted_at,
         note=row.note,
@@ -107,16 +117,16 @@ def _row(row: CrmViewerGrant) -> ViewerGrant:
 async def load_grant(portal_id: int, user_id: int) -> ViewerGrant | None:
     """This viewer's grant, or None. One primary-key read under tenant context.
 
-    `crm_viewer_grants` carries FORCED row-level security, so a read outside `tenant_txn`
+    `viewer_grants` carries FORCED row-level security, so a read outside `tenant_txn`
     returns nothing at all rather than failing - which would read as "no grant" and quietly
     narrow a viewer instead of raising. Every caller here opens the context.
     """
     async with tenant_txn(portal_id) as session:
         row = (
             await session.execute(
-                select(CrmViewerGrant).where(
-                    CrmViewerGrant.portal_id == portal_id,
-                    CrmViewerGrant.user_id == user_id,
+                select(ViewerGrantRow).where(
+                    ViewerGrantRow.portal_id == portal_id,
+                    ViewerGrantRow.user_id == user_id,
                 )
             )
         ).scalar_one_or_none()
@@ -129,9 +139,9 @@ async def list_grants(portal_id: int) -> list[ViewerGrant]:
         rows = (
             (
                 await session.execute(
-                    select(CrmViewerGrant)
-                    .where(CrmViewerGrant.portal_id == portal_id)
-                    .order_by(CrmViewerGrant.granted_at.desc(), CrmViewerGrant.user_id)
+                    select(ViewerGrantRow)
+                    .where(ViewerGrantRow.portal_id == portal_id)
+                    .order_by(ViewerGrantRow.granted_at.desc(), ViewerGrantRow.user_id)
                 )
             )
             .scalars()
@@ -146,6 +156,8 @@ async def set_grant(
     *,
     kind: str,
     department_ids: Sequence[int] = (),
+    covers_crm: bool = True,
+    covers_calls: bool = False,
     granted_by: int,
     note: str = "",
 ) -> ViewerGrant:
@@ -164,6 +176,10 @@ async def set_grant(
         raise ValueError("a portal-wide grant names no departments")
     if len(departments) > MAX_DEPARTMENTS:
         raise ValueError(f"a grant names at most {MAX_DEPARTMENTS} departments")
+    if not covers_crm and not covers_calls:
+        # A grant that opens nothing is not a narrower grant, it is a deleted one, and
+        # `clear_grant` is how a caller says that.
+        raise ValueError("a grant opens at least one area")
     if user_id == granted_by:
         # An administrator already sees the whole mirror; a self-grant can only be a mistake
         # or an attempt to make the audit trail say something it does not mean.
@@ -175,12 +191,14 @@ async def set_grant(
         "user_id": user_id,
         "kind": kind,
         "department_ids": departments,
+        "covers_crm": bool(covers_crm),
+        "covers_calls": bool(covers_calls),
         "granted_by": granted_by,
         "note": text,
     }
     async with tenant_txn(portal_id) as session:
         await session.execute(
-            pg_insert(CrmViewerGrant)
+            pg_insert(ViewerGrantRow)
             .values(**values)
             .on_conflict_do_update(
                 index_elements=["portal_id", "user_id"],
@@ -189,6 +207,8 @@ async def set_grant(
                 set_={
                     "kind": kind,
                     "department_ids": departments,
+                    "covers_crm": bool(covers_crm),
+                    "covers_calls": bool(covers_calls),
                     "granted_by": granted_by,
                     "note": text,
                     "granted_at": func.now(),
@@ -200,13 +220,19 @@ async def set_grant(
             portal_id,
             "crm_grant_set",
             user_id=granted_by,
-            details={"subject": user_id, "kind": kind, "departments": departments},
+            details={
+                "subject": user_id,
+                "kind": kind,
+                "departments": departments,
+                "crm": bool(covers_crm),
+                "calls": bool(covers_calls),
+            },
         )
         row = (
             await session.execute(
-                select(CrmViewerGrant).where(
-                    CrmViewerGrant.portal_id == portal_id,
-                    CrmViewerGrant.user_id == user_id,
+                select(ViewerGrantRow).where(
+                    ViewerGrantRow.portal_id == portal_id,
+                    ViewerGrantRow.user_id == user_id,
                 )
             )
         ).scalar_one()
@@ -214,7 +240,13 @@ async def set_grant(
     _log.info(
         "crm_grants: grant set",
         # The subject and the kind, never the note: it is free text an administrator wrote.
-        extra={"portal_id": portal_id, "subject": user_id, "kind": kind},
+        extra={
+            "portal_id": portal_id,
+            "subject": user_id,
+            "kind": kind,
+            "crm": bool(covers_crm),
+            "calls": bool(covers_calls),
+        },
     )
     return grant
 
@@ -231,12 +263,12 @@ async def clear_grant(portal_id: int, user_id: int, *, cleared_by: int) -> bool:
         # merely counted, which is what the audit row below claims.
         removed = (
             await session.execute(
-                delete(CrmViewerGrant)
+                delete(ViewerGrantRow)
                 .where(
-                    CrmViewerGrant.portal_id == portal_id,
-                    CrmViewerGrant.user_id == user_id,
+                    ViewerGrantRow.portal_id == portal_id,
+                    ViewerGrantRow.user_id == user_id,
                 )
-                .returning(CrmViewerGrant.user_id)
+                .returning(ViewerGrantRow.user_id)
             )
         ).scalar_one_or_none() is not None
         if removed:
@@ -254,22 +286,16 @@ async def clear_grant(portal_id: int, user_id: int, *, cleared_by: int) -> bool:
     return removed
 
 
-def grant_scope(portal_id: int, grant: ViewerGrant) -> ColumnElement[bool] | None:
-    """The CRM row predicate this grant produces, or None for "the whole mirror".
+def _department_members(portal_id: int, grant: ViewerGrant) -> Any:
+    """The user ids of the departments this grant names, as a subquery.
 
-    `None` means exactly what it means everywhere else in `crm_repo`: no extra term. It is
-    returned only for `KIND_PORTAL`, which is the one grant that says so.
-
-    The department form is a subquery rather than a resolved list of user ids, and that is
-    the point: the membership is read at query time from `employees.departments`, so a person
-    who moved department in Bitrix24 stops seeing the old one's records as soon as the
-    employee refresh notices, without anybody editing the grant. An empty membership makes
-    the `IN` match nothing, which fails closed; a NULL `assigned_by_id` is not in any
-    subquery either, which is also correct - an unassigned record is nobody's department.
+    A subquery rather than a resolved list, and that is the point: membership is read at
+    query time from `employees.departments`, so a person who moved department in Bitrix24
+    stops seeing the old one's records as soon as the employee refresh notices, without
+    anybody editing the grant. An empty membership makes the `IN` match nothing, which
+    fails closed.
     """
-    if grant.kind == KIND_PORTAL:
-        return None
-    members = (
+    return (
         select(Employee.bx_user_id)
         .where(
             Employee.portal_id == portal_id,
@@ -277,4 +303,35 @@ def grant_scope(portal_id: int, grant: ViewerGrant) -> ColumnElement[bool] | Non
         )
         .scalar_subquery()
     )
-    return CrmItem.assigned_by_id.in_(members)
+
+
+def calls_scope(portal_id: int, grant: ViewerGrant) -> ColumnElement[bool] | None:
+    """The `calls` row predicate this grant produces, or None for "every call".
+
+    The telephony half of a grant, and the one an administrator should think hardest about:
+    `calls_repo.scope_filter` otherwise pins a non-administrator to their own rows because
+    Bitrix24's statistics probe said so, and a call row carries the customer's phone number.
+    Opening it overrides Bitrix24's answer rather than reading it.
+
+    A NULL `portal_user_id` - a statistic row with no user - is in nobody's department and
+    so is not selected by the department form, exactly as `scope_filter`'s own `own`
+    predicate excludes it.
+    """
+    if grant.kind == KIND_PORTAL:
+        return None
+    return Call.portal_user_id.in_(_department_members(portal_id, grant))
+
+
+def grant_scope(portal_id: int, grant: ViewerGrant) -> ColumnElement[bool] | None:
+    """The CRM row predicate this grant produces, or None for "the whole mirror".
+
+    `None` means exactly what it means everywhere else in `crm_repo`: no extra term. It is
+    returned only for `KIND_PORTAL`, which is the one grant that says so.
+
+    The department form goes through `_department_members`, which says why it is a subquery.
+    A NULL `assigned_by_id` is in no subquery either, which is also correct: an unassigned
+    record is nobody's department.
+    """
+    if grant.kind == KIND_PORTAL:
+        return None
+    return CrmItem.assigned_by_id.in_(_department_members(portal_id, grant))

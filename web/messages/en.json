@@ -373,6 +373,13 @@
       "neverSynced": "CRM data has not been synchronised yet, so the report may be incomplete."
     },
     "crmScope": {
+      "area": {
+        "both": "CRM reports and calls",
+        "calls": "calls",
+        "crm": "CRM reports"
+      },
+      "areasCallsHint": "Calls are the wider access: a call row carries the customer's phone number, and Bitrix24 shows this employee only their own.",
+      "areasLabel": "What this opens",
       "cancel": "Cancel",
       "change": "Change",
       "defaultHint": "Saving removes the separate access: the employee goes back to their Bitrix24 rights.",
@@ -384,7 +391,7 @@
       "empty": "Employees have not been loaded yet. Open this page again later.",
       "failed": "The employee list could not be loaded.",
       "grantedBy": "Granted by user {user}",
-      "hint": "Without separate access an employee sees the Deals and Sources reports exactly as Bitrix24 serves them under their own rights.",
+      "hint": "Without separate access an employee sees the calls and the Deals and Sources reports exactly as Bitrix24 serves them under their own rights.",
       "inactive": "dismissed",
       "kindDefault": "Bitrix24 rights",
       "kindDepartments": "Departments",
@@ -400,7 +407,7 @@
       "scopeDefault": "Bitrix24 rights",
       "scopeDepartments": "Departments: {list}",
       "scopePortal": "The whole portal",
-      "section": "Access to CRM reports",
+      "section": "Access to app data",
       "warning": "This is the one setting that can show an employee more than Bitrix24 itself shows them. Bitrix24 does not expose CRM rights over its API, so the decision is yours — and every change is written to the application log."
     }
   },

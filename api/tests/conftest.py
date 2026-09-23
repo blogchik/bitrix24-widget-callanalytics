@@ -177,7 +177,7 @@ class PortalFixture:
         return 1
 
     @property
-    def crm_viewer_grants(self) -> int:
+    def viewer_grants(self) -> int:
         """One administrator grant. A tenant row but NOT a CRM one: only an uninstall takes it,
         because turning CRM analytics off and on again must not forget a decision."""
         return 1
@@ -196,7 +196,7 @@ class PortalFixture:
             + self.employees
             + self.crm_contexts
             + self.crm_rows
-            + self.crm_viewer_grants
+            + self.viewer_grants
         )
 
 
@@ -371,7 +371,7 @@ async def _seed_portal(index: int) -> PortalFixture:
         await session.execute(
             text(
                 """
-                INSERT INTO crm_viewer_grants (portal_id, user_id, kind, granted_by, note)
+                INSERT INTO viewer_grants (portal_id, user_id, kind, granted_by, note)
                 VALUES (:pid, :uid, 'portal', :by, 'seeded by the test fixture')
                 """
             ),

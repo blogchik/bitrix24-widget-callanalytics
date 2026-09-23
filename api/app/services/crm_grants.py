@@ -168,7 +168,9 @@ async def set_grant(
     renders, not a 500 from the driver.
     """
     if kind not in GRANT_KINDS:
-        raise ValueError(f"unknown grant kind: {kind!r}")
+        # The offending value is deliberately NOT in the message: it comes from a request
+        # body, and this text reaches a log through the route that renders it.
+        raise ValueError("unknown grant kind")
     departments = sorted({int(value) for value in department_ids})
     if kind == KIND_DEPARTMENTS and not departments:
         raise ValueError("a departments grant names at least one department")
@@ -240,10 +242,13 @@ async def set_grant(
     _log.info(
         "crm_grants: grant set",
         # The subject and the kind, never the note: it is free text an administrator wrote.
+        # `kind` is re-derived from this module's own constants rather than echoed: it
+        # arrived in a request body, and §6's rule is that nothing the caller sent reaches a
+        # log line - validated or not, the value that is logged is one of ours.
         extra={
             "portal_id": portal_id,
             "subject": user_id,
-            "kind": kind,
+            "kind": KIND_PORTAL if kind == KIND_PORTAL else KIND_DEPARTMENTS,
             "crm": bool(covers_crm),
             "calls": bool(covers_calls),
         },

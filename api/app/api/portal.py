@@ -801,12 +801,14 @@ async def crm_grants_set(
             granted_by=principal.user_id,
             note=note,
         )
-    except ValueError as exc:
-        # The message names the rule, never the body: `set_grant` raises on shapes the CHECK
-        # constraints would also refuse, and the page has a sentence per code.
+    except ValueError:
+        # The exception text is NOT logged. `set_grant` builds it from the request body in
+        # one branch, and §6's rule is that nothing the caller sent reaches a log line. The
+        # code returned below is what support needs; the shape that was refused is in the
+        # rest_log entry for the request, already redacted.
         _log.info(
             "portal: grant refused",
-            extra={"portal_id": portal.id, "subject": user_id, "reason": str(exc)},
+            extra={"portal_id": portal.id, "subject": user_id},
         )
         return _error("crm_grant_invalid", 400)
     return JSONResponse(grant.as_json())

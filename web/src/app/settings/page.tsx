@@ -28,6 +28,7 @@
  * an upstream redirect having happened.
  */
 import { useLocale, useTranslations } from 'next-intl';
+import { usePathname } from 'next/navigation';
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 
 import {
@@ -39,6 +40,7 @@ import {
   Section,
 } from '@/components/AppFrame';
 import CrmScopeSection from '@/components/CrmScopeSection';
+import PageNav, { NAV_CSS } from '@/components/PageNav';
 import StateCard from '@/components/StateCard';
 import { apiFetch, setCrmAnalytics, useMe, type Me } from '@/lib/api';
 import { getAuth, refreshAuth } from '@/lib/bx24';
@@ -326,6 +328,7 @@ export default function SettingsPage() {
   const t = useTranslations();
   const c = useCopy();
   const locale = useLocale();
+  const pathname = usePathname();
   const { data: me, error, loading, reload } = useMe();
 
   const isAdmin = Boolean(me?.is_admin);
@@ -421,10 +424,26 @@ export default function SettingsPage() {
   const zone = me.timezone;
   const crmOn = view.crm?.analytics_enabled !== false;
 
+  // The nav is what keeps this page from being a dead end. It is reached from the tab on
+  // the other four pages, and Bitrix24 draws no back control around the frame, so without
+  // it closing the whole app was the only way out.
   return (
     <PageShell
       title={t('app.settings.title')}
       subtitle={t('app.signedInAs', { id: String(me.user_id) })}
+      nav={
+        <PageNav
+          current={pathname}
+          label={t('app.nav.label')}
+          items={[
+            { href: '/dashboard', label: t('app.nav.dashboard') },
+            { href: '/hours', label: t('app.nav.hours') },
+            { href: '/deals', label: t('app.nav.deals') },
+            { href: '/utm', label: t('app.nav.utm') },
+          ]}
+          settingsLabel={t('app.nav.settings')}
+        />
+      }
       chips={
         view.token_status ? (
           <span className="ca-chip">{view.token_status}</span>
@@ -440,7 +459,7 @@ export default function SettingsPage() {
         ) : undefined
       }
     >
-      <style href={STYLE_ID} precedence="default" dangerouslySetInnerHTML={{ __html: CSS }} />
+      <style href={STYLE_ID} precedence="default" dangerouslySetInnerHTML={{ __html: `${NAV_CSS}${CSS}` }} />
 
       {status.failed ? (
         <p className="ca-muted text-[13px]">{c('app.settings.statusUnavailable')}</p>

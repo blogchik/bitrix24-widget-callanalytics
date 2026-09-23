@@ -251,7 +251,7 @@ async def me(principal: Principal = Depends(get_principal)) -> JSONResponse:
                 and portal.crm_opt_out_at is None
                 and portal.crm_mode == _MIRROR_MODE
                 and principal.access == _OWN_LEVEL
-                and not crm_access.widens
+                and not crm_access.widens_crm
             ),
             # The notice informs and gates nothing; an administrator sees it until dismissed.
             "notice_visible": bool(

@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.api.portal import _require_admin
 from app.db.models import CrmItem, Portal
 from app.db.session import control_txn, tenant_txn
 from app.security.principal import Principal, PrincipalError
@@ -139,6 +140,32 @@ async def test_a_grant_never_crosses_a_portal(two_portals: TwoPortals) -> None:
     assert await crm_grants.load_grant(a.portal_id, GRANTEE) is not None
     assert await crm_grants.load_grant(b.portal_id, GRANTEE) is None
     assert [g.user_id for g in await crm_grants.list_grants(b.portal_id)] == [b.user_ids[1]]
+
+
+async def test_a_grant_never_makes_anybody_an_administrator(two_portals: TwoPortals) -> None:
+    """The owner's condition, in one assertion: "everything except settings".
+
+    A grant is about data. The settings page - and every endpoint that writes a grant - is
+    gated on the JWT's `adm` claim, which comes from Bitrix24's `user.admin`, and nothing on
+    the grant path reaches it. If this ever passes for a granted viewer, a person an
+    administrator meant to show reports to can hand out grants of their own.
+    """
+    a = two_portals.a
+    grant = await crm_grants.set_grant(
+        a.portal_id,
+        GRANTEE,
+        kind="portal",
+        covers_crm=True,
+        covers_calls=True,
+        granted_by=a.user_ids[0],
+    )
+    assert grant.covers_crm and grant.covers_calls, "the widest grant there is"
+
+    viewer = _principal(a.portal_id, GRANTEE, access="own")
+    assert viewer.is_admin is False
+    with pytest.raises(PrincipalError) as refusal:
+        await _require_admin(viewer)
+    assert refusal.value.http_status == 403
 
 
 # --- which viewers it reaches ------------------------------------------------------------

@@ -642,7 +642,9 @@ async def rebind_placements(
 # --- GET/POST/DELETE /portal/crm-grants (0005) ---------------------------------------
 
 
-def _read_grant_body(payload: Any) -> tuple[int, str, list[int], str] | None:
+def _read_grant_body(
+    payload: Any,
+) -> tuple[int, str, list[int], str, bool, bool] | None:
     """`{"user_id", "kind", "department_ids"?, "note"?}` and nothing else, or None.
 
     Shape only. Whether the combination makes sense is `crm_grants.set_grant`'s decision,
@@ -667,7 +669,12 @@ def _read_grant_body(payload: Any) -> tuple[int, str, list[int], str] | None:
     note = payload.get("note", "")
     if not isinstance(note, str) or len(note) > crm_grants.MAX_NOTE_CHARS * 2:
         return None
-    return user_id, kind, departments, note
+    # Absent means the CRM reports and nothing else, which is what a 0005-era body meant.
+    covers_crm = payload.get("covers_crm", True)
+    covers_calls = payload.get("covers_calls", False)
+    if not isinstance(covers_crm, bool) or not isinstance(covers_calls, bool):
+        return None
+    return user_id, kind, departments, note, covers_crm, covers_calls
 
 
 async def _department_names(portal_id: int) -> dict[int, str]:
@@ -777,7 +784,7 @@ async def crm_grants_set(
     parsed = _read_grant_body(payload)
     if parsed is None:
         return _error("bad_request", 400)
-    user_id, kind, departments, note = parsed
+    user_id, kind, departments, note, covers_crm, covers_calls = parsed
 
     portal, _ = await _load(principal.portal_id)
     if portal.status != _ACTIVE:
@@ -789,15 +796,21 @@ async def crm_grants_set(
             user_id,
             kind=kind,
             department_ids=departments,
+            covers_crm=covers_crm,
+            covers_calls=covers_calls,
             granted_by=principal.user_id,
             note=note,
         )
-    except ValueError as exc:
-        # The message names the rule, never the body: `set_grant` raises on shapes the CHECK
-        # constraints would also refuse, and the page has a sentence per code.
+    except ValueError:
+        # The exception text is NOT logged. `set_grant` builds it from the request body in
+        # one branch, and §6's rule is that nothing the caller sent reaches a log line. The
+        # code returned below is what support needs; the shape that was refused is in the
+        # rest_log entry for the request, already redacted.
         _log.info(
             "portal: grant refused",
-            extra={"portal_id": portal.id, "subject": user_id, "reason": str(exc)},
+            # `int()` and not the value as it arrived: §6 keeps the caller's own bytes out
+            # of a log line, and an integer cannot carry the newline that forges a second one.
+            extra={"portal_id": portal.id, "subject": int(user_id)},
         )
         return _error("crm_grant_invalid", 400)
     return JSONResponse(grant.as_json())

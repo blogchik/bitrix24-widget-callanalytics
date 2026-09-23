@@ -1,5 +1,5 @@
 /**
- * The settings section where an administrator says who may read the CRM mirror.
+ * The settings section where an administrator says who may see more than Bitrix24 shows them.
  *
  * This is the one control in the product that can show a person MORE than Bitrix24 would,
  * and the section says so at the top rather than in a tooltip. Bitrix24 exposes no CRM
@@ -7,6 +7,11 @@
  * ERROR_METHOD_NOT_FOUND - so an administrator who wants a supervisor to see the whole
  * funnel has no other place to say it, and the server audits every change to
  * `portal_events`.
+ *
+ * A grant names its AREAS. The CRM reports and the call pages are scoped by two different
+ * systems - one by this app, one by Bitrix24's telephony verdict - and an administrator who
+ * opens one has not opened the other. The calls area is the wider disclosure of the two: a
+ * call row carries the customer's phone number, and the hint under the control says so.
  *
  * One editor at a time, on purpose: a page full of open forms invites an administrator to
  * change three people and remember one save.
@@ -32,9 +37,30 @@ import {
 /** The three things an administrator can say, including "say nothing". */
 type EditorKind = 'default' | CrmGrantKind;
 
+/** Which parts of the app a grant opens. `both` is the default, and the narrower two exist
+ * because the owner asked to be able to give less than everything. */
+type EditorAreas = 'crm' | 'calls' | 'both';
+
+const AREAS: Record<EditorAreas, { crm: boolean; calls: boolean }> = {
+  crm: { crm: true, calls: false },
+  calls: { crm: false, calls: true },
+  both: { crm: true, calls: true },
+};
+
+function areasOf(grant: CrmGrant | null): EditorAreas {
+  if (grant === null) {
+    return 'both';
+  }
+  if (grant.covers_crm && grant.covers_calls) {
+    return 'both';
+  }
+  return grant.covers_calls ? 'calls' : 'crm';
+}
+
 interface EditorState {
   userId: number;
   kind: EditorKind;
+  areas: EditorAreas;
   departmentIds: string[];
   note: string;
   busy: boolean;
@@ -84,6 +110,7 @@ export default function CrmScopeSection() {
       setEditor({
         userId: employee.user_id,
         kind: grant?.kind ?? 'default',
+        areas: areasOf(grant),
         departmentIds: (grant?.department_ids ?? []).map(String),
         note: grant?.note ?? '',
         busy: false,
@@ -106,6 +133,8 @@ export default function CrmScopeSection() {
           user_id: editor.userId,
           kind: editor.kind,
           department_ids: editor.departmentIds.map(Number),
+          covers_crm: AREAS[editor.areas].crm,
+          covers_calls: AREAS[editor.areas].calls,
           note: editor.note,
         });
       }
@@ -170,7 +199,9 @@ export default function CrmScopeSection() {
                       {grant === null
                         ? t('app.crmScope.scopeDefault')
                         : grant.kind === 'portal'
-                          ? t('app.crmScope.scopePortal')
+                          ? `${t('app.crmScope.scopePortal')} · ${t(
+                              `app.crmScope.area.${areasOf(grant)}`,
+                            )}`
                           : t('app.crmScope.scopeDepartments', {
                               list: grant.department_ids
                                 .map((id) => {
@@ -220,6 +251,24 @@ export default function CrmScopeSection() {
                       ]}
                       disabled={editor.busy}
                     />
+                    {editor.kind === 'default' ? null : (
+                      <SegmentedControl<EditorAreas>
+                        label={t('app.crmScope.areasLabel')}
+                        value={editor.areas}
+                        onChange={(areas) => setEditor({ ...editor, areas })}
+                        options={[
+                          { value: 'crm', label: t('app.crmScope.area.crm') },
+                          { value: 'calls', label: t('app.crmScope.area.calls') },
+                          { value: 'both', label: t('app.crmScope.area.both') },
+                        ]}
+                        hint={
+                          AREAS[editor.areas].calls
+                            ? t('app.crmScope.areasCallsHint')
+                            : undefined
+                        }
+                        disabled={editor.busy}
+                      />
+                    )}
                     {editor.kind === 'departments' ? (
                       <MultiSelect
                         label={t('app.crmScope.departmentsLabel')}

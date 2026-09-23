@@ -39,7 +39,7 @@ from app.db.models import CrmFunnel, CrmItem, CrmLane, CrmStage, Portal
 from app.db.session import control_txn, tenant_txn
 from app.logging import get_logger
 from app.security.principal import Principal, PrincipalError
-from app.services.crm_grants import ViewerGrant, grant_scope, load_grant
+from app.services.crm_grants import ViewerGrant, grant_scope
 from app.services.crm_scope import ViewerScope, load_scope, scope_predicate
 from app.services.stats import CallFilters
 from app.sync import crm_lanes
@@ -101,8 +101,24 @@ class ViewerAccess:
     scope: ViewerScope | None = None
 
     @property
-    def widens(self) -> bool:
-        return self.grant is not None or self.scope is not None
+    def widens_crm(self) -> bool:
+        """Whether the CRM reports are opened past this viewer's own records.
+
+        A grant only counts for the area it names: one that opens the calls pages and not
+        the CRM ones leaves the CRM gate exactly where it was.
+        """
+        if self.grant is not None:
+            return self.grant.covers_crm
+        return self.scope is not None
+
+    @property
+    def widens_calls(self) -> bool:
+        """Whether the Summary, By hour and call list pages are opened.
+
+        Only a grant can do this. A census measures CRM cells and says nothing about
+        telephony, which Bitrix24 scopes with its own separate verdict.
+        """
+        return self.grant is not None and self.grant.covers_calls
 
 
 async def viewer_access(principal: Principal) -> ViewerAccess:
@@ -118,9 +134,10 @@ async def viewer_access(principal: Principal) -> ViewerAccess:
     """
     if principal.access == _ALL:
         return ViewerAccess()
-    grant = await load_grant(principal.portal_id, principal.user_id)
-    if grant is not None:
-        return ViewerAccess(grant=grant)
+    # `get_principal` already read it, next to the `portals` row: one read per request,
+    # shared by the CRM gates here and by `calls_repo.scope_filter`.
+    if principal.grant is not None:
+        return ViewerAccess(grant=principal.grant)
     if not settings.crm_scope_enabled:
         return ViewerAccess()
     return ViewerAccess(scope=await load_scope(principal.portal_id, principal.user_id))
@@ -145,7 +162,7 @@ def serves_mirror(
         return False
     if principal.access == _ALL:
         return True
-    return principal.access == _OWN and access is not None and access.widens
+    return principal.access == _OWN and access is not None and access.widens_crm
 
 
 def crm_scope(
@@ -172,7 +189,7 @@ def crm_scope(
         return None
     if principal.access == _DENIED:
         raise PrincipalError("no_stats_permission", 403)
-    if access is not None and access.grant is not None:
+    if access is not None and access.grant is not None and access.grant.covers_crm:
         return grant_scope(principal.portal_id, access.grant)
     if access is not None and access.scope is not None:
         return scope_predicate(access.scope)

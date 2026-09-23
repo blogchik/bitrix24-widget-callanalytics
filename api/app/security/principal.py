@@ -42,6 +42,7 @@ from app.db.models import Portal
 from app.db.session import control_txn
 from app.logging import get_logger
 from app.security.session_token import SessionClaims, TokenError, verify_session
+from app.services.crm_grants import ViewerGrant, load_grant
 
 __all__ = [
     "Principal",
@@ -62,6 +63,8 @@ _ACTIVE: Final[str] = "active"
 
 #: §4.7 collapses Bitrix24's four statistics levels to three; `denied` is the one that
 #: may reach `GET /me` and nothing else.
+#: The access level that needs no grant: an administrator already sees everything.
+_ALL: Final[str] = "all"
 _DENIED: Final[str] = "denied"
 
 
@@ -89,6 +92,16 @@ class Principal:
     placement: str
     entity: dict[str, Any] | None
     issued_at: int
+    #: The administrator's decision about this viewer, when there is one. NOT from the JWT:
+    #: `get_principal` loads it from `viewer_grants`, next to the `portals` read that already
+    #: happens there. It lives on the principal so `calls_repo.scope_filter` stays the single
+    #: place the call scope is applied - threading it through the eleven callers of
+    #: `base_select` instead would put that decision in eleven places, and a site that forgot
+    #: it would quietly serve a narrower answer than the administrator asked for.
+    #:
+    #: It can never widen `is_admin`. A grant is about data; the settings page is gated on the
+    #: `adm` claim, which comes from Bitrix24's `user.admin` and nothing here reaches.
+    grant: ViewerGrant | None = None
 
 
 class PrincipalError(Exception):
@@ -217,6 +230,12 @@ async def get_principal(request: Request) -> Principal:
         )
         raise PrincipalError("portal_inactive", 401)
 
+    # An administrator's request pays no read at all: they already see everything, and a
+    # grant could only ever say something narrower, which no gate would apply anyway.
+    grant = (
+        None if claims.adm or claims.acc == _ALL else await load_grant(portal.id, claims.sub)
+    )
+
     return Principal(
         portal_id=portal.id,
         member_id=portal.member_id,
@@ -228,6 +247,7 @@ async def get_principal(request: Request) -> Principal:
         placement=claims.plc,
         entity=_entity_of(claims),
         issued_at=claims.iat,
+        grant=grant,
     )
 
 

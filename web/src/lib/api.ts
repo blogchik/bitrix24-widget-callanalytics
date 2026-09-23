@@ -360,6 +360,12 @@ export interface Me {
   user_id: number;
   is_admin: boolean;
   access: AccessLevel;
+  /**
+   * Which calls this viewer's Summary, By hour and call list show. `access` alone stopped
+   * answering that once an administrator could widen it with a grant, so the pages branch
+   * on this instead when deciding whether to draw the employee filter.
+   */
+  calls_scope?: 'all' | 'own' | 'denied' | null;
   /** Already resolved through the shared fallback map (§8). */
   locale?: string | null;
   timezone?: string | null;
@@ -473,6 +479,10 @@ export interface CrmGrant {
   user_id: number;
   kind: CrmGrantKind;
   department_ids: number[];
+  /** The Deals and Sources reports. */
+  covers_crm: boolean;
+  /** The Summary, By hour and call list pages - a wider disclosure than `covers_crm`. */
+  covers_calls: boolean;
   /** The administrator who decided, so the page can name who is accountable. */
   granted_by: number;
   granted_at: string;
@@ -516,6 +526,8 @@ export function setCrmGrant(input: {
   user_id: number;
   kind: CrmGrantKind;
   department_ids?: number[];
+  covers_crm?: boolean;
+  covers_calls?: boolean;
   note?: string;
 }): Promise<CrmGrant> {
   return apiFetch<CrmGrant>('/portal/crm-grants', { method: 'POST', body: input });

@@ -78,6 +78,7 @@ from app.security.crypto import DecryptionError
 from app.security.principal import Principal, PrincipalErrorRoute
 from app.security.session_token import PlayClaims, TokenError, verify_play_token
 from app.services.calls_repo import base_select
+from app.services.crm_grants import load_grant
 
 __all__ = ["forget_viewer_tokens", "remember_viewer_token", "router", "viewer_token"]
 
@@ -222,14 +223,18 @@ def _error(code: str, status: int) -> JSONResponse:
     return JSONResponse({"code": code}, status_code=status)
 
 
-def _principal_of(claims: PlayClaims, portal: Portal) -> Principal:
+async def _principal_of(claims: PlayClaims, portal: Portal) -> Principal:
     """Rebuild just enough principal to re-apply §4.7's scope predicate.
 
-    `scope_filter` reads three fields - `portal_id`, `user_id`, `access` - and this is
-    the honest way to hand it those without inventing a second scope implementation for
-    the one endpoint that has no session. The claims are signed by us and were minted
-    only after `play-url` matched the row under a live session, so `acc` here is the same
-    level that authorised the mint, at most five minutes old.
+    `scope_filter` reads `portal_id`, `user_id`, `access` and now the viewer's grant, and
+    this is the honest way to hand it those without inventing a second scope implementation
+    for the one endpoint that has no session. The grant is re-read rather than carried in
+    the token: it is the current decision that should govern playback, and a grant revoked
+    in the five minutes since the mint must close the recording, not trail it.
+
+    The claims are signed by us and were minted only after `play-url` matched the row under
+    a live session, so `acc` here is the same level that authorised the mint, at most five
+    minutes old.
 
     The display fields are placeholders on purpose: nothing on this path renders text.
     """
@@ -244,6 +249,11 @@ def _principal_of(claims: PlayClaims, portal: Portal) -> Principal:
         placement="",
         entity=None,
         issued_at=0,
+        grant=(
+            None
+            if claims.acc == _ACCESS_ALL
+            else await load_grant(portal.id, claims.sub)
+        ),
     )
 
 
@@ -533,7 +543,7 @@ async def record(call_id: int, request: Request) -> Response:
         # moment it uninstalls, not when the five minutes run out.
         return _error("portal_inactive", 401)
 
-    principal = _principal_of(claims, portal)
+    principal = await _principal_of(claims, portal)
     # `scope_filter` raises `PrincipalError('no_stats_permission', 403)` for a denied
     # level; `PrincipalErrorRoute` renders it. A grant can only carry a level that was
     # live at mint time, so this is the backstop, not the common path.

@@ -76,9 +76,9 @@ from app.db.session import control_txn, tenant_txn
 from app.logging import get_logger, get_request_id
 from app.security.crypto import DecryptionError
 from app.security.principal import Principal, PrincipalErrorRoute
-from app.services.crm_grants import load_grant
 from app.security.session_token import PlayClaims, TokenError, verify_play_token
 from app.services.calls_repo import base_select
+from app.services.crm_grants import load_grant
 
 __all__ = ["forget_viewer_tokens", "remember_viewer_token", "router", "viewer_token"]
 
@@ -230,9 +230,11 @@ async def _principal_of(claims: PlayClaims, portal: Portal) -> Principal:
     this is the honest way to hand it those without inventing a second scope implementation
     for the one endpoint that has no session. The grant is re-read rather than carried in
     the token: it is the current decision that should govern playback, and a grant revoked
-    in the five minutes since the mint must close the recording, not trail it. The claims are signed by us and were minted
-    only after `play-url` matched the row under a live session, so `acc` here is the same
-    level that authorised the mint, at most five minutes old.
+    in the five minutes since the mint must close the recording, not trail it.
+
+    The claims are signed by us and were minted only after `play-url` matched the row under
+    a live session, so `acc` here is the same level that authorised the mint, at most five
+    minutes old.
 
     The display fields are placeholders on purpose: nothing on this path renders text.
     """

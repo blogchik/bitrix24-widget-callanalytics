@@ -36,7 +36,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.sql.elements import ColumnElement
 
-from app.db.models import CrmItem, ViewerGrantRow, Employee
+from app.db.models import Call, CrmItem, Employee, ViewerGrantRow
 from app.db.session import tenant_txn
 from app.logging import get_logger
 from app.services.portals import record_event

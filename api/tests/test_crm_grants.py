@@ -16,9 +16,9 @@ import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.api.portal import _require_admin
 from app.db.models import CrmItem, Portal
 from app.db.session import control_txn, tenant_txn
-from app.api.portal import _require_admin
 from app.security.principal import Principal, PrincipalError
 from app.services import crm_grants, crm_repo
 from tests.conftest import TwoPortals

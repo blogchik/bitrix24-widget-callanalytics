@@ -252,6 +252,7 @@ export default function DealsPage() {
               { href: '/deals', label: t('app.nav.deals') },
               { href: '/utm', label: t('app.nav.utm') },
             ]}
+            settingsLabel={me.data.is_admin ? t('app.nav.settings') : undefined}
           />
         }
         // Not `app.ownScopeBanner`: "you see only your own calls" is wrong on its face on a

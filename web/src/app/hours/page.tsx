@@ -192,6 +192,7 @@ export default function HoursPage() {
               { href: '/deals', label: t('app.nav.deals') },
               { href: '/utm', label: t('app.nav.utm') },
             ]}
+            settingsLabel={me.data.is_admin ? t('app.nav.settings') : undefined}
           />
         }
         banner={me.data.access === 'own' ? <span>{t('app.ownScopeBanner')}</span> : undefined}

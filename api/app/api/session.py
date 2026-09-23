@@ -40,6 +40,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
+from app.api.viewer_token import read_viewer_access_token
 from app.bitrix.crm import tab_context_commands
 from app.bitrix.errors import (
     BitrixError,
@@ -53,6 +54,7 @@ from app.bitrix.errors import (
     UserAccessError,
 )
 from app.bitrix.identity import resolve_identity_with
+from app.config import settings
 from app.db.models import Portal, PortalSync
 from app.db.session import control_txn
 from app.i18n import resolve_locale
@@ -65,6 +67,7 @@ from app.security.principal import (
 )
 from app.security.session_token import TokenError, issue_session, verify_session
 from app.services import crm_repo
+from app.services import crm_scope as crm_scope_service
 from app.services.access import decide_access
 from app.services.crm_context import resolve_crm_context, store_crm_context
 
@@ -111,6 +114,12 @@ _DENIED_CODE: Final[str] = "no_stats_permission"
 
 #: The §4.7 level that may not read call data, and the §3 `portals.status` that may.
 _DENIED_LEVEL: Final[str] = "denied"
+#: The access level that needs no census: an administrator already sees it all.
+_ADMIN_LEVEL: Final[str] = "all"
+#: The level a census is FOR: a viewer Bitrix24 answered, but narrowly.
+_OWN_LEVEL: Final[str] = "own"
+#: §4.14: the only `crm_mode` a census can serve a report from.
+_MIRROR_MODE: Final[str] = "mirror"
 _ACTIVE: Final[str] = "active"
 
 #: How a §4.4 step-5 state kind is answered over JSON. The kinds are the SPA's own
@@ -188,6 +197,8 @@ async def me(principal: Principal = Depends(get_principal)) -> JSONResponse:
         raise PrincipalError("portal_inactive", 401)
 
     portal, sync = row
+    # One read, shared by the `crm.read` branch below. An administrator costs none.
+    crm_access = await crm_repo.viewer_access(principal)
     body: dict[str, Any] = {
         "user_id": principal.user_id,
         "is_admin": principal.is_admin,
@@ -219,7 +230,18 @@ async def me(principal: Principal = Depends(get_principal)) -> JSONResponse:
             "mode": portal.crm_mode,
             # Which path this viewer's Deals and Sources pages take (§4.14): `mirror` is a
             # tokenless GET from Postgres, `live` the POST that asks Bitrix24.
-            "read": "mirror" if crm_repo.serves_mirror(portal, principal) else "live",
+            "read": "mirror" if crm_repo.serves_mirror(portal, principal, crm_access) else "live",
+            # §4.14: true when a census would change this viewer's answer and there is not
+            # one yet. The SPA acts on it once, with a Bitrix24 token, instead of paying for
+            # a census on every page load - and never asks when an administrator already
+            # granted this person a scope, because a grant replaces a census.
+            "scope_needed": (
+                settings.crm_scope_enabled
+                and portal.crm_opt_out_at is None
+                and portal.crm_mode == _MIRROR_MODE
+                and principal.access == _OWN_LEVEL
+                and not crm_access.widens
+            ),
             # The notice informs and gates nothing; an administrator sees it until dismissed.
             "notice_visible": bool(
                 principal.is_admin
@@ -482,5 +504,69 @@ async def exchange(request: Request) -> JSONResponse:
             "placement": claims.plc,
             "entity": entity,
             "expires_in": _SESSION_TTL_SECONDS,
+        }
+    )
+
+
+# --- POST /crm/scope (0005) -----------------------------------------------------------
+
+
+@router.post("/crm/scope")
+async def crm_scope_census(
+    request: Request, principal: Principal = Depends(get_principal)
+) -> JSONResponse:
+    """Ask Bitrix24, with this viewer's own token, which CRM cells they may read.
+
+    A `POST` carrying the token rather than work bolted onto `/me`, for two reasons that
+    both matter. `/me` is read on every page load and the census costs seconds, not
+    milliseconds - measured at 8.8 s on a real portal. And the mirror's `GET /deals` and
+    `GET /utm` are tokenless BY DESIGN: turning either into a token-carrying POST would put
+    a live credential on every report request and collapse the one clean signal the SPA
+    branches on. So the token arrives once, here, and the reports stay tokenless.
+
+    Refusals are all 409 with a machine code, because each names a different thing the SPA
+    should do next rather than an error it should show.
+    """
+    if principal.access == _DENIED_LEVEL:
+        raise PrincipalError(_DENIED_CODE, 403)
+
+    viewer_token = await read_viewer_access_token(request)
+    if viewer_token is None:
+        return JSONResponse({"code": "viewer_token_required"}, status_code=409)
+
+    async with control_txn() as session:
+        portal = (
+            await session.execute(select(Portal).where(Portal.id == principal.portal_id))
+        ).scalar_one_or_none()
+    if portal is None or portal.status != "active":
+        raise PrincipalError("portal_inactive", 401)
+    if portal.crm_opt_out_at is not None:
+        return JSONResponse({"code": "crm_analytics_off"}, status_code=409)
+
+    # An administrator needs no census, and a granted viewer already has an answer that
+    # replaces one. Both are told the same thing: read `/me` again, nothing to do here.
+    if principal.is_admin or principal.access == _ADMIN_LEVEL:
+        return JSONResponse({"code": crm_repo.MIRROR_UNAVAILABLE}, status_code=409)
+    existing = await crm_repo.viewer_access(principal)
+    if existing.grant is not None:
+        return JSONResponse({"code": crm_repo.MIRROR_UNAVAILABLE}, status_code=409)
+
+    if not settings.crm_scope_enabled or portal.crm_mode != _MIRROR_MODE:
+        return JSONResponse({"code": crm_repo.MIRROR_UNAVAILABLE}, status_code=409)
+
+    scope = await crm_scope_service.run_census(
+        portal.id,
+        principal.user_id,
+        access_token=viewer_token,
+        client_endpoint=portal.client_endpoint,
+    )
+    # The census stores whatever it measured; what the SPA is told is whether that answer
+    # can serve a report, which is the same question `load_scope` answers on the next read.
+    usable = await crm_scope_service.load_scope(portal.id, principal.user_id)
+    return JSONResponse(
+        {
+            "read": "mirror" if usable is not None else "live",
+            "scope": crm_scope_service.as_json(usable),
+            "truncated": scope.truncated,
         }
     )

@@ -189,6 +189,22 @@ class Settings(BaseSettings):
     #: late. Six sweep intervals: one slow visit is routine, half an hour is not.
     crm_stale_after_sec: int = Field(default=1800, ge=300)
 
+    # ---- Per-viewer CRM scope, the census (0005) ----
+    #: Off until a portal has been watched with it on. With it off, a viewer without a grant
+    #: keeps the live read, which is exactly today's behaviour.
+    crm_scope_enabled: bool = False
+    #: How long one viewer's census stands before it is taken again. Short, because it is a
+    #: cached answer to "what may this person see?" and that answer can change in Bitrix24
+    #: without anything telling us.
+    crm_scope_ttl_sec: int = Field(default=900, ge=120)
+    #: Cells asked about per entity. Measured on a real portal: 29 deal cells and 18 lead
+    #: assignees, so 60 leaves room without letting one portal's grid become a REST storm.
+    #: A grid past the cap keeps its most recently touched cells and records `truncated`.
+    crm_scope_max_cells: int = Field(default=60, ge=1, le=200)
+    #: Census commands in one batch. 25, not the protocol's 50: Bitrix24 caps a single
+    #: request at 60 s and this is the same ceiling the live reports use.
+    crm_scope_commands_per_batch: int = Field(default=25, ge=1, le=50)
+
     # ---- Modes ----
     recording_mode: Literal["off", "proxy"] = "off"
     # §5.9 keeps the Celery swap open; an unknown backend name is a startup error,

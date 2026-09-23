@@ -66,6 +66,7 @@ import { DateRange, MultiSelect, SegmentedControl, type SelectOption } from '@/c
 import { ApiError, apiFetch, deniedBodyKey, useMe } from '@/lib/api';
 import { fitWindow } from '@/lib/bx24';
 import { viewerAccessToken } from '@/lib/calls';
+import { useCrmCensus } from '@/lib/crmScope';
 import { withExtension } from '@/lib/format';
 import {
   DIMENSIONS,
@@ -118,6 +119,7 @@ export default function UtmPage() {
   const crmOff = me.data?.crm?.analytics_enabled === false;
   // §4.14: the server decides which path this viewer takes; the page only follows it.
   const mirror = me.data?.crm?.read === 'mirror';
+  const census = useCrmCensus(me);
 
   useEffect(() => {
     if (!me.data || filters || crmOff) {
@@ -147,7 +149,7 @@ export default function UtmPage() {
     };
   }, [crmOff, me.data]);
 
-  const report = useUtm(filters, employees, mirror);
+  const report = useUtm(census.running ? null : filters, employees, mirror);
   const data = report.data;
 
   // The portal's report path changed under an open page: `/me` is read again once, exactly as
@@ -244,7 +246,13 @@ export default function UtmPage() {
             ]}
           />
         }
-        banner={<span>{t('app.utm.scopeNote')}</span>}
+        banner={
+          <span>
+            {mirror && me.data.access !== 'all'
+              ? t('app.utm.scopeGranted')
+              : t('app.utm.scopeNote')}
+          </span>
+        }
       >
         {filters ? (
           <div className="flex flex-col gap-3">
@@ -279,7 +287,9 @@ export default function UtmPage() {
                   />
                 </div>
               ) : null}
-              {me.data.access === 'all' ? (
+              {/* Shown to anyone who can see somebody else's records: every administrator,
+                  and anyone an administrator granted a scope to. */}
+              {me.data.access === 'all' || mirror ? (
                 <div className="min-w-0 flex-1 basis-[220px] sm:max-w-[320px]">
                   <MultiSelect
                     label={t('app.hours.employees')}

@@ -191,7 +191,16 @@ async def test_me_tells_every_viewer_and_only_undismissed_administrators_see_the
     employee = (
         await client.get(ME_PATH, headers=_headers(portal, user_id=EMPLOYEE, is_admin=False))
     ).json()["crm"]
-    assert employee == {"analytics_enabled": True, "mode": "sync", "read": "live", "notice_visible": False}
+    # `scope_needed` is False here for three independent reasons, and any one of them is
+    # enough: CRM_SCOPE_ENABLED ships off, the portal is on `sync` rather than `mirror`, and
+    # a census only ever applies to an `own` viewer with nothing widening them yet.
+    assert employee == {
+        "analytics_enabled": True,
+        "mode": "sync",
+        "read": "live",
+        "notice_visible": False,
+        "scope_needed": False,
+    }
 
     for _ in range(2):
         dismissed = await client.post(DISMISS_PATH, headers=_headers(portal))

@@ -1476,6 +1476,7 @@ async def load_utm_report_mirror(
     portal: Portal,
     filters: CallFilters,
     dimensions: Sequence[str],
+    access: crm_repo.ViewerAccess | None = None,
 ) -> dict[str, Any]:
     """`GET /api/v1/utm`: the same report, from Postgres (§4.14).
 
@@ -1483,7 +1484,7 @@ async def load_utm_report_mirror(
     available when the lead lanes read them, and a portal that refuses leads degrades to
     deals-only exactly as `_capability` degrades it.
     """
-    scope = crm_repo.crm_scope(principal)
+    scope = crm_repo.crm_scope(principal, access)
     gate = crm_repo.report_gate()
     try:
         await asyncio.wait_for(gate.acquire(), _ADMIT_WAIT_S)

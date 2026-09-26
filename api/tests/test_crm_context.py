@@ -561,3 +561,59 @@ async def test_the_resolved_activity_ids_never_exceed_the_cap(portal: SeededPort
     )
     assert loaded is not None
     assert len(loaded.activity_ids) == len(ctx.activity_ids)
+
+
+# --- 5. calls made while the client was still a lead -----------------------------------
+#
+# A call made to a lead keeps `CRM_ENTITY_TYPE = LEAD` in `voximplant.statistic.get` forever.
+# Converting the lead re-binds the call ACTIVITY to the deal and the contact, but the owner
+# stays the lead and `crm.activity.list` filters on the owner, so neither the activity clause
+# nor the contact key reaches that call. On the first Simple-CRM portal that was 1 037 calls
+# missing from 639 deal tabs. A deal's own source lead therefore has to be one of its keys
+# (a contact or company gets its leads from the mirror, see `test_calls_api.py`).
+
+LEAD_ID: Final[int] = 44
+OTHER_LEAD_ID: Final[int] = 45
+
+
+def deal_batch(deal_row: dict[str, Any]) -> BatchResult:
+    """`batch_for` a deal tab, with this `crm.deal.get` answer."""
+    commands = tab_context_commands("DEAL", DEAL_ID)
+    base = batch_for(commands)
+    results = [
+        CommandResult(key=key, result=deal_row, error=None, time=None)
+        if method.strip().lower() == "crm.deal.get"
+        else answered
+        for (key, method, _params), answered in zip(commands, base.commands, strict=True)
+    ]
+    return BatchResult(commands=tuple(results), time=None)
+
+
+async def test_a_deal_tab_also_matches_the_calls_of_the_lead_it_came_from(
+    portal: SeededPortal,
+) -> None:
+    """`LEAD_ID` from the `crm.deal.get` answer the tab already has - no extra request."""
+    ctx = await resolve_crm_context(
+        deal_batch({**DEAL_ROW, "LEAD_ID": str(LEAD_ID)}), entity_type="DEAL", entity_id=DEAL_ID
+    )
+    assert ctx is not None
+    assert ("LEAD", LEAD_ID) in keys_of(ctx)
+
+    await insert_call(portal.portal_id, 901, crm_entity_type="LEAD", crm_entity_id=LEAD_ID)
+    await insert_call(portal.portal_id, 902, crm_entity_type="LEAD", crm_entity_id=OTHER_LEAD_ID)
+    assert await matched_bx_ids(portal.portal_id, ctx) == {901}
+
+
+async def test_a_deal_that_never_had_a_lead_adds_no_lead_key(portal: SeededPortal) -> None:
+    ctx = await resolve_crm_context(
+        deal_batch({**DEAL_ROW, "LEAD_ID": None}), entity_type="DEAL", entity_id=DEAL_ID
+    )
+    assert ctx is not None
+    assert not any(kind == "LEAD" for kind, _ in keys_of(ctx))
+
+
+@pytest.mark.parametrize("entity_type", ["DEAL", "LEAD", "CONTACT", "COMPANY"])
+def test_the_tab_batch_reads_no_rights_dependent_lead_list(entity_type: str) -> None:
+    """A list read on the opener's token would make the SHARED context row depend on who
+    opened the card; the tab's leads come from `crm.deal.get` or the mirror instead."""
+    assert not any(method == "crm.lead.list" for _, method, _ in tab_context_commands(entity_type, 7))

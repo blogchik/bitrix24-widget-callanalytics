@@ -116,6 +116,8 @@ class CrmBitrix(FilteringBitrix):
         #: S-A.10: `>=updatedTime: v` selects from `v - filter_shift`, as a portal whose token
         #: user sits that far east of the server does.
         self.filter_shift = timedelta(0)
+        #: `crm.settings.mode.get`: 1 Classic, 2 Simple (no leads).
+        self.crm_mode = 1
 
     def _dispatch(self, method: str, params: dict[str, str]) -> Any:
         if method == "crm.item.list":
@@ -127,6 +129,8 @@ class CrmBitrix(FilteringBitrix):
             return {"categories": _CATEGORIES}
         if method == "crm.status.list":
             return _STATUSES.get(params.get("filter[ENTITY_ID]", ""), [])
+        if method == "crm.settings.mode.get":
+            return self.crm_mode
         return super()._dispatch(method, params)
 
     def _items(self, params: dict[str, str]) -> Any:
@@ -473,3 +477,142 @@ async def test_an_uninstall_forgets_the_lanes(crm_portal: tuple[SeededPortal, Cr
         assert await mark_uninstalled(session, seeded.portal_id)
 
     assert await _lanes(seeded.portal_id) == {}
+
+
+async def _stored_crm_mode(portal_id: int) -> Any:
+    async with control_txn() as session:
+        return (
+            await session.execute(
+                text("SELECT capabilities -> 'crm_bitrix_mode' FROM portals WHERE id = :pid"),
+                {"pid": portal_id},
+            )
+        ).scalar_one()
+
+
+async def test_the_portals_crm_mode_is_stored_and_followed_when_it_switches(
+    crm_portal: tuple[SeededPortal, CrmBitrix],
+) -> None:
+    """The dictionary lane reads `crm.settings.mode.get` and the reports read it back.
+
+    Portals switch between Classic and Simple CRM - the first Simple portal did, twice in one
+    month - so a value read once at install would label it wrongly for weeks.
+    """
+    seeded, fake = crm_portal
+    fake.crm_mode = 2
+    await _drive(seeded.portal_id, visits=1)
+    assert await _stored_crm_mode(seeded.portal_id) == 2
+
+    fake.crm_mode = 1
+    async with control_txn() as session:
+        await session.execute(
+            text(
+                "UPDATE crm_lanes SET due_at = now() - interval '1 minute' "
+                "WHERE portal_id = :pid AND lane = 'dict'"
+            ),
+            {"pid": seeded.portal_id},
+        )
+    await _drive(seeded.portal_id, visits=1)
+    assert await _stored_crm_mode(seeded.portal_id) == 1
+
+
+async def _make_dict_lane(portal_id: int, *, due_in: timedelta) -> None:
+    async with control_txn() as session:
+        await session.execute(
+            text("UPDATE crm_lanes SET due_at = now() + :due WHERE portal_id = :pid AND lane = 'dict'"),
+            {"pid": portal_id, "due": due_in},
+        )
+
+
+async def test_a_failed_mode_read_never_replaces_a_known_mode(
+    crm_portal: tuple[SeededPortal, CrmBitrix],
+) -> None:
+    """One flaky `crm.settings.mode.get` must not flip a Simple portal to Classic for an hour."""
+    seeded, fake = crm_portal
+    fake.crm_mode = 2
+    await _drive(seeded.portal_id, visits=1)
+    assert await _stored_crm_mode(seeded.portal_id) == 2
+
+    fake.crm_mode = Answer(error="ACCESS_DENIED")  # type: ignore[assignment]
+    await _make_dict_lane(seeded.portal_id, due_in=timedelta(minutes=-1))
+    await _drive(seeded.portal_id, visits=1)
+    assert await _stored_crm_mode(seeded.portal_id) == 2
+
+
+async def test_a_missing_mode_is_read_before_the_dictionary_is_due(
+    crm_portal: tuple[SeededPortal, CrmBitrix],
+) -> None:
+    """After a deploy, or a credential re-store on an old build, the reports must not wait an
+    hour for the next dictionary pass to learn the portal runs Simple CRM."""
+    seeded, fake = crm_portal
+    fake.crm_mode = 2
+    await _drive(seeded.portal_id, visits=1)
+    async with control_txn() as session:
+        await session.execute(
+            text("UPDATE portals SET capabilities = capabilities - 'crm_bitrix_mode' WHERE id = :pid"),
+            {"pid": seeded.portal_id},
+        )
+    await _make_dict_lane(seeded.portal_id, due_in=timedelta(hours=1))
+
+    await _drive(seeded.portal_id, visits=1)
+    assert await _stored_crm_mode(seeded.portal_id) == 2
+
+
+async def test_the_capability_key_is_spelled_the_same_where_it_is_kept() -> None:
+    from app.services import portals
+    from app.sync import crm_dict
+
+    assert portals._CRM_MODE_CAPABILITY == crm_dict.CRM_MODE_CAPABILITY
+
+
+async def test_a_credential_re_store_keeps_the_portals_crm_mode(
+    crm_portal: tuple[SeededPortal, CrmBitrix],
+) -> None:
+    """Install, update and self-heal rebuild `capabilities` from scratch; the worker-owned
+    mode must survive that, or a Simple portal reads as Classic until the next pass."""
+    from app.bitrix.identity import Identity
+    from app.bitrix.oauth import TokenResponse
+    from app.services.portals import store_portal_credential
+    from tests.fixtures.bitrix import CLIENT_ENDPOINT, DOMAIN
+
+    seeded, fake = crm_portal
+    fake.crm_mode = 2
+    await _drive(seeded.portal_id, visits=1)
+    assert await _stored_crm_mode(seeded.portal_id) == 2
+
+    async with control_txn() as session:
+        await store_portal_credential(
+            session,
+            member_id=seeded.member_id,
+            tokens=TokenResponse(
+                access_token="new-access",
+                refresh_token="new-refresh",
+                expires_in=3600,
+                expires=None,
+                client_endpoint=CLIENT_ENDPOINT,
+                server_endpoint=None,
+                member_id=seeded.member_id,
+                user_id=1,
+                status="L",
+                scope="crm,telephony,placement,user_brief",
+                domain=DOMAIN,
+            ),
+            admin=Identity(
+                user_id=1, is_admin=True, timezone=None, name=None, last_name=None,
+                second_name=None, work_position=None, photo_url=None,
+            ),
+            application_token=None,
+            domain=DOMAIN,
+            protocol_https=True,
+            lang=None,
+            app_status="L",
+            capabilities={"statistic_get": True},
+        )
+
+    assert await _stored_crm_mode(seeded.portal_id) == 2
+    async with control_txn() as session:
+        caps = (
+            await session.execute(
+                text("SELECT capabilities FROM portals WHERE id = :pid"), {"pid": seeded.portal_id}
+            )
+        ).scalar_one()
+    assert caps["statistic_get"] is True, "the caller's own keys are still written"

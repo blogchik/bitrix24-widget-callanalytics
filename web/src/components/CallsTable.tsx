@@ -68,7 +68,9 @@ import {
   describeDirection,
   describeEmployee,
   describeResult,
+  crmTarget,
   lineLabel,
+  portalNumberOf,
   recordingFallbackPath,
   resultGroupOf,
   useCalls,
@@ -510,7 +512,7 @@ export function CallsTable({
     [query, applied],
   );
 
-  const { items, error, loading, loadingMore, hasMore, recordingMode, loadMore, reload } =
+  const { items, error, loading, loadingMore, hasMore, total, recordingMode, loadMore, reload } =
     useCalls(effectiveQuery, enabled);
 
   const toggleRow = useCallback((id: number) => {
@@ -560,7 +562,14 @@ export function CallsTable({
         <div className="ca-calls-headline">
           <h2 className="ca-calls-title">{title ?? c('app.calls.table.title')}</h2>
           <span className="ca-calls-count">
-            {c('app.calls.table.shown', { shown: formatCount(items.length, locale) })}
+            {/* "N of M" only while more can be loaded: once the list is complete, the rows are
+                the answer, even if calls arrived after the first page counted the total. */}
+            {hasMore && total !== null && total > items.length
+              ? c('app.calls.table.shownOf', {
+                  shown: formatCount(items.length, locale),
+                  total: formatCount(total, locale),
+                })
+              : c('app.calls.table.shown', { count: items.length })}
           </span>
         </div>
         {showSearch ? (
@@ -708,8 +717,7 @@ export function CallsTable({
 
 /** Everything both layouts need to say about one call, worked out once. */
 function callFacts(call: CallRow, copy: Copy) {
-  const crmType = call.crm?.type ?? null;
-  const crmId = call.crm?.id ?? null;
+  const { type: crmType, id: crmId } = crmTarget(call);
   return {
     employee: describeEmployee(call, copy),
     direction: describeDirection(call, copy),
@@ -781,9 +789,9 @@ function CallRowView({
 
       <td>
         <span className="ca-viz-num ca-nowrap">{formatPhone(call.phone_number)}</span>
-        {call.portal_number ? (
+        {portalNumberOf(call) ? (
           <span className="ca-sub ca-viz-num" title={line ?? undefined}>
-            {formatPhone(call.portal_number)}
+            {formatPhone(portalNumberOf(call))}
           </span>
         ) : line ? (
           <span className="ca-sub">{line}</span>
@@ -913,9 +921,9 @@ function CallCardView({
             />
             {result.label}
           </span>
-          {call.portal_number ? (
+          {portalNumberOf(call) ? (
             <span className="ca-cc-dur" title={line ?? undefined}>
-              {formatPhone(call.portal_number)}
+              {formatPhone(portalNumberOf(call))}
             </span>
           ) : line ? (
             <span>{line}</span>

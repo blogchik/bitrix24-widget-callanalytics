@@ -34,6 +34,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections import deque
+from dataclasses import replace
 from typing import Any, Final
 
 from fastapi import APIRouter, Depends, Request
@@ -47,7 +48,7 @@ from app.api.viewer_token import read_viewer_access_token
 from app.bitrix.errors import BitrixError
 from app.bitrix.identity import resolve_identity
 from app.config import settings
-from app.db.models import Call, Employee, Portal
+from app.db.models import Call, CrmItem, Employee, Portal
 from app.db.session import control_txn, tenant_txn
 from app.logging import get_logger, get_request_id
 from app.security.principal import (
@@ -58,6 +59,7 @@ from app.security.principal import (
     require_data_access,
 )
 from app.security.session_token import issue_play_token
+from app.services import crm_repo
 from app.services.calls_repo import base_select, crm_match_clause, scope_filter
 from app.services.crm_context import load_crm_context
 from app.services.stats import CallFilters, FilterError, parse_filters
@@ -225,7 +227,9 @@ def _table_facets(params: QueryParams) -> tuple[list[ColumnElement[bool]], dict[
     return terms, echo
 
 
-async def crm_clause_for(principal: Principal) -> ColumnElement[bool] | None:
+async def crm_clause_for(
+    principal: Principal, *, mirror_leads: bool = False
+) -> ColumnElement[bool] | None:
     """§4.8's entity predicate for a CRM tab, or None for the dashboard.
 
     The JWT's `ent` claim decides which entity; the cached `crm_contexts` row supplies
@@ -241,8 +245,10 @@ async def crm_clause_for(principal: Principal) -> ColumnElement[bool] | None:
     the current user's own Bitrix24 token. A user who genuinely may not read the card then
     gets `crm_no_access` decided by Bitrix24 rather than by our cache.
 
-    Exported for the dashboard router: a CRM tab that aggregated over a different match
-    set than its own table would be a discrepancy nobody could explain.
+    `mirror_leads` adds the leads the CRM mirror links to a contact or company tab (see
+    below); the caller passes it only when the mirror holds live data (`mirror_readable`).
+    Any future CRM-tab aggregate must use this same function: a tab that summed over a
+    different match set than its own table would be a discrepancy nobody could explain.
     """
     entity = principal.entity
     if entity is None:
@@ -264,6 +270,15 @@ async def crm_clause_for(principal: Principal) -> ColumnElement[bool] | None:
         raise PrincipalError("invalid_session", 401) from None
     if context is None:
         raise PrincipalError("context_missing", 409)
+    leads = (
+        await crm_repo.linked_lead_ids(principal.portal_id, entity_type, entity_id)
+        if mirror_leads
+        else []
+    )
+    if leads:
+        # The calls this client got while still a lead (`crm_repo.linked_lead_ids`). A deal's
+        # own source lead is already a key: `crm.deal.get` reports it to every opener alike.
+        context = replace(context, entity_keys=[*context.entity_keys, *(["LEAD", lead] for lead in leads)])
     return crm_match_clause(context, entity_type=entity_type, entity_id=entity_id)
 
 
@@ -412,7 +427,10 @@ async def list_calls(
         )
         return exc.as_response()
 
-    crm = await crm_clause_for(principal)
+    portal = await _portal_row(principal.portal_id)
+    mirror = portal is not None and crm_repo.mirror_readable(portal)
+    simple = mirror and portal is not None and crm_repo.simple_crm(portal)
+    crm = await crm_clause_for(principal, mirror_leads=mirror)
     filtered = _filtered(principal, filters, crm, facets)
 
     async with tenant_txn(principal.portal_id) as session:
@@ -424,6 +442,19 @@ async def list_calls(
             session,
             principal.portal_id,
             {int(row.portal_user_id) for row in page_rows if row.portal_user_id is not None},
+        )
+        converted = (
+            await _converted_deals(
+                session,
+                principal.portal_id,
+                {
+                    int(row.crm_entity_id)
+                    for row in page_rows
+                    if (row.crm_entity_type or "").upper() == "LEAD" and row.crm_entity_id
+                },
+            )
+            if simple
+            else {}
         )
 
     rows: list[dict[str, Any]] = []
@@ -448,6 +479,11 @@ async def list_calls(
                     "type": row.crm_entity_type,
                     "id": row.crm_entity_id,
                     "activity_id": row.crm_activity_id,
+                    # Simple CRM only: the deal this call's lead became. Lead cards are hidden
+                    # there, so the SPA opens the deal; the binding above stays as recorded.
+                    "deal_id": converted.get(int(row.crm_entity_id))
+                    if (row.crm_entity_type or "").upper() == "LEAD" and row.crm_entity_id
+                    else None,
                 },
                 "duration": int(row.call_duration),
                 # Generated server-side (§3) so the table, the summary tiles and the
@@ -493,6 +529,36 @@ def _correlation_id() -> uuid.UUID:
         except ValueError:
             pass
     return uuid.uuid4()
+
+
+async def _portal_row(portal_id: int) -> Portal | None:
+    """The tenant row, for its CRM mode and mirror state (`crm_repo.mirror_readable`)."""
+    async with control_txn() as session:
+        return (
+            await session.execute(select(Portal).where(Portal.id == portal_id))
+        ).scalar_one_or_none()
+
+
+async def _converted_deals(session: Any, portal_id: int, lead_ids: set[int]) -> dict[int, int]:
+    """`lead id -> deal id` for leads the CRM mirror knows were converted, newest deal first.
+
+    Called only while the mirror holds live data; otherwise a call keeps its lead link.
+    """
+    if not lead_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(CrmItem.lead_id, func.max(CrmItem.id))
+            .where(
+                CrmItem.portal_id == portal_id,
+                CrmItem.entity_type_id == crm_repo.DEAL,
+                CrmItem.deleted_at.is_(None),
+                CrmItem.lead_id.in_(sorted(lead_ids)),
+            )
+            .group_by(CrmItem.lead_id)
+        )
+    ).all()
+    return {int(lead_id): int(deal_id) for lead_id, deal_id in rows if lead_id is not None}
 
 
 async def _call_in_scope(principal: Principal, call_id: int) -> Any | None:

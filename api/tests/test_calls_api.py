@@ -46,7 +46,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.config import settings
-from app.db.session import tenant_txn
+from app.db.session import control_txn, tenant_txn
 from app.main import create_app
 from app.security.session_token import issue_session
 from tests.fixtures.bitrix import SeededPortal, delete_portal, seed_portal
@@ -1199,3 +1199,150 @@ async def test_no_response_carries_the_recording_url_at_any_depth(
             "with playback off the SPA must be able to tell 'we cannot play this here' from "
             "'there is nothing to play' (§9); a 404 would hide a recording that exists."
         )
+
+
+# --- Bitrix24 Simple CRM: a call made to a lead opens the deal it became ---------------------
+
+
+async def set_crm_mode(portal_id: int, mode: int, *, mirror: str = "mirror") -> None:
+    """The portal's CRM mode as the dictionary lane stores it, and whether the mirror is live."""
+    async with control_txn() as session:
+        await session.execute(
+            text(
+                "UPDATE portals SET crm_mode = :mirror, capabilities = capabilities || "
+                "jsonb_build_object('crm_bitrix_mode', CAST(:mode AS int)) WHERE id = :pid"
+            ),
+            {"pid": portal_id, "mode": mode, "mirror": mirror},
+        )
+
+
+async def mirror_deal(portal_id: int, deal_id: int, lead_id: int) -> None:
+    async with tenant_txn(portal_id) as session:
+        await session.execute(
+            text(
+                "INSERT INTO crm_items (portal_id, entity_type_id, id, lead_id, read_at) "
+                "VALUES (:pid, 2, :id, :lead, now())"
+            ),
+            {"pid": portal_id, "id": deal_id, "lead": lead_id},
+        )
+
+
+async def test_a_lead_bound_call_links_to_the_deal_it_became_on_a_simple_crm_portal(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """Simple CRM hides lead cards; the lead was converted, so the deal is the record to open.
+
+    The binding itself is sent unchanged - it is what Bitrix24 recorded on the call.
+    """
+    start = datetime(BASE_DAY.year, BASE_DAY.month, BASE_DAY.day, 9, 0, tzinfo=UTC)
+    ids = await seed_calls(
+        portal.portal_id,
+        [
+            {"bx_id": 7001, "started": start, "crm_type": "LEAD", "crm_id": 44},
+            {"bx_id": 7002, "started": start + timedelta(minutes=1), "crm_type": "LEAD", "crm_id": 45},
+            {"bx_id": 7003, "started": start + timedelta(minutes=2), "crm_type": "CONTACT", "crm_id": 44},
+        ],
+    )
+    try:
+        await mirror_deal(portal.portal_id, 9000, 44)
+        await mirror_deal(portal.portal_id, 9001, 44)
+        await set_crm_mode(portal.portal_id, 2)
+
+        response = await get_calls(client, session_for(portal), **AROUND_BASE_DAY)
+        assert response.status_code == 200, response.text
+        crm = {row["id"]: row["crm"] for row in rows_of(response.json())}
+        assert crm[ids[7001]] == {"type": "LEAD", "id": 44, "activity_id": None, "deal_id": 9001}
+        assert crm[ids[7002]]["deal_id"] is None, "a lead that never became a deal keeps its link"
+        assert crm[ids[7003]]["deal_id"] is None, "only a LEAD binding is resolved"
+
+        # Classic CRM keeps lead cards, so the lead link stays.
+        await set_crm_mode(portal.portal_id, 1)
+        classic = await get_calls(client, session_for(portal), **AROUND_BASE_DAY)
+        assert all(row["crm"]["deal_id"] is None for row in rows_of(classic.json()))
+
+        # A mirror that is switched off holds data nobody refreshes: it is not read at all.
+        await set_crm_mode(portal.portal_id, 2, mirror="off")
+        stale = await get_calls(client, session_for(portal), **AROUND_BASE_DAY)
+        assert all(row["crm"]["deal_id"] is None for row in rows_of(stale.json()))
+    finally:
+        async with tenant_txn(portal.portal_id) as session:
+            await session.execute(
+                text("DELETE FROM crm_items WHERE portal_id = :pid"), {"pid": portal.portal_id}
+            )
+
+
+async def mirror_lead(
+    portal_id: int, lead_id: int, *, contact_ids: Sequence[int] = (), company_id: int | None = None
+) -> None:
+    async with tenant_txn(portal_id) as session:
+        await session.execute(
+            text(
+                "INSERT INTO crm_items (portal_id, entity_type_id, id, contact_ids, company_id, read_at) "
+                "VALUES (:pid, 1, :id, CAST(:contacts AS bigint[]), :company, now())"
+            ),
+            {"pid": portal_id, "id": lead_id, "contacts": list(contact_ids), "company": company_id},
+        )
+
+
+@pytest.mark.parametrize("entity_type", ["CONTACT", "COMPANY"])
+async def test_a_contact_or_company_tab_shows_the_calls_its_client_got_as_a_lead(
+    client: httpx.AsyncClient, portal: SeededPortal, entity_type: str
+) -> None:
+    """The lead keys come from the mirror, never from a list read on the opener's token.
+
+    The context row is shared between viewers; keys that depended on the opener's lead
+    rights would make the tab's numbers depend on who opened the card last.
+    """
+    entity_id = 3100
+    start = datetime(BASE_DAY.year, BASE_DAY.month, BASE_DAY.day, 11, 0, tzinfo=UTC)
+    ids = await seed_calls(
+        portal.portal_id,
+        [
+            {"bx_id": 8001, "started": start, "crm_type": "LEAD", "crm_id": 61},
+            {"bx_id": 8002, "started": start + timedelta(minutes=1), "crm_type": "LEAD", "crm_id": 62},
+            {
+                "bx_id": 8003,
+                "started": start + timedelta(minutes=2),
+                "crm_type": entity_type,
+                "crm_id": entity_id,
+            },
+        ],
+    )
+    link = {"contact_ids": (entity_id,)} if entity_type == "CONTACT" else {"company_id": entity_id}
+    await set_crm_mode(portal.portal_id, 1)  # a live mirror, on a Classic portal too
+    try:
+        await mirror_lead(portal.portal_id, 61, **link)  # type: ignore[arg-type]
+        await mirror_lead(portal.portal_id, 62)
+        async with tenant_txn(portal.portal_id) as session:
+            await session.execute(
+                text(
+                    "INSERT INTO crm_contexts (portal_id, entity_type, entity_id, entity_keys, "
+                    "activity_ids, resolved_by_user_id, resolved_at) VALUES (:pid, :type, :eid, "
+                    "CAST(:keys AS jsonb), '{}', :uid, now())"
+                ),
+                {
+                    "pid": portal.portal_id,
+                    "type": entity_type,
+                    "eid": entity_id,
+                    "keys": json.dumps([[entity_type, entity_id]]),
+                    "uid": USER_A,
+                },
+            )
+        token = session_for(
+            portal,
+            user_id=USER_A,
+            entity={"t": entity_type, "id": entity_id},
+            placement=f"CRM_{entity_type}_DETAIL_TAB",
+        )
+
+        response = await get_calls(client, token, **AROUND_BASE_DAY)
+        assert response.status_code == 200, response.text
+        got = set(ids_of(response.json()))
+        assert ids[8001] in got, "the call the client got while still a lead is missing"
+        assert ids[8003] in got
+        assert ids[8002] not in got, "a lead of somebody else reached this tab"
+    finally:
+        async with tenant_txn(portal.portal_id) as session:
+            await session.execute(
+                text("DELETE FROM crm_items WHERE portal_id = :pid"), {"pid": portal.portal_id}
+            )

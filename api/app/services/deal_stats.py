@@ -556,6 +556,7 @@ async def _employee_labels(portal_id: int, user_ids: set[int]) -> dict[int, dict
                     Employee.second_name,
                     Employee.phone_inner,
                     Employee.active,
+                    Employee.found,
                 ).where(Employee.portal_id == portal_id, Employee.bx_user_id.in_(capped))
             )
         ).all()
@@ -566,7 +567,9 @@ async def _employee_labels(portal_id: int, user_ids: set[int]) -> dict[int, dict
         labels[int(row.bx_user_id)] = {
             "name": joined or None,
             "phone_inner": row.phone_inner,
-            "active": bool(row.active),
+            # A user `user.get` no longer returns (deleted, or an import's placeholder) is
+            # not a current employee either, and must not read like one on the page.
+            "active": bool(row.active) and row.found is not False,
         }
     return labels
 
@@ -1252,7 +1255,8 @@ async def load_deal_report_mirror(
     except TimeoutError:
         raise DealReportError("retry", 503, retry_after=5) from None
     try:
-        coverage = await crm_repo.coverage(portal.id)
+        # Deals only: the lead lanes say nothing about this report (`crm_repo.coverage`).
+        coverage = await crm_repo.coverage(portal.id, leads=False)
         if not coverage.deals_available:
             raise DealReportError(crm_repo.MIRROR_UNAVAILABLE, 409, reason=coverage.deal_reason)
         funnels, stages = await crm_repo.deal_dictionary(portal.id)

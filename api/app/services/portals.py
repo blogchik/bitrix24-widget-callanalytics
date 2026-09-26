@@ -73,6 +73,10 @@ log = get_logger(__name__)
 #: the ciphertext was already computed.
 _MEMBER_ID_RE: Final = re.compile(r"^[0-9a-f]{32}$")
 
+#: `app.sync.crm_dict.CRM_MODE_CAPABILITY`, spelled here because the worker package imports this
+#: module; `tests/test_crm_sync_e2e.py` asserts the two agree.
+_CRM_MODE_CAPABILITY: Final[str] = "crm_bitrix_mode"
+
 #: `portals_token_status_chk` (§3). Validated in Python so a bad value fails before the
 #: statement runs, instead of aborting the whole install transaction on a constraint.
 _TOKEN_STATUSES: Final[frozenset[str]] = frozenset(
@@ -288,6 +292,18 @@ async def store_portal_credential(
     # Never update the conflict key; `token_version` counts writes of the credential.
     update_values = {k: v for k, v in values.items() if k != "member_id"}
     update_values["token_version"] = Portal.token_version + 1
+    if not reinstalled:
+        # The worker owns `capabilities.crm_bitrix_mode` (`crm_dict.CRM_MODE_CAPABILITY`, the
+        # portal's own CRM mode, re-read every dictionary pass). A credential re-store must not
+        # erase it, or a Simple-CRM portal reads as Classic until the next pass. A reinstall
+        # starts clean. The existing row's value wins over the caller's, which never sets it.
+        fresh = bindparam("fresh_capabilities", value=capabilities, type_=postgresql.JSONB)
+        kept = func.jsonb_strip_nulls(
+            func.jsonb_build_object(
+                _CRM_MODE_CAPABILITY, Portal.capabilities.op("->")(_CRM_MODE_CAPABILITY)
+            )
+        )
+        update_values["capabilities"] = fresh.op("||")(kept)
 
     portal_id = int(
         (

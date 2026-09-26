@@ -382,7 +382,16 @@ def parse_activity_ids(batch: BatchResult, *, cap: int | None = None) -> list[in
 def parse_deal_entity_keys(
     deal: Any, contacts: Any, *, cap: int | None = None
 ) -> list[list[Any]]:
-    """A deal's contacts and company as `[["CONTACT", 12], ["COMPANY", 3]]` (§3, §4.8).
+    """A deal's contacts, company and source lead as `[type, id]` pairs (§3, §4.8).
+
+    For example `[["CONTACT", 12], ["COMPANY", 3], ["LEAD", 7]]`.
+
+    The source lead (`LEAD_ID`) is there because a call made before the conversion keeps
+    `CRM_ENTITY_TYPE = LEAD`, and matching on the deal's activities cannot see it: Bitrix24
+    re-binds the activity to the deal but leaves the lead as its owner, and
+    `crm.activity.list` filters on the owner. A contact or company tab gets its leads from
+    the CRM mirror instead (`crm_repo.linked_lead_ids`), because a list read on the opener's
+    token would make the shared context row depend on who opened the card.
 
     The deal itself is deliberately NOT in the list. `CRM_ENTITY_TYPE` has no `DEAL` value,
     so a `["DEAL", id]` key could never match a cached row through this path; §4.8's third
@@ -391,7 +400,7 @@ def parse_deal_entity_keys(
 
     Contacts come from `crm.deal.contact.items.get`, which returns the full N:N set;
     `crm.deal.get`'s own `CONTACT_ID` is folded in as well because older builds keep the
-    primary contact only there. Order is contacts first, then the company, so the jsonb
+    primary contact only there. Order is contacts, the company, then the lead, so the jsonb
     reads the way §3's COMMENT ON writes it.
     """
     limit = _cap(cap)
@@ -417,6 +426,7 @@ def parse_deal_entity_keys(
     if isinstance(deal, Mapping):
         add("CONTACT", _field(deal, "CONTACT_ID", "contact_id"))
         add("COMPANY", _field(deal, "COMPANY_ID", "company_id"))
+        add("LEAD", _field(deal, "LEAD_ID", "lead_id"))
 
     return keys
 

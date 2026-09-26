@@ -588,3 +588,141 @@ async def test_only_an_administrators_report_on_a_shadow_portal_is_compared() ->
     assert crm_shadow.shadows(Portal(crm_mode="shadow", crm_opt_out_at=None), admin)
     assert not crm_shadow.shadows(Portal(crm_mode="shadow", crm_opt_out_at=None), own)
     assert not crm_shadow.shadows(Portal(crm_mode="sync", crm_opt_out_at=None), admin)
+
+
+# --- Bitrix24 Simple CRM ------------------------------------------------------------------------
+
+
+async def set_crm_mode(portal_id: int, mode: int) -> None:
+    """What the dictionary lane stores from `crm.settings.mode.get` (1 Classic, 2 Simple)."""
+    async with control_txn() as session:
+        await session.execute(
+            text(
+                "UPDATE portals SET capabilities = capabilities || "
+                "jsonb_build_object('crm_bitrix_mode', CAST(:mode AS int)) WHERE id = :pid"
+            ),
+            {"pid": portal_id, "mode": mode},
+        )
+
+
+async def test_a_simple_crm_portal_gets_a_deals_only_sources_report(
+    mirrored: tuple[SeededPortal, Fence],
+) -> None:
+    """Every lead there became a deal carrying its tags, so leads beside deals count twice."""
+    portal, fence = mirrored
+    leads, deals, _ = utm_rows()
+    await store(fence, leads, crm_items.LEAD_ITEM)
+    await store(fence, deals, crm_items.DEAL_ITEM)
+    await loaded(portal.portal_id, now=dt.datetime.now(dt.UTC))
+    await set_crm_mode(portal.portal_id, 2)
+    principal = viewer(portal)
+    filters = parse_filters(JUNE, principal)
+
+    mirror = await utm_stats.load_utm_report_mirror(
+        principal, await portal_row(portal.portal_id), filters, DIMENSIONS
+    )
+
+    assert mirror["scan"]["leads"]["available"] is False
+    assert mirror["scan"]["leads"]["reason"] == utm_stats.SIMPLE_CRM_REASON
+    assert mirror["totals"]["leads"]["total"] == 0
+    assert mirror["totals"]["deals"]["total"] == len(deals)
+    live = live_utm_report(leads, deals, filters, with_leads=False)
+    live["scan"]["leads"]["reason"] = utm_stats.SIMPLE_CRM_REASON
+    assert without_source(mirror) == without_source(live)
+
+
+async def test_a_classic_crm_portal_keeps_its_leads(mirrored: tuple[SeededPortal, Fence]) -> None:
+    portal, fence = mirrored
+    leads, deals, _ = utm_rows()
+    await store(fence, leads, crm_items.LEAD_ITEM)
+    await store(fence, deals, crm_items.DEAL_ITEM)
+    await loaded(portal.portal_id, now=dt.datetime.now(dt.UTC))
+    await set_crm_mode(portal.portal_id, 1)
+    principal = viewer(portal)
+
+    mirror = await utm_stats.load_utm_report_mirror(
+        principal, await portal_row(portal.portal_id), parse_filters(JUNE, principal), DIMENSIONS
+    )
+
+    assert mirror["scan"]["leads"]["available"] is True
+    assert mirror["totals"]["leads"]["total"] == len(leads)
+
+
+async def test_an_operator_bitrix24_no_longer_returns_is_not_drawn_as_a_current_employee(
+    mirrored: tuple[SeededPortal, Fence],
+) -> None:
+    """Portal 1 had such a row (an import's placeholder user): full opacity, no name."""
+    portal, fence = mirrored
+    selected, _ = deal_rows()
+    await seed_dictionary(portal.portal_id)
+    await store(fence, selected, crm_items.DEAL_ITEM)
+    await loaded(portal.portal_id, now=dt.datetime.now(dt.UTC))
+    # The upsert already left placeholder rows for every assignee; `user.get` then answered
+    # for VIEWER and not for OTHER.
+    async with tenant_txn(portal.portal_id) as session:
+        await session.execute(
+            text(
+                "UPDATE employees SET active = true, found = (bx_user_id = :viewer) "
+                "WHERE portal_id = :pid AND bx_user_id IN (:other, :viewer)"
+            ),
+            {"pid": portal.portal_id, "other": OTHER, "viewer": VIEWER},
+        )
+    principal = viewer(portal)
+
+    body = await deal_stats.load_deal_report_mirror(
+        principal, await portal_row(portal.portal_id), parse_filters(JUNE, principal)
+    )
+
+    rows = {row["user_id"]: row for group in body["groups"] for row in group["rows"]}
+    assert rows[OTHER]["active"] is False
+    assert rows[VIEWER]["active"] is True
+
+
+async def test_a_simple_crm_sources_report_does_not_wait_for_the_lead_history(
+    mirrored: tuple[SeededPortal, Fence],
+) -> None:
+    """It reads no leads, so an unfinished lead backfill must not say "history is loading"."""
+    portal, fence = mirrored
+    _, deals, _ = utm_rows()
+    await store(fence, deals, crm_items.DEAL_ITEM)
+    now = dt.datetime.now(dt.UTC)
+    await set_lane(
+        portal.portal_id, crm_lanes.DEAL_BACKFILL, status=crm_lanes.DONE, done=9, total=9, clean=now
+    )
+    await set_lane(portal.portal_id, crm_lanes.DEAL_SWEEP, clean=now)
+    await set_lane(portal.portal_id, crm_lanes.LEAD_BACKFILL, done=10, total=1000, clean=now)
+    await set_lane(portal.portal_id, crm_lanes.LEAD_SWEEP)
+    await set_crm_mode(portal.portal_id, 2)
+    principal = viewer(portal)
+
+    body = await utm_stats.load_utm_report_mirror(
+        principal, await portal_row(portal.portal_id), parse_filters(JUNE, principal), DIMENSIONS
+    )
+
+    assert body["coverage"] == {"window_from": None, "history_complete": True, "progress_pct": 100}
+    assert body["stale"] is None
+
+
+async def test_the_deals_report_does_not_wait_for_the_lead_history_either(
+    mirrored: tuple[SeededPortal, Fence],
+) -> None:
+    """The Deals page reads no leads on any portal, Classic included."""
+    portal, fence = mirrored
+    selected, _ = deal_rows()
+    await seed_dictionary(portal.portal_id)
+    await store(fence, selected, crm_items.DEAL_ITEM)
+    now = dt.datetime.now(dt.UTC)
+    await set_lane(
+        portal.portal_id, crm_lanes.DEAL_BACKFILL, status=crm_lanes.DONE, done=9, total=9, clean=now
+    )
+    await set_lane(portal.portal_id, crm_lanes.DEAL_SWEEP, clean=now)
+    await set_lane(portal.portal_id, crm_lanes.LEAD_BACKFILL, done=10, total=1000, clean=now)
+    await set_lane(portal.portal_id, crm_lanes.LEAD_SWEEP)
+    principal = viewer(portal)
+
+    body = await deal_stats.load_deal_report_mirror(
+        principal, await portal_row(portal.portal_id), parse_filters(JUNE, principal)
+    )
+
+    assert body["coverage"] == {"window_from": None, "history_complete": True, "progress_pct": 100}
+    assert body["stale"] is None

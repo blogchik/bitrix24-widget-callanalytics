@@ -48,9 +48,10 @@ export interface UtmTableProps {
   /** The same tag spelled out in full, for the caption and the scroll region's name. */
   dimensionTitle: string;
   /**
-   * False on a portal whose leads Bitrix24 refuses. The four lead columns are then left out
-   * rather than drawn as zeros: "no leads module" and "nobody created a lead" are different
-   * facts, and the wire keeps them apart for exactly that reason.
+   * False when the report carries no leads: a portal whose leads Bitrix24 refuses, or one
+   * running Simple CRM, where every lead becomes a deal at once. The four lead columns are
+   * then left out rather than drawn as zeros - "no leads here" and "nobody created a lead"
+   * are different facts - and the deals' own win rate takes their place.
    */
   leadsAvailable: boolean;
   locale: string;
@@ -65,11 +66,12 @@ const MAX_ROWS = 40;
 /** Two decimals, as the owner's spreadsheet prints its rates. */
 const RATE_DIGITS = 2;
 
-/** One numeric column. `lead` marks the four that mean nothing without leads. */
+/** One numeric column: `lead` ones need leads, `dealsOnly` ones replace them. */
 interface Column {
   head: string;
   cell: (bucket: Bucket) => string;
-  lead: boolean;
+  lead?: boolean;
+  dealsOnly?: boolean;
 }
 
 export const UTM_CSS: string = `
@@ -145,8 +147,15 @@ export function UtmTable({
     { head: t('app.utm.won'), cell: (b) => formatCount(b.deals.won, locale), lead: false },
     { head: t('app.utm.inProgress'), cell: (b) => formatCount(b.deals.in_progress, locale), lead: false },
     { head: t('app.utm.lost'), cell: (b) => formatCount(b.deals.lost, locale), lead: false },
+    {
+      head: t('app.utm.winRate'),
+      cell: (b) => percent(conversion(b.deals.won, b.deals.total), locale, RATE_DIGITS),
+      dealsOnly: true,
+    },
   ];
-  const columns = all.filter((column) => leadsAvailable || !column.lead);
+  const columns = all.filter((column) =>
+    leadsAvailable ? !column.dealsOnly : !column.lead,
+  );
 
   const cells = (bucket: Bucket) =>
     columns.map((column) => (

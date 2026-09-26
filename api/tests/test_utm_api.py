@@ -18,6 +18,7 @@ asserts, plus three that are its own because it reads TWO entities:
 from __future__ import annotations
 
 import datetime as dt
+import re
 from collections.abc import AsyncIterator
 from typing import Any, Final
 
@@ -27,7 +28,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.config import settings
-from app.db.session import tenant_txn
+from app.db.session import control_txn, tenant_txn
 from app.main import create_app
 from app.security.session_token import issue_session
 from app.services import utm_stats
@@ -941,3 +942,102 @@ async def test_a_period_with_nothing_in_it_does_not_cache_the_verdict(
     assert third.status_code == 200, third.text
     assert warm.rest_count == 1
     assert third.json()["scan"]["from_cache"] is True
+
+
+# --- Bitrix24 Simple CRM ------------------------------------------------------------------
+
+
+async def set_crm_mode(portal_id: int, mode: int) -> None:
+    async with control_txn() as session:
+        await session.execute(
+            text(
+                "UPDATE portals SET capabilities = capabilities || "
+                "jsonb_build_object('crm_bitrix_mode', CAST(:mode AS int)) WHERE id = :pid"
+            ),
+            {"pid": portal_id, "mode": mode},
+        )
+
+
+def entity_pages(fake: FakeBitrix, entity_type_id: int) -> int:
+    """How many `crm.item.list` commands asked for this entity, probes included."""
+    return sum(
+        1
+        for record in fake.requests
+        if record.kind == "batch"
+        for command in record.commands.values()
+        if command.startswith("crm.item.list")
+        and re.search(rf"(^|[?&])entityTypeId={entity_type_id}(&|$)", command)
+    )
+
+
+async def test_a_simple_crm_portal_scans_deals_only(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """Simple CRM converts every lead into a deal with its tags: the lead leg would count twice.
+
+    The probe still asks both entities (it caches what the portal CAN answer, and portals
+    switch modes); the scan then reads deals alone.
+    """
+    await set_crm_mode(portal.portal_id, 2)
+    fake = (
+        FakeBitrix()
+        .on("user.current", me())
+        .on("crm.item.fields", item_fields(), item_fields())
+        .on(
+            "crm.item.list",
+            honour_ok(),
+            honour_ok(),
+            Page(items=sample_deals(), total=len(sample_deals())),
+        )
+    )
+    with patch_httpx(fake):
+        response = await post_utm(client, session_for(portal))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["scan"]["leads"]["available"] is False
+    assert body["scan"]["leads"]["reason"] == utm_stats.SIMPLE_CRM_REASON
+    assert body["totals"]["leads"]["total"] == 0
+    assert body["totals"]["deals"]["total"] == len(sample_deals())
+    assert entity_pages(fake, 1) == 1, "the lead probe only - no lead page is read"
+
+
+async def test_a_warm_cache_follows_the_mode_both_ways(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """The cache keeps what the portal CAN answer, never the deals-only view: a portal that
+    switches Classic -> Simple -> Classic gets the right legs on every warm report."""
+    with patch_httpx(cold_fake()):
+        cold = await post_utm(client, session_for(portal))
+    assert cold.status_code == 200 and cold.json()["totals"]["leads"]["total"] == 4
+
+    await set_crm_mode(portal.portal_id, 2)
+    simple = (
+        FakeBitrix()
+        .on("user.current", me())
+        .on("crm.item.list", Page(items=sample_deals(), total=2))
+    )
+    with patch_httpx(simple):
+        response = await post_utm(client, session_for(portal))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert simple.rest_count == 1 and body["scan"]["from_cache"] is True
+    assert body["scan"]["leads"]["reason"] == utm_stats.SIMPLE_CRM_REASON
+    assert body["totals"]["deals"]["total"] == 2 and body["totals"]["leads"]["total"] == 0
+    assert entity_pages(simple, 1) == 0
+
+    await set_crm_mode(portal.portal_id, 1)
+    classic = (
+        FakeBitrix()
+        .on("user.current", me())
+        .on(
+            "crm.item.list",
+            Page(items=sample_leads(), total=4),
+            Page(items=sample_deals(), total=2),
+        )
+    )
+    with patch_httpx(classic):
+        again = await post_utm(client, session_for(portal))
+    assert again.status_code == 200, again.text
+    assert again.json()["scan"]["from_cache"] is True
+    assert again.json()["totals"]["leads"]["total"] == 4

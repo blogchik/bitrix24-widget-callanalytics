@@ -391,6 +391,9 @@ class _Visit:
     lanes: dict[str, crm_lanes.Lane] = field(default_factory=dict)
     #: CRM batches this visit may still send (`CRM_BATCHES_PER_VISIT`).
     crm_batches: int = 0
+    #: `portals.capabilities.crm_bitrix_mode` as loaded at open: the portal's own CRM mode
+    #: (`crm_dict.CRM_MODE_*`), or None before the dictionary lane has first read it.
+    crm_bitrix_mode: int | None = None
 
     @property
     def backfilling(self) -> bool:
@@ -480,7 +483,13 @@ async def _open_visit(portal_id: int, correlation_id: uuid.UUID) -> _Visit | Non
         crm_active=crm_active,
         lanes=lanes,
         crm_batches=settings.crm_batches_per_visit,
+        crm_bitrix_mode=_stored_crm_mode(portal),
     )
+
+
+def _stored_crm_mode(portal: Portal) -> int | None:
+    value = (portal.capabilities or {}).get(crm_dict.CRM_MODE_CAPABILITY)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 async def _crm_active(session: AsyncSession, portal: Portal) -> bool:
@@ -1041,11 +1050,18 @@ def _dialect(name: str, item: MirrorDialect, legacy: MirrorDialect) -> MirrorDia
     return legacy if name == crm_backfill.DIALECT_LEGACY else item
 
 
-def _crm_lane_ready(visit: _Visit, name: str) -> crm_lanes.Lane | None:
+def _crm_lane_ready(
+    visit: _Visit, name: str, *, now_if: bool = False
+) -> crm_lanes.Lane | None:
+    """The lane when this visit may run it. `now_if` runs it before it is due, not while parked."""
     lane = visit.lanes.get(name)
     if not visit.crm_active or lane is None or visit.crm_batches <= 0:
         return None
-    return lane if lane.runnable(_utcnow()) else None
+    now = _utcnow()
+    backing_off = lane.paused_until is not None and lane.paused_until > now
+    if now_if and lane.status not in (crm_lanes.DONE, crm_lanes.PARKED) and not backing_off:
+        return lane
+    return lane if lane.runnable(now) else None
 
 
 async def _guarded_crm(visit: _Visit, name: str, work: Awaitable[None]) -> None:
@@ -1074,7 +1090,7 @@ async def _phase_crm_dict(visit: _Visit) -> None:
 
 
 async def _run_crm_dict(visit: _Visit) -> None:
-    lane = _crm_lane_ready(visit, crm_lanes.DICT)
+    lane = _crm_lane_ready(visit, crm_lanes.DICT, now_if=visit.crm_bitrix_mode is None)
     if lane is None:
         return
     dictionary = await _with_client(
@@ -1095,6 +1111,23 @@ async def _run_crm_dict(visit: _Visit) -> None:
     await crm_dict.store_dictionary(
         visit.fence, dictionary, now=now, lanes=[visit.lanes[crm_lanes.DICT]]
     )
+    # The reports read the mode from here (`crm_repo.simple_crm`), so a portal that switches
+    # between Classic and Simple CRM is followed within one dictionary pass. A clean read with
+    # no usable mode stores CRM_MODE_UNKNOWN, so the lane stops running early - but a mode
+    # command that merely FAILED never replaces a mode already stored.
+    mode = dictionary.crm_mode
+    if (
+        mode is None
+        and dictionary.complete
+        and (visit.crm_bitrix_mode is None or dictionary.crm_mode_answered)
+    ):
+        mode = crm_dict.CRM_MODE_UNKNOWN
+    if mode is not None and mode != visit.crm_bitrix_mode:
+        async with control_txn() as session:
+            await record_placements(
+                session, visit.portal_id, capabilities_patch={crm_dict.CRM_MODE_CAPABILITY: mode}
+            )
+        visit.crm_bitrix_mode = mode
 
 
 async def _phase_crm_sweep(visit: _Visit) -> None:

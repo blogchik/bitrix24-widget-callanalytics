@@ -53,6 +53,11 @@ export interface CallCrm {
   type?: string | null;
   id?: number | null;
   activity_id?: number | null;
+  /**
+   * On a Simple-CRM portal: the deal a LEAD-bound call's lead was converted into. Simple CRM
+   * hides lead cards, so the link opens the deal instead (see {@link crmTarget}).
+   */
+  deal_id?: number | null;
 }
 
 /** The telephony line: `rest_app_id` `null` is built-in telephony (§3). */
@@ -98,6 +103,8 @@ export interface CallsPage {
   rows: CallRow[];
   page: number;
   hasMore: boolean;
+  /** Every call the filters match, not just the rows loaded so far. */
+  total: number | null;
   /** §9's `RECORDING_MODE`: `off` until the spike is answered, then `proxy`. */
   recordingMode: string | null;
   period: PeriodEcho | null;
@@ -305,10 +312,10 @@ export function normalisePage(raw: unknown, requestedPage: number): CallsPage {
   return {
     rows,
     page: num(body.page) ?? requestedPage,
-    // `has_more` rather than the `total` the server also sends: this table pages by
-    // appending and never draws a numbered pager, so a count it would not render is a
-    // count it does not need to carry through four types to get here.
+    // `has_more` drives the paging; `total` is only told to the reader, so the header can
+    // say "50 of 7 127" instead of passing the rows loaded so far off as the period's count.
     hasMore: typeof body.has_more === 'boolean' ? body.has_more : rows.length >= PAGE_SIZE,
+    total: num(body.total),
     recordingMode: str(body.recording_mode),
     period: periodOf(body.period),
   };
@@ -348,6 +355,8 @@ export interface CallsResource {
   /** A "load more" page is in flight; the rows on screen stay put. */
   loadingMore: boolean;
   hasMore: boolean;
+  /** Every call the filters match; null until the first page answers. */
+  total: number | null;
   /** §9's mode, as the server reports it on every page. */
   recordingMode: string | null;
   period: PeriodEcho | null;
@@ -360,6 +369,7 @@ interface PageState {
   items: CallRow[];
   page: number;
   hasMore: boolean;
+  total: number | null;
   recordingMode: string | null;
   period: PeriodEcho | null;
 }
@@ -369,6 +379,7 @@ const EMPTY_STATE = (key: string): PageState => ({
   items: [],
   page: 0,
   hasMore: false,
+  total: null,
   recordingMode: null,
   period: null,
 });
@@ -424,6 +435,7 @@ export function useCalls(query: CallsQuery, enabled: boolean = true): CallsResou
           items: page.rows,
           page: page.page,
           hasMore: page.hasMore,
+          total: page.total,
           recordingMode: page.recordingMode,
           period: page.period,
         });
@@ -465,6 +477,7 @@ export function useCalls(query: CallsQuery, enabled: boolean = true): CallsResou
             items: appendUnique(previous.items, page.rows),
             page: page.page,
             hasMore: page.hasMore && page.rows.length > 0,
+            total: page.total ?? previous.total,
             recordingMode: page.recordingMode ?? previous.recordingMode,
             period: page.period ?? previous.period,
           };
@@ -490,6 +503,7 @@ export function useCalls(query: CallsQuery, enabled: boolean = true): CallsResou
     loading,
     loadingMore,
     hasMore: state.hasMore,
+    total: state.total,
     recordingMode: state.recordingMode,
     period: state.period,
     loadMore,
@@ -589,7 +603,32 @@ export async function requestCallRefresh(callId: number): Promise<boolean> {
  * path would only open Bitrix24's own "path not available" slider.
  */
 export function recordingFallbackPath(call: CallRow): string {
-  return crmEntityPath(call.crm?.type, call.crm?.id) ?? '/telephony/';
+  const target = crmTarget(call);
+  return crmEntityPath(target.type, target.id) ?? '/telephony/';
+}
+
+/**
+ * The CRM record a call points the reader at: the deal a Simple-CRM lead became when the
+ * server resolved one, and otherwise the binding Bitrix24 recorded on the call.
+ */
+export function crmTarget(call: CallRow): { type: string | null; id: number | null } {
+  const deal = call.crm?.deal_id;
+  if (typeof deal === 'number' && Number.isFinite(deal) && deal > 0) {
+    return { type: 'DEAL', id: deal };
+  }
+  return { type: call.crm?.type ?? null, id: call.crm?.id ?? null };
+}
+
+/**
+ * The line's own number, or null when there is none to show.
+ *
+ * REST-integration telephony (Sipuni, onlinePBX) fills `PORTAL_NUMBER` with the marker
+ * `REST_APP:<id>` rather than a number; printed through `formatPhone` it read as "2" or
+ * "68". Null lets the caller fall back to the integration's name.
+ */
+export function portalNumberOf(call: CallRow): string | null {
+  const value = (call.portal_number ?? '').trim();
+  return value && !/^REST_APP:/i.test(value) ? value : null;
 }
 
 // ---------------------------------------------------------------------------------
@@ -707,7 +746,8 @@ export const NEW_MESSAGE_KEYS: Readonly<Record<string, string>> = {
     'No calls in this period yet - the call history is still being imported.',
   'app.calls.table.loadMore': 'Load more',
   'app.calls.table.loadingMore': 'Loading...',
-  'app.calls.table.shown': '{shown} calls',
+  'app.calls.table.shown': '{count, plural, one {# call} other {# calls}}',
+  'app.calls.table.shownOf': 'Showing {shown} of {total}',
   'app.calls.table.allShown': 'All calls in this period are shown.',
   'app.calls.table.employeeUnknown': 'User #{id}',
   'app.calls.table.dismissed': 'dismissed',

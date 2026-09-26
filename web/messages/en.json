@@ -52,7 +52,8 @@
         "searchClear": "Clear the search",
         "searchEmpty": "No calls in this period match this number.",
         "searchPlaceholder": "Any part of the number",
-        "shown": "{shown} calls",
+        "shown": "{count, plural, one {# call} other {# calls}}",
+        "shownOf": "Showing {shown} of {total}",
         "time": "Time",
         "timeOrder": "Newest first",
         "title": "Calls"
@@ -293,8 +294,10 @@
     "utm": {
       "title": "Traffic sources",
       "subtitle": "Which tagged links brought the leads and the deals.",
+      "subtitleDeals": "Which tagged links brought the deals.",
       "scopeGranted": "The scope of this report was set by the application administrator — it can differ from what Bitrix24 CRM shows you.",
       "scopeNote": "Showing the leads and deals you can see in Bitrix24 CRM.",
+      "scopeNoteDeals": "Showing the deals you can see in Bitrix24 CRM.",
       "summary": "Total",
       "empty": "Nothing matched in this period",
       "leads": "Leads",
@@ -307,6 +310,9 @@
       "dealsPerLead": "Deals / leads",
       "tableNote": "Leads are counted by their own tags and deals by theirs, over the period they were created in. Won, In progress and Lost are where those deals stand today.",
       "ratioNote": "Deals / leads can exceed 100%: a deal may have been created by hand, or from a lead created before the period.",
+      "winRate": "Win rate",
+      "tableNoteDeals": "Counts the deals created in the selected period. Won, In progress and Lost are where those deals stand today.",
+      "simpleCrmNote": "This portal's CRM runs in simple mode (no leads): every request becomes a deal at once, so the report counts deals.",
       "groupBy": "Group by",
       "noTag": "No tag",
       "otherValues": "Other values",
@@ -316,6 +322,7 @@
       "regionLabel": "Table by {dimension}, scrolls sideways",
       "leadsUnavailable": "Leads are not available on this portal, so the report covers deals only.",
       "noTaggedRows": "Bitrix24 returned no UTM tags on any of the {count} leads created in this period. Either those links carried no tags, or this portal's build does not return UTM through the API.",
+      "noTaggedDeals": "Bitrix24 returned no UTM tags on any of the {count} deals created in this period. Either those links carried no tags, or this portal's build does not return UTM through the API.",
       "collapsedNote": "Not broken down by {dimensions}: this period has too many distinct values to group by them. Every other number is unaffected.",
       "valuesCapped": "Only the top {kept} values of a tag are listed separately; the rest are grouped under “Other values” and are still counted in every total.",
       "dimension": {

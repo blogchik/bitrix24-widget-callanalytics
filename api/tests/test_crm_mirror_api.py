@@ -192,3 +192,24 @@ async def test_me_names_the_path_each_viewer_takes(client: httpx.AsyncClient, ma
     assert admin["read"] == "mirror"
     assert employee["read"] == "live"
     assert not_yet["read"] == "live"
+
+
+async def test_me_says_which_crm_mode_the_portal_itself_runs(
+    client: httpx.AsyncClient, make_portal: Make
+) -> None:
+    """`bitrix_mode` is the portal's own (crm.settings.mode.get), not the mirror's `mode`."""
+    portal = await make_portal("mirror")
+    before = (await client.get(ME_PATH, headers=_headers(portal))).json()["crm"]
+    async with control_txn() as session:
+        await session.execute(
+            text(
+                "UPDATE portals SET capabilities = capabilities || '{\"crm_bitrix_mode\": 2}'::jsonb "
+                "WHERE id = :pid"
+            ),
+            {"pid": portal.portal_id},
+        )
+    after = (await client.get(ME_PATH, headers=_headers(portal))).json()["crm"]
+
+    assert before["bitrix_mode"] == "classic", "unknown reads as Classic, as the reports did before"
+    assert after["bitrix_mode"] == "simple"
+    assert after["mode"] == "mirror"

@@ -23,7 +23,6 @@ from datetime import UTC, datetime
 from typing import Any, Final
 
 from fastapi import APIRouter, Request, Response
-from sqlalchemy import update
 
 from app.bitrix.client import BitrixClient
 from app.bitrix.errors import (
@@ -47,12 +46,11 @@ from app.bitrix.identity import NotAnAdministrator, verify_admin_token_with
 from app.bitrix.oauth import OAuthRateLimited, TokenResponse, exchange_refresh_token
 from app.bitrix.placements import bind_all
 from app.config import settings
-from app.db.models import Portal
 from app.db.session import control_txn
 from app.handlers.render import render_error, render_install, render_state
 from app.logging import get_logger, get_request_id
 from app.security.redact import REDACTED
-from app.services.portals import record_event, store_portal_credential
+from app.services.portals import record_event, record_placements, store_portal_credential
 from app.services.rest_log import write_rest_log
 
 router = APIRouter()
@@ -522,7 +520,6 @@ async def _install(request: Request, hints: _Hints) -> Response:
         post=post,
         outcome_portal_id=outcome.portal_id,
         existing=batch.get("placement"),
-        capabilities=capabilities,
         correlation_id=correlation_id,
     )
 
@@ -560,7 +557,6 @@ async def _bind_widgets(
     post: IframePost,
     outcome_portal_id: int,
     existing: Any,
-    capabilities: dict[str, Any],
     correlation_id: uuid.UUID,
 ) -> None:
     """`placement.bind` x4 + `event.bind`, then record the results (§4.3 step 5).
@@ -597,16 +593,17 @@ async def _bind_widgets(
         # §4.3 step 5 is explicit that a bind failure never stops an install.
         _log.warning("install: binding step failed", exc_info=True)
 
-    merged = {**capabilities, "event_bind": event_bind}
     try:
-        # The one `portals` write outside services/portals.py: it touches neither a
-        # token column nor `client_endpoint` (§4.1's credential and endpoint
-        # invariants), only the two best-effort result columns of §4.3 step 5.
+        # Through the owning service, and MERGED into `capabilities` rather than replacing
+        # it: the install-time probe results were just stored with the credential, and the
+        # worker-owned `crm_bitrix_mode` must survive an app update (a Simple-CRM portal
+        # otherwise reads as Classic until its next dictionary pass).
         async with control_txn() as session:
-            await session.execute(
-                update(Portal)
-                .where(Portal.id == outcome_portal_id)
-                .values(placements=_jsonable(placements), capabilities=_jsonable(merged))
+            await record_placements(
+                session,
+                outcome_portal_id,
+                placements=_jsonable(placements),
+                capabilities_patch={"event_bind": _jsonable(event_bind)},
             )
     except Exception:
         _log.warning(

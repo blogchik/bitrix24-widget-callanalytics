@@ -229,9 +229,19 @@ export function HourlyTalkTable({
   );
 
   const dateFormat = useMemo(
-    () => new Intl.DateTimeFormat(locale, { day: '2-digit', month: 'short' }),
+    // `timeZone: 'UTC'` because the date is parsed as UTC midnight below: without it a
+    // browser west of UTC printed every row one day early.
+    () => new Intl.DateTimeFormat(locale, { day: '2-digit', month: 'short', timeZone: 'UTC' }),
     [locale],
   );
+
+  /**
+   * Minutes as the grid prints them. Under half a minute of talk is "<1", not "0": a "0" read
+   * exactly like an hour in which nobody answered at all. Each figure is rounded on its own,
+   * so a row's cells need not add up to its rounded total; the titles carry exact seconds.
+   */
+  const minuteLabel = (seconds: number): string =>
+    seconds > 0 && seconds < 30 ? '<1' : formatCount(Math.round(seconds / 60), locale);
 
   const dateLabel = (iso: string): string => {
     const parsed = Date.parse(`${iso}T00:00:00Z`);
@@ -284,10 +294,6 @@ export function HourlyTalkTable({
                   const pair = row.hours[hour];
                   const seconds = Number(pair?.[0] ?? 0);
                   const calls = Number(pair?.[1] ?? 0);
-                  // Rounded to the nearest minute for the cell, exact in the title: the
-                  // grid is read by comparing, and seconds would be four characters of
-                  // precision nobody compares.
-                  const minutes = Math.round(seconds / 60);
                   const empty = calls === 0 && seconds === 0;
                   return (
                     <td
@@ -304,13 +310,13 @@ export function HourlyTalkTable({
                           ? undefined
                           : t('app.hours.cellTitle', {
                               hour,
-                              minutes: formatCount(minutes, locale),
+                              minutes: minuteLabel(seconds),
                               seconds: formatCount(seconds, locale),
                               calls: formatCount(calls, locale),
                             })
                       }
                     >
-                      {formatCount(minutes, locale)} ({formatCount(calls, locale)})
+                      {minuteLabel(seconds)} ({formatCount(calls, locale)})
                     </td>
                   );
                 })}
@@ -321,12 +327,12 @@ export function HourlyTalkTable({
                 <td
                   className="ca-hours-total"
                   title={t('app.hours.totalTitle', {
-                    minutes: formatCount(Math.round(row.talk_seconds / 60), locale),
+                    minutes: minuteLabel(row.talk_seconds),
                     seconds: formatCount(row.talk_seconds, locale),
                     calls: formatCount(row.calls, locale),
                   })}
                 >
-                  {formatCount(Math.round(row.talk_seconds / 60), locale)} (
+                  {minuteLabel(row.talk_seconds)} (
                   {formatCount(row.calls, locale)})
                 </td>
               </tr>
@@ -346,7 +352,6 @@ export function HourlyTalkTable({
               const pair = footer.hours[hour];
               const seconds = Number(pair?.[0] ?? 0);
               const calls = Number(pair?.[1] ?? 0);
-              const minutes = Math.round(seconds / 60);
               return (
                 <td
                   key={hour}
@@ -354,24 +359,24 @@ export function HourlyTalkTable({
                   data-empty={calls === 0 && seconds === 0 ? 'true' : undefined}
                   title={t('app.hours.columnTitle', {
                     hour,
-                    minutes: formatCount(minutes, locale),
+                    minutes: minuteLabel(seconds),
                     calls: formatCount(calls, locale),
                     rows: formatCount(footer.rows_counted, locale),
                   })}
                 >
-                  {formatCount(minutes, locale)} ({formatCount(calls, locale)})
+                  {minuteLabel(seconds)} ({formatCount(calls, locale)})
                 </td>
               );
             })}
             <td
               className="ca-hours-total"
               title={t('app.hours.grandTitle', {
-                minutes: formatCount(Math.round(footer.talk_seconds / 60), locale),
+                minutes: minuteLabel(footer.talk_seconds),
                 calls: formatCount(footer.calls, locale),
                 rows: formatCount(footer.rows_counted, locale),
               })}
             >
-              {formatCount(Math.round(footer.talk_seconds / 60), locale)} (
+              {minuteLabel(footer.talk_seconds)} (
               {formatCount(footer.calls, locale)})
             </td>
           </tr>

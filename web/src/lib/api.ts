@@ -390,6 +390,8 @@ export interface Me {
 export interface MeCrm {
   analytics_enabled: boolean;
   mode?: string | null;
+  /** The portal's own CRM mode (`crm.settings.mode.get`); `simple` has no leads. */
+  bitrix_mode?: 'simple' | 'classic' | null;
   /**
    * Which path the Deals and Sources pages take for this viewer: `mirror` is a tokenless GET
    * answered from Postgres, `live` the POST that asks Bitrix24 on the viewer's own token.

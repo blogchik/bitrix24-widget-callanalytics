@@ -197,6 +197,7 @@ async def test_me_tells_every_viewer_and_only_undismissed_administrators_see_the
     assert employee == {
         "analytics_enabled": True,
         "mode": "sync",
+        "bitrix_mode": "classic",
         "read": "live",
         "notice_visible": False,
         "scope_needed": False,

@@ -44,9 +44,13 @@ _STATUSES: dict[str, list[dict[str, Any]]] = {
 class DictStub:
     """Answers the dictionary methods; `universal=False` is a build without crm.category.list."""
 
-    def __init__(self, *, universal: bool = True, refuse_leads: bool = False) -> None:
+    def __init__(
+        self, *, universal: bool = True, refuse_leads: bool = False, mode: Any = 2
+    ) -> None:
         self.universal = universal
         self.refuse_leads = refuse_leads
+        #: `crm.settings.mode.get`; an exception instance is answered as that error.
+        self.mode = mode
         self.requests: list[list[tuple[str, str, dict[str, Any]]]] = []
 
     async def batch(
@@ -71,6 +75,11 @@ class DictStub:
                 result = [{"ID": "3", "NAME": "B2B", "SORT": "20"}]
             elif method == "crm.dealcategory.stage.list":
                 result = [{"STATUS_ID": f"C{params['id']}:NEW", "NAME": "New", "SORT": "10"}]
+            elif method == "crm.settings.mode.get":
+                if isinstance(self.mode, Exception):
+                    error = self.mode
+                else:
+                    result = self.mode
             elif method == "crm.status.list":
                 entity = params["filter"]["ENTITY_ID"]
                 if entity == "STATUS" and self.refuse_leads:
@@ -105,6 +114,25 @@ async def test_a_universal_portal_reads_funnels_stages_and_lead_statuses_in_two_
     assert (ENTITY_DEAL, 0, "WON", "S") in stages
     assert (ENTITY_DEAL, 3, "C3:NEW", "P") in stages
     assert (ENTITY_LEAD, 0, "JUNK", "F") in stages
+
+
+async def test_the_portals_crm_mode_rides_in_the_first_batch() -> None:
+    """Simple CRM (2) converts every lead into a deal; the reports follow it (crm_repo.simple_crm)."""
+    stub = DictStub(mode=2)
+    dictionary = await read_dictionary(stub, pace=_go)  # type: ignore[arg-type]
+
+    assert len(stub.requests) == 2, "no request of its own"
+    assert ("mode", "crm.settings.mode.get", {}) in stub.requests[0]
+    assert dictionary.crm_mode == 2
+    assert (await read_dictionary(DictStub(mode="1"), pace=_go)).crm_mode == 1  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("answer", [AccessDenied(description="no"), 7, None, True])
+async def test_an_unusable_mode_answer_is_unknown_and_harms_nothing_else(answer: Any) -> None:
+    dictionary = await read_dictionary(DictStub(mode=answer), pace=_go)  # type: ignore[arg-type]
+
+    assert dictionary.crm_mode is None
+    assert dictionary.complete and not dictionary.errors
 
 
 async def test_a_legacy_build_falls_back_and_keeps_the_default_funnel() -> None:

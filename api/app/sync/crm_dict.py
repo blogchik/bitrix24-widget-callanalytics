@@ -42,10 +42,35 @@ from app.sync.crm_lanes import Lane, store_lanes
 from app.sync.lease import Fence, fenced_update
 from app.sync.throttle import merge_time_blocks
 
-__all__ = ["LEAD_STATUSES_KEY", "REMOVE_AFTER", "Dictionary", "read_dictionary", "store_dictionary"]
+__all__ = [
+    "CRM_MODE_CAPABILITY",
+    "CRM_MODE_CLASSIC",
+    "CRM_MODE_KEY",
+    "CRM_MODE_SIMPLE",
+    "CRM_MODE_UNKNOWN",
+    "LEAD_STATUSES_KEY",
+    "REMOVE_AFTER",
+    "Dictionary",
+    "read_dictionary",
+    "store_dictionary",
+]
 
 #: Batch key of the lead pipeline's statuses (`crm.status.list`, `ENTITY_ID = STATUS`).
 LEAD_STATUSES_KEY: Final[str] = "lst"
+
+#: `crm.settings.mode.get`: the portal's CRM mode, read with the dictionary because it is
+#: portal configuration too and costs no request of its own inside the first batch.
+CRM_SETTINGS_MODE_GET: Final[str] = "crm.settings.mode.get"
+CRM_MODE_KEY: Final[str] = "mode"
+#: `crm.enum.settings.mode`: Classic CRM keeps leads; Simple CRM converts every new lead into
+#: a deal at once, so leads are an intake artefact there and not something to report on.
+CRM_MODE_CLASSIC: Final[int] = 1
+CRM_MODE_SIMPLE: Final[int] = 2
+#: Stored when a clean dictionary read got no usable mode: known to be unknown, so the
+#: worker does not re-read the dictionary early on every visit to find out.
+CRM_MODE_UNKNOWN: Final[int] = 0
+#: Where the mode is kept: `portals.capabilities`, written through `record_placements`.
+CRM_MODE_CAPABILITY: Final[str] = "crm_bitrix_mode"
 
 #: A dictionary row still missing this long after it was first missed is removed.
 REMOVE_AFTER: Final[dt.timedelta] = dt.timedelta(hours=24)
@@ -66,6 +91,12 @@ class Dictionary:
     batches: int = 0
     universal: bool = True
     time_block: dict[str, Any] | None = None
+    #: `crm.settings.mode.get`, or None when the portal did not answer it. Portals switch
+    #: modes back and forth, so it is re-read with every dictionary pass.
+    crm_mode: int | None = None
+    #: The mode command answered cleanly, even if not with 1 or 2. A FAILED command must not
+    #: overwrite a mode already stored: one flaky pass would flip a Simple portal to Classic.
+    crm_mode_answered: bool = False
 
     @property
     def complete(self) -> bool:
@@ -80,6 +111,7 @@ def _first_commands(*, universal: bool) -> list[Command]:
             CRM_STATUS_LIST,
             {"order": {"SORT": "ASC"}, "filter": {"ENTITY_ID": "STATUS"}},
         ),
+        (CRM_MODE_KEY, CRM_SETTINGS_MODE_GET, {}),
     ]
 
 
@@ -88,6 +120,20 @@ def _error_of(batch: BatchResult, key: str) -> BitrixError | None:
     if batch.ok(key):
         return None
     return batch.error(key) or classify(None, description=f"batch answered no {key}")
+
+
+def _crm_mode(batch: BatchResult) -> int | None:
+    """The mode as a known value, or None. Optional: an error here stops nothing else."""
+    if not batch.ok(CRM_MODE_KEY):
+        return None
+    raw = batch.get(CRM_MODE_KEY)
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        return None
+    try:
+        mode = int(raw)
+    except ValueError:
+        return None
+    return mode if mode in (CRM_MODE_CLASSIC, CRM_MODE_SIMPLE) else None
 
 
 def _merged_time(batch: BatchResult) -> dict[str, Any] | None:
@@ -111,6 +157,8 @@ async def read_dictionary(client: BitrixClient, *, pace: Pace) -> Dictionary:
         out.batches += 1
         out.universal = False
     out.time_block = _merged_time(first)
+    out.crm_mode = _crm_mode(first)
+    out.crm_mode_answered = first.ok(CRM_MODE_KEY)
 
     lead_error = _error_of(first, LEAD_STATUSES_KEY)
     if lead_error is None:

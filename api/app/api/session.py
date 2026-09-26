@@ -239,6 +239,9 @@ async def me(principal: Principal = Depends(get_principal)) -> JSONResponse:
         "crm": {
             "analytics_enabled": portal.crm_opt_out_at is None,
             "mode": portal.crm_mode,
+            # The portal's own CRM mode, not the mirror's (`mode` above): on Simple CRM every
+            # lead becomes a deal at once, so the pages report deals and leave leads out.
+            "bitrix_mode": "simple" if crm_repo.simple_crm(portal) else "classic",
             # Which path this viewer's Deals and Sources pages take (§4.14): `mirror` is a
             # tokenless GET from Postgres, `live` the POST that asks Bitrix24.
             "read": "mirror" if crm_repo.serves_mirror(portal, principal, crm_access) else "live",

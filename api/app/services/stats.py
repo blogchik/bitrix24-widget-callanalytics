@@ -925,7 +925,7 @@ async def load_hours(principal: Principal, filters: CallFilters) -> dict[str, An
         # the browser: a client that re-derived it from the rows it received would paint a
         # truncated answer on a different scale than the full one.
         "max_cell_seconds": max(
-            (int(cell[0]) for row in shown for cell in row["hours"]), default=0
+            (int(cell[0]) for row in ordered for cell in row["hours"]), default=0
         ),
         "total_rows": total_rows,
         "row_cap": _HOUR_ROW_CAP,

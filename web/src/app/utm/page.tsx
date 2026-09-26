@@ -97,6 +97,8 @@ export default function UtmPage() {
   const crmOff = me.data?.crm?.analytics_enabled === false;
   // §4.14: the server decides which path this viewer takes; the page only follows it.
   const mirror = me.data?.crm?.read === 'mirror';
+  // Known before the report: on Simple CRM the page is about deals from its first paint.
+  const dealsOnly = me.data?.crm?.bitrix_mode === 'simple';
   const census = useCrmCensus(me);
 
   useEffect(() => {
@@ -195,6 +197,9 @@ export default function UtmPage() {
   }
 
   const scan = data?.scan;
+  // Not a failure: on Simple CRM every lead becomes a deal at once, so the server reports
+  // deals alone and says why (`utm_stats.SIMPLE_CRM_REASON`).
+  const simpleCrm = scan?.leads.reason === 'simple_crm';
 
   return (
     <>
@@ -202,7 +207,7 @@ export default function UtmPage() {
       <PageShell
         wide
         title={t('app.utm.title')}
-        subtitle={t('app.utm.subtitle')}
+        subtitle={t(dealsOnly ? 'app.utm.subtitleDeals' : 'app.utm.subtitle')}
         nav={
           <PageNav
             current={pathname}
@@ -220,7 +225,7 @@ export default function UtmPage() {
           <span>
             {mirror && me.data.access !== 'all'
               ? t('app.utm.scopeGranted')
-              : t('app.utm.scopeNote')}
+              : t(dealsOnly ? 'app.utm.scopeNoteDeals' : 'app.utm.scopeNote')}
           </span>
         }
       >
@@ -321,11 +326,16 @@ export default function UtmPage() {
             {/* The sentences without which this table is misread. The second explains a
                 column that is only drawn when the portal has leads. */}
             <p className="ca-utm-note" role="note">
-              {t('app.utm.tableNote')}
-              {data.scan.leads.available ? ` ${t('app.utm.ratioNote')}` : null}
+              {data.scan.leads.available
+                ? `${t('app.utm.tableNote')} ${t('app.utm.ratioNote')}`
+                : t('app.utm.tableNoteDeals')}
             </p>
 
-            {scan && !scan.leads.available ? (
+            {simpleCrm ? (
+              <p className="ca-utm-note" role="note">
+                {t('app.utm.simpleCrmNote')}
+              </p>
+            ) : scan && !scan.leads.available ? (
               <p className="ca-utm-note" role="status">
                 {t('app.utm.leadsUnavailable')}
               </p>
@@ -333,6 +343,11 @@ export default function UtmPage() {
             {scan && scan.leads.available && (scan.leads.tagged_rows ?? 0) === 0 && scan.leads.folded > 0 ? (
               <p className="ca-utm-note" role="status">
                 {t('app.utm.noTaggedRows', { count: scan.leads.folded })}
+              </p>
+            ) : null}
+            {scan && !scan.leads.available && scan.deals.available && scan.deals.tagged_rows === 0 && scan.deals.folded > 0 ? (
+              <p className="ca-utm-note" role="status">
+                {t('app.utm.noTaggedDeals', { count: scan.deals.folded })}
               </p>
             ) : null}
             {scan && scan.collapsed.length > 0 ? (

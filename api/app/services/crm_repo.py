@@ -42,7 +42,7 @@ from app.security.principal import Principal, PrincipalError
 from app.services.crm_grants import ViewerGrant, grant_scope
 from app.services.crm_scope import ViewerScope, load_scope, scope_predicate
 from app.services.stats import CallFilters
-from app.sync import crm_lanes
+from app.sync import crm_dict, crm_lanes
 
 __all__ = [
     "DEAL",
@@ -141,6 +141,63 @@ async def viewer_access(principal: Principal) -> ViewerAccess:
     if not settings.crm_scope_enabled:
         return ViewerAccess()
     return ViewerAccess(scope=await load_scope(principal.portal_id, principal.user_id))
+
+
+def mirror_readable(portal: Portal) -> bool:
+    """The CRM mirror holds live data for this portal: syncing, not opted out, not being purged.
+
+    The reports have `serves_mirror` for a whole report; this is the weaker test for reading a
+    few mirrored links on the side (a tab's leads, a call's converted deal).
+    """
+    return portal.crm_mode != "off" and portal.crm_opt_out_at is None and not portal.crm_purge_pending
+
+
+def simple_crm(portal: Portal) -> bool:
+    """True when the portal runs Bitrix24 Simple CRM: no leads, every new lead a deal at once.
+
+    Read from `portals.capabilities`, which the dictionary lane refreshes from
+    `crm.settings.mode.get` every pass, because portals do switch between the two modes.
+    Unknown - not read yet, or unanswered - is Classic, which is what the reports did before.
+    """
+    mode = (portal.capabilities or {}).get(crm_dict.CRM_MODE_CAPABILITY)
+    return mode == crm_dict.CRM_MODE_SIMPLE
+
+
+#: Leads one contact or company tab matches on. A card with more is not what the tab is for,
+#: and the keys become an `IN` list: the same bound `crm_activity_cap` puts on activity ids.
+_LINKED_LEAD_CAP: Final[int] = 250
+
+
+async def linked_lead_ids(portal_id: int, entity_type: str, entity_id: int) -> list[int]:
+    """The leads the CRM mirror links to a contact or company, newest first.
+
+    A call made while the client was still a lead keeps `CRM_ENTITY_TYPE = LEAD` forever, so
+    a contact or company tab only reaches it through the lead. Read from the mirror, not on
+    the opener's token: the tab's context row is shared between viewers, and keys that
+    depended on who opened the card would make the tab's numbers depend on it too. Empty
+    when the portal does not mirror CRM - the tab then matches as it always did.
+    """
+    if entity_type == "CONTACT":
+        link = CrmItem.contact_ids.contains([entity_id])
+    elif entity_type == "COMPANY":
+        link = CrmItem.company_id == entity_id
+    else:
+        return []
+    async with tenant_txn(portal_id) as session:
+        rows = (
+            await session.execute(
+                select(CrmItem.id)
+                .where(
+                    CrmItem.portal_id == portal_id,
+                    CrmItem.entity_type_id == LEAD,
+                    CrmItem.deleted_at.is_(None),
+                    link,
+                )
+                .order_by(CrmItem.id.desc())
+                .limit(_LINKED_LEAD_CAP)
+            )
+        ).scalars()
+        return [int(value) for value in rows]
 
 
 def serves_mirror(
@@ -568,8 +625,14 @@ class _LaneState:
     last_clean_at: dt.datetime | None
 
 
-async def coverage(portal_id: int) -> Coverage:
-    """Read the lanes once and state what a report built from the mirror can promise."""
+async def coverage(portal_id: int, *, leads: bool = True) -> Coverage:
+    """Read the lanes once and state what a report built from the mirror can promise.
+
+    `leads=False` for a report that reads no leads - the Deals page, or the Sources page on a
+    Simple-CRM portal: an unfinished or lagging lead lane says nothing about its numbers, and
+    must not put "history is still loading" or "stale" over a deals-only table.
+    `leads_available` and `lead_reason` still describe the lead lanes either way.
+    """
     async with control_txn() as session:
         rows = (
             await session.execute(
@@ -607,8 +670,9 @@ async def coverage(portal_id: int) -> Coverage:
     if leads_available:
         leads_available, lead_reason = readable(crm_lanes.LEAD_SWEEP)
 
+    counted = leads and leads_available
     backfills = [lanes[crm_lanes.DEAL_BACKFILL]] if deals_available else []
-    if leads_available:
+    if counted:
         backfills.append(lanes[crm_lanes.LEAD_BACKFILL])
     history_complete = bool(backfills) and all(lane.status == crm_lanes.DONE for lane in backfills)
 
@@ -621,7 +685,7 @@ async def coverage(portal_id: int) -> Coverage:
         # it does not have.
         progress_pct = min(99, (100 * done) // total) if total > 0 else 0
 
-    sweeps = [crm_lanes.DEAL_SWEEP] + ([crm_lanes.LEAD_SWEEP] if leads_available else [])
+    sweeps = [crm_lanes.DEAL_SWEEP] + ([crm_lanes.LEAD_SWEEP] if counted else [])
     cleaned = [lanes[name].last_clean_at if name in lanes else None for name in sweeps]
     data_as_of = None if any(moment is None for moment in cleaned) else min(
         moment for moment in cleaned if moment is not None

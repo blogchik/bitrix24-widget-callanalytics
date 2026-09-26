@@ -606,14 +606,14 @@ async def test_the_footer_covers_every_matching_row_even_when_the_table_is_trunc
     )
 
 
-async def test_the_colour_scale_is_normalised_over_the_answer_the_client_receives(
+async def test_the_colour_scale_is_computed_server_side_over_talk_time(
     client: httpx.AsyncClient, portal: SeededPortal
 ) -> None:
     """`max_cell_seconds` is the ramp's top, and it is computed server-side.
 
     A client that re-derived it would be normalising over whatever it was sent, which after
-    truncation is a different table than the one the number describes. Server-side, the two
-    always agree.
+    truncation is a different table than the one the number describes (see the cap test
+    below: the server normalises over every row, shown or not).
     """
     await seed_employee(portal.portal_id, USER_A, "Ada")
     await seed_call(
@@ -636,3 +636,54 @@ async def test_the_colour_scale_is_normalised_over_the_answer_the_client_receive
     assert body["max_cell_seconds"] == 900, (
         "the ramp is normalised over cell TALK time, which the unanswered call is not part of"
     )
+
+
+async def test_the_colour_scale_covers_the_rows_the_cap_cut_off(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """Truncation must not change the ramp's scale: it is normalised over the WHOLE table.
+
+    The busiest cell sits on the older day, which is the day the newest-first cap cuts off.
+    """
+    from app.services.stats import _HOUR_ROW_CAP
+
+    insert = text(
+        """
+        INSERT INTO calls (portal_id, bx_id, call_id, call_type, call_start_date,
+                           call_duration, call_failed_code, portal_user_id,
+                           phone_number, portal_number)
+        SELECT :pid, g, 'ramp-' || g, 1, :started, :duration, '200', g + CAST(:user_offset AS int),
+               '+998900000000', 'line-1'
+        FROM generate_series(CAST(:first AS int), CAST(:last AS int)) AS g
+        """
+    )
+    async with tenant_txn(portal.portal_id) as session:
+        # A full cap of rows on the newer day, 60 s each...
+        await session.execute(
+            insert,
+            {
+                "pid": portal.portal_id,
+                "started": datetime(2026, 3, 11, 6, 0, tzinfo=UTC),
+                "duration": 60,
+                "user_offset": 0,
+                "first": 1,
+                "last": _HOUR_ROW_CAP,
+            },
+        )
+        # ...and one busier row on the older day, which the newest-first cap cuts off.
+        await session.execute(
+            insert,
+            {
+                "pid": portal.portal_id,
+                "started": datetime(2026, 3, 10, 6, 0, tzinfo=UTC),
+                "duration": 3000,
+                "user_offset": 100_000,
+                "first": _HOUR_ROW_CAP + 1,
+                "last": _HOUR_ROW_CAP + 1,
+            },
+        )
+
+    body = (await get_hours(client, session_for(portal))).json()
+    assert body["truncated"] is True
+    assert all(int(cell[0]) <= 60 for row in body["rows"] for cell in row["hours"])
+    assert body["max_cell_seconds"] == 3000

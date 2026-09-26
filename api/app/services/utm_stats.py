@@ -24,6 +24,13 @@ A missing lead leg DEGRADES the report to deals-only and says so; it never refus
 because "this portal has no leads module" and "nobody created a lead last month" are
 different facts that a marketer would act on differently.
 
+A portal running Bitrix24 **Simple CRM** (`crm.settings.mode.get` = 2) is the other
+deals-only case, and it is decided here rather than by an error: the lead API still answers
+there, but every new lead is converted into a deal at once and carries its tags over (on the
+first such portal 1 661 of 1 661 converted deals matched their lead's tags). Reading both legs
+would count each request twice, so the lead leg is skipped and `scan.leads.reason` says
+`simple_crm` (`crm_repo.simple_crm`, refreshed by the dictionary lane).
+
 **5. Cardinality never refuses.** A `utm_term` that is unique per click would make the
 combination count enormous - but the count is unknowable until the scan that produced it has
 already been paid for. Refusing there would spend the whole budget and then decline to
@@ -116,6 +123,7 @@ from app.services.stats import CallFilters, FilterError, parse_filters, resolve_
 from app.sync.throttle import read_time_block
 
 __all__ = [
+    "SIMPLE_CRM_REASON",
     "UtmReportError",
     "load_utm_report",
     "load_utm_report_mirror",
@@ -125,6 +133,11 @@ __all__ = [
 ]
 
 _log = get_logger(__name__)
+
+#: `scan.leads.reason` on a Simple-CRM portal (`crm_repo.simple_crm`). Not a failure: every
+#: lead there is converted into a deal at once and carries its tags over, so the deal leg
+#: alone counts each request once, and a lead leg beside it would count it twice.
+SIMPLE_CRM_REASON: Final[str] = "simple_crm"
 
 #: Query-string names that belong to `calls` and mean nothing to a CRM record. Refused
 #: rather than ignored: serving an answer to a different question is worse than a 400.
@@ -749,6 +762,22 @@ async def _capability(
     return capability, cacheable
 
 
+def _deals_only(capability: _Capability) -> _Capability:
+    """The capability a Simple-CRM report scans with: the deal leg, and no lead leg.
+
+    A portal whose deals cannot be read keeps its leads rather than answering nothing.
+    """
+    if capability.deal is None:
+        return capability
+    return _Capability(
+        lead=None,
+        deal=capability.deal,
+        lead_reason=SIMPLE_CRM_REASON,
+        deal_reason=capability.deal_reason,
+        dimensions=capability.dimensions,
+    )
+
+
 def _cached_capability(portal_id: int) -> _Capability | None:
     entry = _capability_cache.get(portal_id)
     if entry is not None and entry[0] > time.monotonic():
@@ -1292,6 +1321,9 @@ async def _report(
 
     capability = _cached_capability(portal.id)
     scan_probe = _Scan()
+    # The cache keeps what the portal CAN answer; which legs a report reads is decided per
+    # request, because a portal may switch between Classic and Simple CRM at any time.
+    simple = crm_repo.simple_crm(portal)
 
     async with BitrixClient(
         endpoint=portal.client_endpoint,
@@ -1310,7 +1342,8 @@ async def _report(
             commands: list[tuple[str, str, dict[str, Any]]] = [me_command()]
             start_iso = _iso(filters.start_utc)
             end_iso = _iso(filters.end_utc)
-            for dialect in capability.entities():
+            warm_view = _deals_only(capability) if simple else capability
+            for dialect in warm_view.entities():
                 commands.extend(
                     list_page_commands(
                         dialect,
@@ -1330,44 +1363,44 @@ async def _report(
             first = None
             from_cache = False
 
+        view = _deals_only(capability) if simple else capability
         scan, scanned = await _run_scan(
             client,
             budget,
-            capability=capability,
+            capability=view,
             filters=filters,
             assigned_to=assigned_to,
             first_batch=first,
         )
-    if scanned is not capability:
+    if scanned is not view:
         # The cached verdict is now known to be wrong. Evicting rather than rewriting it
         # keeps one rule about this cache: it is only ever filled from a full probe.
         _capability_cache.pop(portal.id, None)
-        capability = scanned
-    elif not from_cache:
-        # The verdict is remembered HERE rather than straight after the probe, because the
-        # last piece of evidence it needs comes from the scan: a `>=created: 2999` answering
-        # zero only proves the filter held if this viewer can read records at all, and a
-        # selection that returned rows proves exactly that. Asking Bitrix24 the same question
-        # directly - an unfiltered list, counting the whole table - is what this page used to
-        # do, and it is what made a production portal answer `operation_time_limit` forever.
-        #
-        # A period with nothing in it therefore leaves the portal un-cached and the next open
-        # cold. That is the honest trade and it is cheap now: the cold path is two field maps
-        # and two selections that match nothing.
-        if cacheable and scan.totals[KIND_LEAD] + scan.totals[KIND_DEAL] > 0:
-            _remember_capability(portal.id, capability)
+    # The verdict is remembered HERE rather than straight after the probe, because the last
+    # piece of evidence it needs comes from the scan: a `>=created: 2999` answering zero only
+    # proves the filter held if this viewer can read records at all, and a selection that
+    # returned rows proves exactly that. Asking Bitrix24 the same question directly - an
+    # unfiltered list, counting the whole table - is what this page used to do, and it is what
+    # made a production portal answer `operation_time_limit` forever.
+    #
+    # A period with nothing in it therefore leaves the portal un-cached and the next open
+    # cold. That is the honest trade and it is cheap now: the cold path is two field maps and
+    # two selections that match nothing. What is cached is the full probe, never the
+    # deals-only view a Simple-CRM report scanned with.
+    elif not from_cache and cacheable and scan.totals[KIND_LEAD] + scan.totals[KIND_DEAL] > 0:
+        _remember_capability(portal.id, capability)
 
     # A dimension the caller asked to group by that this portal does not store would be a
     # column of nothing but the `none` bucket. Narrow to what both the portal and the caller
     # named; the response echoes the result so the page knows which controls to draw.
-    chosen = tuple(name for name in dimensions if name in capability.dimensions)
+    chosen = tuple(name for name in dimensions if name in scanned.dimensions)
     if not chosen:
-        chosen = capability.dimensions
+        chosen = scanned.dimensions
 
     return _build_response(
         filters=filters,
         dimensions=chosen,
-        capability=capability,
+        capability=scanned,
         scan=scan,
         rest_requests=budget.requests,
         from_cache=from_cache,
@@ -1491,12 +1524,12 @@ async def load_utm_report_mirror(
     except TimeoutError:
         raise UtmReportError("retry", 503, retry_after=5) from None
     try:
-        coverage = await crm_repo.coverage(portal.id)
+        simple = crm_repo.simple_crm(portal)
+        coverage = await crm_repo.coverage(portal.id, leads=not simple)
         if not coverage.deals_available:
             raise UtmReportError(crm_repo.MIRROR_UNAVAILABLE, 409, reason=coverage.deal_reason)
-        entity_type_ids = (
-            (crm_repo.LEAD, crm_repo.DEAL) if coverage.leads_available else (crm_repo.DEAL,)
-        )
+        leads_on = coverage.leads_available and not simple
+        entity_type_ids = (crm_repo.LEAD, crm_repo.DEAL) if leads_on else (crm_repo.DEAL,)
         assigned_to = filters.employees
         counts = await crm_repo.utm_counts(
             portal.id, filters, entity_type_ids=entity_type_ids, scope=scope, employees=assigned_to
@@ -1508,9 +1541,9 @@ async def load_utm_report_mirror(
         gate.release()
 
     capability = _Capability(
-        lead=_MIRROR_LEAD if coverage.leads_available else None,
+        lead=_MIRROR_LEAD if leads_on else None,
         deal=_MIRROR_DEAL,
-        lead_reason="" if coverage.leads_available else coverage.lead_reason,
+        lead_reason="" if leads_on else (SIMPLE_CRM_REASON if simple else coverage.lead_reason),
         deal_reason="",
         dimensions=DIMENSIONS,
     )

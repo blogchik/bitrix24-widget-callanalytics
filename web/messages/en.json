@@ -284,7 +284,7 @@
       "blankStage": "No stage",
       "scopeGranted": "The scope of this report was set by the application administrator — it can differ from what Bitrix24 CRM shows you.",
       "scopeNote": "Showing the deals and funnels you can see in Bitrix24 CRM.",
-      "currentStageNote": "Every count is the CURRENT stage of deals that were created, changed or closed in the selected period. It is a snapshot of today, not a picture of the period.",
+      "currentStageNote": "Only deals created in the selected period are counted. Every count is their CURRENT stage: a snapshot of today, not a picture of the period.",
       "rowsTruncated": "Showing {shown} of {total} operators; the Total row covers all of them.",
       "funnelsHidden": "{count, plural, one {# funnel is hidden} other {# funnels are hidden}}: they have no deals in this period.",
       "stageDictionaryFailed": "Stage names could not be read for {count, plural, one {# funnel} other {# funnels}} — those columns are labelled by code. The counts are still correct.",

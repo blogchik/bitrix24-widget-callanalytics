@@ -22,6 +22,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, Final
+from urllib.parse import parse_qsl
 
 import httpx
 import pytest
@@ -65,7 +66,7 @@ def me(user_id: int = VIEWER) -> dict[str, Any]:
 
 
 def item_fields() -> dict[str, Any]:
-    """`crm.item.fields`: the four names the union filter depends on must exist."""
+    """`crm.item.fields`: the name the period filter depends on must exist."""
     return {
         "fields": {
             "id": {"type": "integer"},
@@ -138,10 +139,9 @@ def cold_fake(rows: list[dict[str, Any]] | None = None, *, total: int | None = N
         .on("crm.status.list", stages("C7:"), stages(""))
         .on(
             "crm.item.list",
-            # The three honour-probe answers, then the page. `hp0` must be non-empty or the
+            # The two honour-probe answers, then the page. `hp0` must be non-empty or the
             # verdict is inconclusive and the dialect is never cached.
             Page(items=[deal(99, GROW, "C7:NEW", VIEWER, "P")], total=1),
-            Page(items=[], total=0),
             Page(items=[], total=0),
             Page(items=items, total=total if total is not None else len(items)),
         )
@@ -228,6 +228,19 @@ def group_of(body: Mapping[str, Any], category_id: int) -> Mapping[str, Any]:
     raise AssertionError(f"funnel {category_id} is not in the report: {body['groups']}")
 
 
+def list_filters(fake: FakeBitrix) -> list[dict[str, str]]:
+    """The `filter[...]` pairs of every `crm.item.list` sub-command, in the order sent."""
+    filters: list[dict[str, str]] = []
+    for record in fake.requests:
+        if record.kind != "batch":
+            continue
+        for command in record.commands.values():
+            method, _, query = command.partition("?")
+            if method == "crm.item.list":
+                filters.append({k: v for k, v in parse_qsl(query) if k.startswith("filter[")})
+    return filters
+
+
 # --- the happy path ------------------------------------------------------------------------
 
 
@@ -310,6 +323,29 @@ async def test_the_unassigned_row_survives(
         response = await post_deals(client, session_for(portal))
     rows = group_of(response.json(), DEFAULT_FUNNEL)["rows"]
     assert [row["user_id"] for row in rows][-1] is None
+
+
+async def test_the_period_selects_on_creation_time_alone(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """Owner decision 3: a deal modified or closed in the period is not counted for it.
+
+    Asserted on the wire, because nothing in the response would betray a wider filter: the
+    extra deals would simply be counted, in cells that still add up.
+    """
+    fake = cold_fake()
+    with patch_httpx(fake):
+        response = await post_deals(client, session_for(portal))
+    assert response.status_code == 200, response.text
+
+    # hp0 (unfiltered), hp1 (the year-2999 probe), then the page.
+    *probes, page = list_filters(fake)
+    assert probes == [{}, {"filter[>=createdTime]": "2999-01-01T00:00:00+00:00"}]
+    assert page == {
+        # June in Tashkent (UTC+5), as half-open UTC bounds.
+        "filter[>=createdTime]": "2026-05-31T19:00:00+00:00",
+        "filter[<createdTime]": "2026-06-30T19:00:00+00:00",
+    }
 
 
 # --- the viewer's own token ------------------------------------------------------------------
@@ -524,18 +560,17 @@ async def test_a_build_without_the_universal_method_falls_back(
     assert scan["dictionary_dialect"] == "dealcategory"
 
 
-async def test_a_portal_that_ignores_the_or_filter_is_demoted(
+async def test_a_portal_that_ignores_the_created_filter_is_demoted(
     client: httpx.AsyncClient, portal: SeededPortal
 ) -> None:
     """The one failure that would otherwise produce a plausible, wrong report."""
     fake = cold_fake()
     fake.on(
         "crm.item.list",
-        # hp0 non-empty, and BOTH future-dated probes come back non-empty: the filter was
-        # dropped, so every date bound in the union would have been dropped too.
+        # hp0 non-empty, and the future-dated probe comes back non-empty too: the key was
+        # dropped, so the period's own bounds would have been dropped with it.
         Page(items=[deal(99, GROW, "C7:NEW", VIEWER, "P")], total=1),
         Page(items=[deal(98, GROW, "C7:NEW", VIEWER, "P")], total=1),
-        Page(items=[deal(97, GROW, "C7:NEW", VIEWER, "P")], total=1),
     )
     fake.on("crm.deal.list", Page(items=[], total=0))
     with patch_httpx(fake):

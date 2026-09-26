@@ -371,9 +371,9 @@ export default function DealsPage() {
             </div>
 
             {/* The most likely misreading of the whole report, answered where it happens.
-                Every count is where deals sit TODAY among those that touched the period,
-                not where they sat during it. Without this sentence a lead reads a month's
-                "in progress" as a month's backlog and does not find out for months. */}
+                Every count is where deals CREATED in the period sit TODAY, not where they
+                sat during it. Without this sentence a lead reads a month's "in progress" as
+                a month's backlog and does not find out for months. */}
             <p className="ca-deals-note" role="note">
               {t('app.deals.currentStageNote')}
             </p>

@@ -1129,6 +1129,14 @@ response). It is deliberately **not** exposed as a control: it would sit among t
 this page promises are free while actually costing a round trip. The reader's grouping
 control is client-side.
 
+**The page is one table** (simplified at the owner's request, 2026-09-26, after their own
+spreadsheet). Rows are the values of one tag, chosen on the table (campaign by default);
+columns are leads, converted leads, deals, lead conversion (converted ÷ leads), deals ÷ leads,
+and the deals split into won / in progress / lost, with an Итого row. The four lead columns are
+left out when `scan.leads.available` is false. The tiles, the daily chart, the ranking, the
+source × medium matrix, the five tag filters and the amount column were removed; `facets`,
+`days` and `amounts` are still in the response, and nothing on the API side changed.
+
 #### Currency
 
 `opportunityAccount` + `accountCurrencyId` — Bitrix24's own conversion into the portal's

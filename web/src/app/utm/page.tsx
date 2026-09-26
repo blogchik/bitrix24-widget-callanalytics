@@ -1,7 +1,7 @@
 'use client';
 
 /**
- * UTM analytics: which advertising tags brought the leads, the deals and the money.
+ * UTM analytics: which advertising tags brought the leads and the deals.
  *
  * The fourth left-menu page, and the only one that answers a marketing question. The
  * dashboard knows how many calls were made; the by-hour grid knows when; the deals page
@@ -9,44 +9,29 @@
  *
  * It is the deals page's twin - a live CRM read that stores nothing, POSTs the viewer's own
  * Bitrix24 token, and can be refused - so everything §4.12 says about those three properties
- * applies here unchanged. What is new is the filter model, and it is the whole design:
+ * applies here unchanged.
  *
  * ---------------------------------------------------------------------------------
- * **Period and employee cost a live scan of two entities. Every tag control costs nothing.**
- *
- * The response carries one row per tag combination, so filtering by source, grouping by
- * campaign, switching the chart's measure and toggling percentages are all folds over data
- * that is already here. The UTM selections are deliberately NOT in the fetch effect's
- * dependency list: changing one leaves the query string byte-identical, the effect does not
- * re-fire, and only the `useMemo` below re-runs. The layout says so too - the two controls
- * that cost a round trip sit in their own row above the ones that do not.
- *
- * The filter OPTIONS come from `facets`, which the server computes before any bucketing and
- * before any filter. So they are exact, and they never shrink when a filter is applied -
- * the classic cross-filter trap, where picking one source collapses the medium list to a
- * single entry and there is no way back.
+ * **One table, after the owner's own spreadsheet (simplified 2026-09-26).** Period and
+ * employee sit on top and cost a read; the tag the rows are grouped by sits on the table
+ * and costs nothing, because the response already carries every combination row and the
+ * fold is arithmetic in the browser. The tiles, the charts and the five tag filters this
+ * page used to carry are gone; the response still carries what they drew.
  * ---------------------------------------------------------------------------------
- *
- * **Why there is no "group by these five" control.** The API takes a `dimensions` parameter
- * and it narrows the FOLD rather than the SCAN - the same pages are fetched either way - so
- * exposing it would put a control that costs a round trip in the row of controls this page
- * promises are free. The grouping the reader actually wants is "show me one tag at a time",
- * which is the `groupBy` segmented control, and that is pure client-side arithmetic.
  *
  * Everything else is the deals page's skeleton, deliberately unchanged: the `useMe` gate,
  * the three terminal states, stale-while-refetching with `ca-viz-dim` + `aria-busy`, and the
  * debounced `fitWindow` (§4.10, §4.11).
  *
  * On a portal promoted to the CRM mirror (§4.14) the viewers `/me.crm.read` names get the
- * same report by GET from Postgres: no token, no scan, 366 days - and period and employee
- * stop costing a round trip to Bitrix24 as well.
+ * same report by GET from Postgres: no token, no scan, 366 days.
  */
 
 import { useLocale, useTranslations } from 'next-intl';
 import { usePathname } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { ErrorState, LoadingBlock, PageShell, Section, StaleNotice } from '@/components/AppFrame';
+import { ErrorState, LoadingBlock, PageShell, StaleNotice } from '@/components/AppFrame';
 import CrmCoverageNotice from '@/components/CrmCoverageNotice';
 import {
   defaultFilters,
@@ -58,10 +43,7 @@ import {
 } from '@/components/Filters';
 import PageNav, { NAV_CSS } from '@/components/PageNav';
 import StateCard from '@/components/StateCard';
-import UtmMatrix, { MATRIX_CSS } from '@/components/UtmMatrix';
-import UtmSourceBars, { type BarMode } from '@/components/UtmSourceBars';
-import UtmTable, { UTM_CSS, UtmSummaryStrip } from '@/components/UtmTable';
-import UtmTrend from '@/components/UtmTrend';
+import UtmTable, { UTM_CSS } from '@/components/UtmTable';
 import { DateRange, MultiSelect, SegmentedControl, type SelectOption } from '@/components/ui';
 import { ApiError, apiFetch, deniedBodyKey, useMe } from '@/lib/api';
 import { fitWindow } from '@/lib/bx24';
@@ -70,13 +52,10 @@ import { useCrmCensus } from '@/lib/crmScope';
 import { withExtension } from '@/lib/format';
 import {
   DIMENSIONS,
-  bucketLabel,
-  crossTab,
   dimensionKey,
   foldBy,
   totalOf,
   type Dimension,
-  type Selections,
   type UtmResponse,
 } from '@/lib/utm';
 import { VIZ_CSS } from '@/lib/viz';
@@ -88,6 +67,9 @@ import { VIZ_CSS } from '@/lib/viz';
  * most likely to answer in one round trip rather than the largest one that would be legal.
  */
 const DEFAULT_PRESET = 'd30' as const;
+
+/** The rows the table opens with: the owner's spreadsheet is one row per campaign. */
+const DEFAULT_GROUP: Dimension = 'utm_campaign';
 
 /** Mirrors `UTM_REPORT_MAX_PERIOD_DAYS`; the server refuses anything longer. */
 const MAX_UTM_PERIOD_DAYS = 92;
@@ -107,12 +89,8 @@ export default function UtmPage() {
   const [filters, setFilters] = useState<DashboardFilters | null>(null);
   const [employees, setEmployees] = useState<readonly string[]>([]);
   const [options, setOptions] = useState<FilterOptions>(EMPTY_FILTER_OPTIONS);
-
-  // Free controls. None of these is in the fetch effect's dependency list.
-  const [selections, setSelections] = useState<Selections>({});
-  const [groupBy, setGroupBy] = useState<Dimension>('utm_source');
-  const [mode, setMode] = useState<BarMode>('volume');
-  const [showPercent, setShowPercent] = useState(false);
+  // Free: not in the fetch effect's dependency list, so switching it only re-folds.
+  const [groupBy, setGroupBy] = useState<Dimension>(DEFAULT_GROUP);
 
   const timezone = me.data?.timezone ?? 'UTC';
   // D-7: with CRM analytics turned off the report is closed, so nothing is fetched for it.
@@ -175,7 +153,7 @@ export default function UtmPage() {
         clearTimeout(timer.current);
       }
     };
-  }, [data, groupBy, mode, report.pending, selections, showPercent]);
+  }, [data, groupBy, report.pending]);
 
   const employeeOptions = useMemo(
     (): readonly SelectOption[] =>
@@ -189,22 +167,14 @@ export default function UtmPage() {
     [options.employees, t],
   );
 
-  /** Every view on the page, recomputed from the rows already in memory. */
+  /** The table, re-folded from the rows already in memory. */
   const view = useMemo(() => {
     if (!data) {
       return null;
     }
-    const buckets = foldBy(data.combinations, data.dimensions, selections, groupBy);
-    const matrix = crossTab(
-      data.combinations,
-      data.dimensions,
-      selections,
-      'utm_source',
-      'utm_medium',
-      (row) => row.leads.total + row.deals.total,
-    );
-    return { buckets, totals: totalOf(buckets), matrix };
-  }, [data, groupBy, selections]);
+    const buckets = foldBy(data.combinations, data.dimensions, groupBy);
+    return { buckets, totals: totalOf(buckets) };
+  }, [data, groupBy]);
 
   if (me.loading) {
     return <LoadingBlock label={t('app.loading')} />;
@@ -225,11 +195,10 @@ export default function UtmPage() {
   }
 
   const scan = data?.scan;
-  const groupLabel = t(dimensionKey(groupBy));
 
   return (
     <>
-      <style dangerouslySetInnerHTML={{ __html: `${VIZ_CSS}${NAV_CSS}${UTM_CSS}${MATRIX_CSS}` }} />
+      <style dangerouslySetInnerHTML={{ __html: `${VIZ_CSS}${NAV_CSS}${UTM_CSS}` }} />
       <PageShell
         wide
         title={t('app.utm.title')}
@@ -256,86 +225,50 @@ export default function UtmPage() {
         }
       >
         {filters ? (
-          <div className="flex flex-col gap-3">
-            {/* Row one: the two controls that cost a live CRM scan. */}
-            <div className="flex flex-wrap items-end gap-3">
-              <SegmentedControl<'today' | 'd7' | 'd30' | 'custom'>
-                label={t('app.dashboard.period.label')}
-                value={filters.preset}
-                onChange={(preset) => {
-                  if (preset === 'custom') {
-                    setFilters({ ...filters, preset });
-                    return;
+          <div className="flex flex-wrap items-end gap-3">
+            <SegmentedControl<'today' | 'd7' | 'd30' | 'custom'>
+              label={t('app.dashboard.period.label')}
+              value={filters.preset}
+              onChange={(preset) => {
+                if (preset === 'custom') {
+                  setFilters({ ...filters, preset });
+                  return;
+                }
+                const range = rangeForPreset(preset, timezone);
+                setFilters({ ...filters, preset, from: range.from, to: range.to });
+              }}
+              options={(['today', 'd7', 'd30', 'custom'] as const).map((preset) => ({
+                value: preset,
+                label: t(`app.dashboard.period.${preset}`),
+              }))}
+              className="min-w-0 max-w-full"
+            />
+            {filters.preset === 'custom' ? (
+              <div className="min-w-0 flex-1 basis-[240px] sm:max-w-[360px]">
+                <DateRange
+                  value={{ from: filters.from, to: filters.to }}
+                  onChange={(next) =>
+                    setFilters({ ...filters, preset: 'custom', from: next.from, to: next.to })
                   }
-                  const range = rangeForPreset(preset, timezone);
-                  setFilters({ ...filters, preset, from: range.from, to: range.to });
-                }}
-                options={(['today', 'd7', 'd30', 'custom'] as const).map((preset) => ({
-                  value: preset,
-                  label: t(`app.dashboard.period.${preset}`),
-                }))}
-                className="min-w-0 max-w-full"
-              />
-              {filters.preset === 'custom' ? (
-                <div className="min-w-0 flex-1 basis-[240px] sm:max-w-[360px]">
-                  <DateRange
-                    value={{ from: filters.from, to: filters.to }}
-                    onChange={(next) =>
-                      setFilters({ ...filters, preset: 'custom', from: next.from, to: next.to })
-                    }
-                    timeZone={timezone}
-                    maxSpanDays={mirror ? MIRROR_MAX_PERIOD_DAYS : MAX_UTM_PERIOD_DAYS}
-                  />
-                </div>
-              ) : null}
-              {/* Shown to anyone who can see somebody else's records: every administrator,
-                  and anyone an administrator granted a scope to. */}
-              {me.data.access === 'all' || mirror ? (
-                <div className="min-w-0 flex-1 basis-[220px] sm:max-w-[320px]">
-                  <MultiSelect
-                    label={t('app.hours.employees')}
-                    values={employees}
-                    onChange={setEmployees}
-                    options={employeeOptions}
-                    allLabel={t('app.dashboard.filter.all')}
-                    summaryLabel={(count) => t('app.hours.selected', { count })}
-                    emptyText={t('app.hours.noEmployees')}
-                  />
-                </div>
-              ) : null}
-            </div>
-
-            {/* Row two: the tag filters. Free, and the page says so. */}
-            {data ? (
-              <>
-                <div className="grid items-end gap-3 [grid-template-columns:repeat(auto-fit,minmax(200px,1fr))]">
-                  {data.facets.map((facet) => (
-                    <MultiSelect
-                      key={facet.dimension}
-                      label={t(dimensionKey(facet.dimension))}
-                      values={selections[facet.dimension] ?? []}
-                      onChange={(values) =>
-                        setSelections((current) => ({ ...current, [facet.dimension]: values }))
-                      }
-                      options={facet.values.map((value) => ({
-                        value: value.value,
-                        label: bucketLabel(value.value, data.buckets, t),
-                        hint: t('app.utm.facetHint', {
-                          leads: value.leads.total,
-                          deals: value.deals.total,
-                        }),
-                      }))}
-                      allLabel={t('app.dashboard.filter.all')}
-                      summaryLabel={(count) => t('app.hours.selected', { count })}
-                      emptyText={t('app.utm.noValues')}
-                      disabled={!facet.selected}
-                    />
-                  ))}
-                </div>
-                <p className="ca-utm-note" role="note">
-                  {t('app.utm.freeFiltersNote')}
-                </p>
-              </>
+                  timeZone={timezone}
+                  maxSpanDays={mirror ? MIRROR_MAX_PERIOD_DAYS : MAX_UTM_PERIOD_DAYS}
+                />
+              </div>
+            ) : null}
+            {/* Shown to anyone who can see somebody else's records: every administrator,
+                and anyone an administrator granted a scope to. */}
+            {me.data.access === 'all' || mirror ? (
+              <div className="min-w-0 flex-1 basis-[220px] sm:max-w-[320px]">
+                <MultiSelect
+                  label={t('app.hours.employees')}
+                  values={employees}
+                  onChange={setEmployees}
+                  options={employeeOptions}
+                  allLabel={t('app.dashboard.filter.all')}
+                  summaryLabel={(count) => t('app.hours.selected', { count })}
+                  emptyText={t('app.hours.noEmployees')}
+                />
+              </div>
             ) : null}
           </div>
         ) : null}
@@ -358,112 +291,39 @@ export default function UtmPage() {
             <LoadingBlock label={t('app.loading')} />
           )
         ) : (
-          <div className="flex flex-col gap-4 sm:gap-5" aria-busy={report.pending}>
-            <div className={report.pending ? 'ca-viz-dim' : undefined}>
-              <div className="flex flex-col gap-4 sm:gap-5">
-                <Section title={t('app.utm.summary')}>
-                  <UtmSummaryStrip
-                    totals={view.totals}
-                    amounts={data.amounts}
-                    locale={locale}
-                    t={t}
-                  />
-                </Section>
-
-                <Section title={t('app.utm.trend')}>
-                  <UtmTrend days={data.days} locale={locale} t={t} />
-                  <p className="ca-utm-note" role="note">
-                    {t('app.utm.trendNote')}
-                  </p>
-                </Section>
-
-                <div className="grid gap-4 sm:gap-5 [grid-template-columns:repeat(auto-fit,minmax(340px,1fr))]">
-                  <Section title={t('app.utm.ranking', { dimension: groupLabel })}>
-                    <div className="mb-3 flex flex-wrap items-end gap-3">
-                      <SegmentedControl<Dimension>
-                        label={t('app.utm.groupBy')}
-                        value={groupBy}
-                        onChange={setGroupBy}
-                        options={DIMENSIONS.filter((dimension) =>
-                          data.dimensions.includes(dimension),
-                        )
-                          .slice(0, 5)
-                          .map((dimension) => ({
-                            value: dimension,
-                            label: t(`app.utm.short.${dimension}`),
-                          }))}
-                      />
-                      <SegmentedControl<BarMode>
-                        label={t('app.utm.measure')}
-                        value={mode}
-                        onChange={setMode}
-                        options={[
-                          { value: 'volume', label: t('app.utm.measureVolume') },
-                          { value: 'conversion', label: t('app.utm.measureConversion') },
-                        ]}
-                      />
-                    </div>
-                    <UtmSourceBars
-                      buckets={view.buckets}
-                      sentinels={data.buckets}
-                      mode={mode}
-                      locale={locale}
-                      t={t}
-                    />
-                  </Section>
-
-                  <Section title={t('app.utm.matrix')}>
-                    <UtmMatrix
-                      matrix={view.matrix}
-                      sentinels={data.buckets}
-                      rowLabel={t('app.utm.short.utm_source')}
-                      columnLabel={t('app.utm.short.utm_medium')}
-                      locale={locale}
-                      t={t}
-                    />
-                  </Section>
-                </div>
-
-                <Section title={t('app.utm.funnel', { dimension: groupLabel })}>
-                  <label className="ca-utm-toggle mb-3">
-                    <input
-                      type="checkbox"
-                      checked={showPercent}
-                      onChange={(event) => setShowPercent(event.target.checked)}
-                    />
-                    <span>{t('app.utm.showPercent')}</span>
-                  </label>
-                  <UtmTable
-                    buckets={view.buckets}
-                    totals={view.totals}
-                    sentinels={data.buckets}
-                    amounts={data.amounts}
-                    dimensionLabel={groupLabel}
-                    locale={locale}
-                    t={t}
-                    showPercent={showPercent}
-                  />
-                </Section>
+          <div className="flex flex-col gap-3" aria-busy={report.pending}>
+            <section
+              className={`ca-card min-w-0 px-4 py-4 sm:px-6 sm:py-5${report.pending ? ' ca-viz-dim' : ''}`}
+            >
+              <div className="mb-3">
+                <SegmentedControl<Dimension>
+                  label={t('app.utm.groupBy')}
+                  value={groupBy}
+                  onChange={setGroupBy}
+                  options={DIMENSIONS.filter((dimension) => data.dimensions.includes(dimension)).map(
+                    (dimension) => ({ value: dimension, label: t(`app.utm.short.${dimension}`) }),
+                  )}
+                  className="min-w-0 max-w-full"
+                />
               </div>
-            </div>
+              <UtmTable
+                buckets={view.buckets}
+                totals={view.totals}
+                sentinels={data.buckets}
+                dimensionLabel={t(`app.utm.short.${groupBy}`)}
+                dimensionTitle={t(dimensionKey(groupBy))}
+                leadsAvailable={data.scan.leads.available}
+                locale={locale}
+                t={t}
+              />
+            </section>
 
-            {/* The two sentences without which this page is misread, in the order a reader
-                meets the numbers they explain. */}
+            {/* The sentences without which this table is misread. The second explains a
+                column that is only drawn when the portal has leads. */}
             <p className="ca-utm-note" role="note">
-              {t('app.utm.attributionNote')}
+              {t('app.utm.tableNote')}
+              {data.scan.leads.available ? ` ${t('app.utm.ratioNote')}` : null}
             </p>
-            <p className="ca-utm-note" role="note">
-              {t('app.utm.snapshotNote')}
-            </p>
-            {data.amounts.trusted ? (
-              <p className="ca-utm-note" role="note">
-                {t('app.utm.amountNote', { currency: data.amounts.currency })}
-              </p>
-            ) : (
-              <p className="ca-utm-note" role="status">
-                {t('app.utm.currencyMixed', { currencies: data.amounts.currencies.join(', ') })}
-              </p>
-            )}
 
             {scan && !scan.leads.available ? (
               <p className="ca-utm-note" role="status">
@@ -515,8 +375,8 @@ interface UtmResource {
  * failure is a real answer.
  *
  * **The dependency list is the feature.** `query` depends on the period and the employees and
- * on nothing else, so every tag control on the page re-renders a `useMemo` instead of
- * spending a live CRM scan.
+ * on nothing else, so switching the grouping tag re-renders a `useMemo` instead of spending
+ * a live CRM scan.
  */
 function useUtm(
   filters: DashboardFilters | null,

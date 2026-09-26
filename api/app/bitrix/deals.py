@@ -26,31 +26,25 @@ rather than an error:
 ---------------------------------------------------------------------------------------
 
 **Why two dialects at all.** `crm.deal.*` is officially discontinued for new development in
-favour of `crm.item.*` with `entityTypeId = 2`, and - decisively for this page - `logic: "OR"`
-filter grouping is documented ONLY for `crm.item.list`. Owner decision 3 asks for deals whose
-creation OR modification OR closing falls in the period, which `crm.item.list` answers in ONE
-paged query and `crm.deal.list` cannot answer at all: its filter keys are strictly AND-ed, so
-the same question costs three independent paged scans deduped by id. The fallback exists only
-for builds that answer `ERROR_METHOD_NOT_FOUND`, and it is entered by the typed
-`errors.MethodNotFound` - never by a version number, which no response carries.
+favour of `crm.item.*` with `entityTypeId = 2`, so the universal method is the primary path.
+The fallback exists only for builds that answer `ERROR_METHOD_NOT_FOUND`, and it is entered by
+the typed `errors.MethodNotFound` - never by a version number, which no response carries.
 
-**Why `closed` + `movedTime` and not `CLOSEDATE`.** `CLOSEDATE` reads like "when the deal
-closed" and is not that: `crm.deal.fields` declares it `{"type": "date", "isReadOnly": false}`
-- the deal's *declared* end of its date range, pre-filled at creation and editable by anyone
-who can edit the deal. A back-dated value would pull years-old deals into a one-week report
-and a forward-dated one would hide a deal that closed yesterday. The read-only pair the
-platform maintains is `closed` ("Y"/"N") together with `movedTime`, the moment the deal last
-changed stage - which for a closed deal is when it was closed.
+**Why creation time alone.** Owner decision 3 (changed 2026-09-26) puts a deal in the period
+it was CREATED in, whatever happened to it afterwards. The earlier rule also counted deals
+modified or closed in the period. That took a `logic: "OR"` group, documented only for
+`crm.item.list`, and cost the fallback three paged scans deduped by id. `>=createdTime` AND
+`<createdTime` is two flat keys that every list method has always honoured, so both dialects
+now cost one selection.
 
-**Why the honour probe.** Of the field names this module sends, only `createdTime` is
-confirmed by a retrieved doc; `updatedTime`, `movedTime`, `closed` and `stageSemanticId` are
-inferred from the documented camelCase mapping. That would be a tolerable risk if an unknown
-filter key were an error - but Bitrix24 may instead **ignore** it, and an ignored key inside
-the OR group silently widens the union to "created in the period OR everything", producing a
-report that is plausible, larger than the truth, and wrong with no symptom anywhere.
-`honour_probe_commands` therefore asks the server three questions whose answers are known in
-advance, in the EXACT nested shape production uses, so that a build which drops the field name
-*or* the `logic` grouping is demoted to the `deal` dialect instead of being believed.
+**Why the honour probe.** `createdTime` is confirmed by a retrieved doc, but Bitrix24 may
+**ignore** a filter key it does not apply rather than refuse it. An ignored `>=createdTime`
+deletes the period outright: the selection becomes every deal the viewer can see. On a large
+portal that surfaces as `deal_scan_too_large`; on a small one it is a 200 - a lifetime report
+with a one-month range printed above it, internally consistent in every cell, and wrong.
+`honour_probe_commands` therefore asks the server a question whose answer is known in advance,
+in the EXACT shape production sends, so that a build which drops the key is demoted to the
+`deal` dialect instead of being believed.
 """
 
 from __future__ import annotations
@@ -96,8 +90,7 @@ __all__ = [
     "parse_deal_rows",
     "parse_funnels",
     "parse_stages",
-    "period_leg_filters",
-    "period_or_filter",
+    "period_filter",
     "stage_entity_id",
     "stage_key",
     "status_commands",
@@ -138,7 +131,7 @@ ME_KEY: Final[str] = "me"
 CATEGORIES_KEY: Final[str] = "cats"
 FIELDS_KEY: Final[str] = "flds"
 PREFLIGHT_KEY: Final[str] = "pre"
-HONOUR_KEYS: Final[tuple[str, str, str]] = ("hp0", "hp1", "hp2")
+HONOUR_KEYS: Final[tuple[str, str]] = ("hp0", "hp1")
 
 #: A date far enough ahead that no real deal can be at or past it, used by the honour
 #: probe. Deliberately not derived from the clock: `Date.now()` in a builder would make the
@@ -163,9 +156,6 @@ class Dialect:
     assigned_by_id: str
     semantic: str
     created: str
-    updated: str
-    moved: str
-    closed: str
     #: True when the method takes `entityTypeId` and wraps its rows in `result.items`.
     universal: bool
 
@@ -179,9 +169,6 @@ ITEM_DIALECT: Final[Dialect] = Dialect(
     assigned_by_id="assignedById",
     semantic="stageSemanticId",
     created="createdTime",
-    updated="updatedTime",
-    moved="movedTime",
-    closed="closed",
     universal=True,
 )
 
@@ -194,9 +181,6 @@ DEAL_DIALECT: Final[Dialect] = Dialect(
     assigned_by_id="ASSIGNED_BY_ID",
     semantic="STAGE_SEMANTIC_ID",
     created="DATE_CREATE",
-    updated="DATE_MODIFY",
-    moved="MOVED_TIME",
-    closed="CLOSED",
     universal=False,
 )
 
@@ -317,25 +301,17 @@ def status_key(category_id: int) -> str:
     return f"st{category_id}"
 
 
-def page_key(start: int, stream: int = 0) -> str:
-    """Batch key for one deal page: `pre`, `p0x50`, `p1x0`...
+def page_key(start: int) -> str:
+    """Batch key for one deal page: `pre`, `p50`, `p100`...
 
-    `stream` exists for the `deal` dialect alone. That method has no OR, so owner decision
-    3 becomes three independent paged selections in the same batches, and three pages that
-    all start at 0 would otherwise collide on one key - which `BitrixClient.batch` rejects
-    outright rather than silently overwriting, but only after the report was already built
-    wrong in the caller's head.
-
-    Stream 0's first page keeps the bare `pre` key it was requested under in the preflight
-    batch, so the common single-stream report reads in `rest_log` exactly as §4.12 spells it.
+    The first page keeps the bare `pre` key it was requested under in the preflight batch,
+    so a report reads in `rest_log` exactly as §4.12 spells it.
     """
     if start < 0 or start % DEAL_PAGE_SIZE:
         raise ValueError(f"deal page start must be a non-negative multiple of {DEAL_PAGE_SIZE}")
-    if stream < 0:
-        raise ValueError("deal page stream must be non-negative")
-    if start == 0 and stream == 0:
+    if start == 0:
         return PREFLIGHT_KEY
-    return f"p{stream}x{start}"
+    return f"p{start}"
 
 
 def stage_key(category_id: int, status_id: str) -> str:
@@ -362,8 +338,7 @@ def fields_command() -> tuple[str, str, dict[str, Any]]:
 
     One nested command inside a batch that is being sent anyway. It proves a field NAME
     exists; `honour_probe_commands` proves the filter is actually APPLIED. Neither is
-    sufficient alone: a name can exist and still be ignored inside a `logic` group on a
-    build that does not implement grouping.
+    sufficient alone: a name can exist and still be ignored as a filter key.
     """
     return (FIELDS_KEY, CRM_ITEM_FIELDS, {"entityTypeId": DEAL_ENTITY_TYPE_ID})
 
@@ -413,63 +388,15 @@ def status_commands(
 # --- list commands ---------------------------------------------------------------------
 
 
-def _leg_created(dialect: Dialect, start_iso: str, end_iso: str) -> dict[str, Any]:
+def period_filter(dialect: Dialect, *, start_iso: str, end_iso: str) -> dict[str, Any]:
+    """Owner decision 3 as ONE flat filter: deals CREATED inside the window, and no others.
+
+    A deal modified or closed in the period but created before it does not count, and one
+    created in the period counts whatever happened to it afterwards. Bounds are half-open
+    (`>=start`, `<end`), so a deal created at midnight on the last day belongs to exactly one
+    period and the second-versus-millisecond boundary argument never arises.
+    """
     return {f">={dialect.created}": start_iso, f"<{dialect.created}": end_iso}
-
-
-def _leg_updated(dialect: Dialect, start_iso: str, end_iso: str) -> dict[str, Any]:
-    return {f">={dialect.updated}": start_iso, f"<{dialect.updated}": end_iso}
-
-
-def _leg_closed(dialect: Dialect, start_iso: str, end_iso: str) -> dict[str, Any]:
-    """Deals that were CLOSED in the window - `closed = "Y"` plus `movedTime` in range.
-
-    Not `CLOSEDATE`; see the module docblock. `movedTime` is the moment the deal last
-    changed stage, and for a deal that is closed now, that is when it was closed.
-    """
-    return {
-        f"={dialect.closed}": "Y",
-        f">={dialect.moved}": start_iso,
-        f"<{dialect.moved}": end_iso,
-    }
-
-
-def period_or_filter(dialect: Dialect, *, start_iso: str, end_iso: str) -> dict[str, Any]:
-    """Owner decision 3 as ONE filter: created OR modified OR closed inside the window.
-
-    The nested numeric-keyed group carrying a `logic` member is Bitrix24's own documented
-    shape for exactly this question, and it exists only on `crm.item.list`. Bounds are
-    half-open (`>=start`, `<end`) rather than closed, which is how the official example
-    writes it and which sidesteps the whole second-versus-millisecond boundary argument.
-
-    The client flattens this to `filter[0][logic]` and `filter[0][0][>=createdTime]` at
-    depth 3, well inside `_MAX_PARAM_DEPTH`, so no client change is needed.
-    """
-    return {
-        "0": {
-            "logic": "OR",
-            "0": _leg_created(dialect, start_iso, end_iso),
-            "1": _leg_updated(dialect, start_iso, end_iso),
-            "2": _leg_closed(dialect, start_iso, end_iso),
-        }
-    }
-
-
-def period_leg_filters(
-    dialect: Dialect, *, start_iso: str, end_iso: str
-) -> tuple[dict[str, Any], ...]:
-    """The same union as three independent filters - the `crm.deal.list` fallback.
-
-    Every key of a `crm.deal.list` filter is AND-ed and there is no documented OR, so the
-    union costs three paged scans whose results are deduped by id. Roughly three times the
-    requests and three times the operating time, which is exactly why the `item` dialect is
-    the primary path and this one is entered only on `MethodNotFound`.
-    """
-    return (
-        _leg_created(dialect, start_iso, end_iso),
-        _leg_updated(dialect, start_iso, end_iso),
-        _leg_closed(dialect, start_iso, end_iso),
-    )
 
 
 def _select(dialect: Dialect) -> list[str]:
@@ -498,10 +425,11 @@ def _list_params(
 ) -> dict[str, Any]:
     """One page request, in this dialect's spelling.
 
-    `order` by id ascending is what makes offset paging as stable as it can be here: the
-    selection includes modification time, so a deal edited mid-scan can shift later pages,
-    and a stable ascending key turns that into a possible one-row undercount rather than a
-    duplicate.
+    `order` by id ascending is what makes offset paging as stable as it can be here. The
+    selection filters on creation time, which no edit changes, so an ordinary edit cannot
+    move a deal between pages. A deletion mid-scan still can, and so can a reassignment when
+    `@assignedById` narrows the selection; the stable key and the fold's dedup by id turn
+    either into a possible one-row undercount, never a double count.
     """
     params: dict[str, Any] = dict(filter_)
     if assigned_to:
@@ -523,7 +451,6 @@ def list_page_commands(
     filter_: dict[str, Any],
     starts: Sequence[int],
     assigned_to: Sequence[int] = (),
-    stream: int = 0,
 ) -> list[tuple[str, str, dict[str, Any]]]:
     """Page requests for the given offsets, ready to pack into one batch.
 
@@ -533,7 +460,7 @@ def list_page_commands(
     """
     return [
         (
-            page_key(start, stream),
+            page_key(start),
             dialect.method,
             _list_params(dialect, filter_=filter_, start=start, assigned_to=assigned_to),
         )
@@ -542,59 +469,28 @@ def list_page_commands(
 
 
 def honour_probe_commands(dialect: Dialect) -> list[tuple[str, str, dict[str, Any]]]:
-    """Three questions whose answers are known, in the EXACT shape production sends.
+    """Two questions whose answers are known, in the EXACT shape production sends.
 
     `hp0` is unfiltered and establishes that this viewer can see anything at all - without
-    it a zero from `hp1`/`hp2` proves nothing, because a viewer with no readable deals
-    returns zero for every filter.
+    it a zero from `hp1` proves nothing, because a viewer with no readable deals returns
+    zero for every filter.
 
-    `hp1` and `hp2` are **nested `logic: "OR"` groups**, not flat filters, and that is the
-    point. Two failures are possible and independent: the build may not know the field name,
-    or it may not implement `logic` grouping and treat `filter["0"]` as one more unknown
-    key. A flat probe detects only the first, and the second is the more dangerous - it
-    discards the entire union and answers as if no date filter had been sent at all.
-
-    Both ask for deals at or past the year 2999, so an honoured filter answers zero and any
-    non-zero total means something in the filter was dropped.
+    `hp1` asks for deals created at or past the year 2999, as the same flat key
+    `period_filter` sends. No deal can be: an honoured filter answers zero, and any non-zero
+    total means the key was dropped - which on this page deletes the period rather than
+    narrowing it.
     """
-    never = _NEVER_ISO
     return [
         (HONOUR_KEYS[0], dialect.method, _list_params(dialect, filter_={}, start=0)),
         (
             HONOUR_KEYS[1],
             dialect.method,
-            _list_params(
-                dialect,
-                filter_={
-                    "0": {
-                        "logic": "OR",
-                        "0": {f">={dialect.created}": never},
-                        "1": {f">={dialect.updated}": never},
-                    }
-                },
-                start=0,
-            ),
-        ),
-        (
-            HONOUR_KEYS[2],
-            dialect.method,
-            _list_params(
-                dialect,
-                filter_={
-                    "0": {
-                        "logic": "OR",
-                        "0": {f"={dialect.closed}": "Y", f">={dialect.moved}": never},
-                    }
-                },
-                start=0,
-            ),
+            _list_params(dialect, filter_={f">={dialect.created}": _NEVER_ISO}, start=0),
         ),
     ]
 
 
-def honour_verdict(
-    *, baseline: int | None, future_dates: int | None, future_closed: int | None
-) -> bool | None:
+def honour_verdict(*, baseline: int | None, future: int | None) -> bool | None:
     """`True` honoured, `False` demote to the fallback dialect, `None` inconclusive.
 
     `None` is returned when the baseline is zero or unknown, and the caller MUST NOT cache
@@ -605,9 +501,9 @@ def honour_verdict(
     """
     if baseline is None or baseline <= 0:
         return None
-    if future_dates is None or future_closed is None:
+    if future is None:
         return None
-    return future_dates == 0 and future_closed == 0
+    return future == 0
 
 
 # --- parsers ----------------------------------------------------------------------------
@@ -617,7 +513,7 @@ def field_names_present(fields_result: Any, names: Sequence[str]) -> set[str]:
     """Which of `names` `crm.item.fields` actually declares.
 
     The result is a map of field name to metadata. A name missing from it is a name this
-    build does not have, which is one of the two ways the union can silently widen.
+    build does not have, which is one of the two ways the period can silently vanish.
     """
     if not isinstance(fields_result, Mapping):
         return set()

@@ -10,10 +10,13 @@ downstream can catch:
 * **A bare stage code colliding across funnels.** `STATUS_ID` uniqueness is documented as
   limited to its own directory, and the default funnel's codes are unprefixed, so keying a
   column on the code alone silently merges two funnels' numbers.
-* **The union filter being ignored rather than refused.** If a build drops an unknown field
-  name - or the `logic` grouping itself - the selection widens to "everything" and the
-  report is simply too big, with every number internally consistent. `honour_verdict` is
-  the guard, and its *inconclusive* case matters as much as its negative one.
+* **The period filter being ignored rather than refused.** If a build drops the
+  `createdTime` key, the selection becomes every deal the viewer can see and the report is
+  simply too big, with every number internally consistent. `honour_verdict` is the guard,
+  and its *inconclusive* case matters as much as its negative one.
+* **A deal counted for a period it was not created in.** Owner decision 3 counts creation
+  alone; a filter that also matched modification or closing would quietly pull old deals
+  into every report.
 * **A deal whose stage the dictionary does not name.** Dropping it would make a row's
   `total` disagree with the sum of its own cells, which is the one discrepancy a reader can
   see and cannot explain.
@@ -23,9 +26,12 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from app.bitrix.deals import (
     DEAL_DIALECT,
     ITEM_DIALECT,
+    Dialect,
     as_int,
     honour_probe_commands,
     honour_verdict,
@@ -34,8 +40,7 @@ from app.bitrix.deals import (
     page_key,
     parse_funnels,
     parse_stages,
-    period_leg_filters,
-    period_or_filter,
+    period_filter,
     stage_entity_id,
     stage_key,
     status_commands,
@@ -67,35 +72,25 @@ def test_status_command_carries_the_entity_id_the_funnel_needs() -> None:
     assert commands[0][2]["order"] == {"SORT": "ASC"}
 
 
-def test_page_keys_are_unique_per_stream() -> None:
-    """The fallback dialect runs three selections; three page-0s must not collide."""
-    assert page_key(0, 0) == "pre"
-    assert page_key(0, 1) != page_key(0, 0)
-    assert page_key(50, 1) != page_key(50, 2)
-    assert len({page_key(start, stream) for stream in range(3) for start in (0, 50, 100)}) == 9
+def test_page_keys_are_unique_and_the_first_is_the_preflight() -> None:
+    assert page_key(0) == "pre"
+    assert len({page_key(start) for start in (0, 50, 100)}) == 3
+    with pytest.raises(ValueError):
+        page_key(17)
 
 
 # --- the period filter --------------------------------------------------------------------
 
 
-def test_or_filter_unions_three_legs_and_uses_the_read_only_closed_pair() -> None:
-    """Owner decision 3, and NOT `CLOSEDATE` - which is a writable planned date."""
-    group = period_or_filter(ITEM_DIALECT, start_iso=START, end_iso=END)["0"]
-    assert group["logic"] == "OR"
-    assert group["0"] == {">=createdTime": START, "<createdTime": END}
-    assert group["1"] == {">=updatedTime": START, "<updatedTime": END}
-    assert group["2"] == {"=closed": "Y", ">=movedTime": START, "<movedTime": END}
-    flat = repr(group)
-    assert "closeDate" not in flat and "CLOSEDATE" not in flat
-
-
-def test_fallback_dialect_expresses_the_union_as_three_filters() -> None:
-    legs = period_leg_filters(DEAL_DIALECT, start_iso=START, end_iso=END)
-    assert len(legs) == 3
-    assert legs[0] == {">=DATE_CREATE": START, "<DATE_CREATE": END}
-    assert legs[2]["=CLOSED"] == "Y"
-    # No `logic` anywhere: `crm.deal.list` has none, and sending one would be ignored.
-    assert all("logic" not in repr(leg) for leg in legs)
+@pytest.mark.parametrize(
+    ("dialect", "created"), [(ITEM_DIALECT, "createdTime"), (DEAL_DIALECT, "DATE_CREATE")]
+)
+def test_the_period_is_creation_time_and_nothing_else(dialect: Dialect, created: str) -> None:
+    """Owner decision 3: a deal modified or closed in the period but created before it is out."""
+    assert period_filter(dialect, start_iso=START, end_iso=END) == {
+        f">={created}": START,
+        f"<{created}": END,
+    }
 
 
 def test_select_never_asks_for_customer_content() -> None:
@@ -113,24 +108,22 @@ def test_employee_filter_is_server_side() -> None:
 # --- the honour probe ----------------------------------------------------------------------
 
 
-def test_honour_probe_exercises_the_nested_logic_shape() -> None:
-    """A flat probe would miss a build that drops `logic` grouping - the worse failure."""
+def test_honour_probe_asks_the_same_flat_key_the_period_sends() -> None:
+    """A probe in any other shape could pass on a build that drops the real filter."""
     commands = honour_probe_commands(ITEM_DIALECT)
-    assert [key for key, _, _ in commands] == ["hp0", "hp1", "hp2"]
+    assert [key for key, _, _ in commands] == ["hp0", "hp1"]
     assert commands[0][2]["filter"] == {}
-    for _, _, params in commands[1:]:
-        assert params["filter"]["0"]["logic"] == "OR"
+    assert commands[1][2]["filter"] == {">=createdTime": "2999-01-01T00:00:00+00:00"}
 
 
 def test_honour_verdict_is_inconclusive_when_the_viewer_sees_nothing() -> None:
     """A zero baseline proves nothing, and caching it would pin an untested verdict."""
-    assert honour_verdict(baseline=0, future_dates=0, future_closed=0) is None
-    assert honour_verdict(baseline=None, future_dates=0, future_closed=0) is None
-    assert honour_verdict(baseline=5, future_dates=0, future_closed=0) is True
+    assert honour_verdict(baseline=0, future=0) is None
+    assert honour_verdict(baseline=None, future=0) is None
+    assert honour_verdict(baseline=5, future=0) is True
     # A filter that was ignored returns rows from the year 2999 that cannot exist.
-    assert honour_verdict(baseline=5, future_dates=5, future_closed=0) is False
-    assert honour_verdict(baseline=5, future_dates=0, future_closed=5) is False
-    assert honour_verdict(baseline=5, future_dates=None, future_closed=0) is None
+    assert honour_verdict(baseline=5, future=5) is False
+    assert honour_verdict(baseline=5, future=None) is None
 
 
 # --- scalars ---------------------------------------------------------------------------------

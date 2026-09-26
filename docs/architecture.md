@@ -807,8 +807,9 @@ rows of its own.
 1. Stage columns come from the portal (`crm.status.list`); nothing about the reference
    report's stage names is hardcoded, because the app is mass-market.
 2. Rows group by funnel (`CATEGORY_ID`).
-3. A deal counts if it was **created, modified or closed** inside the period; the operator
-   is `ASSIGNED_BY_ID`.
+3. A deal counts if it was **created** inside the period; the operator is `ASSIGNED_BY_ID`.
+   *Changed by the owner 2026-09-26: a deal modified or closed in the period but created
+   before it no longer counts. It was "created, modified or closed" until then.*
 4. ~~**Nothing is stored** — no table, no migration, no sync phase.~~ *Superseded
    2026-09-14 by the CRM mirror (decision 26, §4.14). Until a portal is switched to the
    mirror, this section describes the live read it still serves.*
@@ -846,34 +847,28 @@ an administrator, a team lead and a salesperson alike.
 
 | | Primary | Fallback (on `errors.MethodNotFound`) |
 |---|---|---|
-| List | `crm.item.list` `entityTypeId=2`, `result.items`, camelCase | `crm.deal.list` × 3 selections, bare array, UPPER_CASE |
+| List | `crm.item.list` `entityTypeId=2`, `result.items`, camelCase | `crm.deal.list`, bare array, UPPER_CASE |
 | Dictionary | `crm.category.list` + `crm.status.list` | `crm.dealcategory.list` + `crm.dealcategory.stage.list` |
 
-`crm.deal.*` is officially discontinued for new development, and — decisively — `logic: "OR"`
-filter grouping is documented **only** for `crm.item.list`. Constraint 3 is therefore ONE
-paged query on the primary path and three deduped selections on the fallback. Never gate on a
-version number; the only detector is the typed error.
+`crm.deal.*` is officially discontinued for new development, so the universal method is the
+primary path. Constraint 3 is two flat keys that every list method honours, so both paths cost
+one paged selection. Never gate on a version number; the only detector is the typed error.
 
-**The period filter** (`closed` + `movedTime`, never `CLOSEDATE` — which is a writable
-*planned* end date, so a back-dated value would pull years-old deals into a one-week report):
+**The period filter** is creation time alone (`DATE_CREATE` on the fallback):
 
 ```json
-{"0": {"logic": "OR",
-       "0": {">=createdTime": "<startISO>", "<createdTime": "<endISO>"},
-       "1": {">=updatedTime": "<startISO>", "<updatedTime": "<endISO>"},
-       "2": {"=closed": "Y", ">=movedTime": "<startISO>", "<movedTime": "<endISO>"}}}
+{">=createdTime": "<startISO>", "<createdTime": "<endISO>"}
 ```
 
 Bounds carry an **explicit offset**: a bare date is read in the *portal's* zone while this app
 computes its period in the viewer's, which is the normal case.
 
-**The honour probe.** Only `createdTime` is confirmed by a retrieved doc; the rest are
-inferred. An unknown filter key may be **ignored** rather than refused, which silently widens
-the union to "created in the period OR everything" — a report that is plausible, larger than
-the truth, and wrong with no symptom. `crm.item.fields` proves a name exists; three probe
-commands in the **exact nested `logic` shape** prove the filter is applied. A verdict is
-cached only when the unfiltered baseline is non-zero: a viewer who can see no deals proves
-nothing about the build.
+**The honour probe.** An unsupported filter key may be **ignored** rather than refused, and an
+ignored `>=createdTime` deletes the period outright: the selection becomes every deal the
+viewer can see — a report that is plausible, larger than the truth, and wrong with no symptom.
+`crm.item.fields` proves the name exists; a year-2999 probe in the **exact flat shape the
+period sends** proves the filter is applied. A verdict is cached only when the unfiltered
+baseline is non-zero: a viewer who can see no deals proves nothing about the build.
 
 `ENTITY_ID` is `DEAL_STAGE` for funnel 0 and `DEAL_STAGE_<id>` otherwise. **`DEAL_STAGE_0`
 returns an empty list with no error** — a silent zero-column funnel, caught only by the unit
@@ -1297,7 +1292,7 @@ Terminal states set `token_status` and `next_run_at='infinity'`: OAuth `invalid_
 - **Celery swap**: add `jobs/celery_backend.py` where beat schedules the same periodic names and a task wraps each definition; set `JOB_BACKEND=celery`. Job functions, tables, cursors, lease and fencing are unchanged.
 
 ### 5.10 CRM mirror: lanes and budgets (decision 26; built from milestone M4)
-- **Lanes** per portal, each with its own due time, cursor and failure state, all inside the one portal lease: `dict` (funnels, stages, field maps, hourly), `window` (a 366-day bootstrap of the deals' created ∨ updated ∨ closed-and-moved legs, newest window first, so a report is correct before the full history lands), `backfill` (disjoint id ranges newest first, each walked by the keyset `>id`, ascending, `start:-1`), `sweep` (`>=updatedTime` from the server-clock watermark minus an overlap, keyset inside; the value sent is moved by the filter shift `sync/crm_clock.py` measures per portal, because Bitrix24 reads a datetime filter in the token user's zone, spike S-A.10), `history` (`crm.stagehistory.list` keyset `>ID` plus a trailing `CREATED_TIME` window), `signals` and `dirty` (§5.11), `reconcile` and `patrol` (§5.12). A park, a 429 or a crash on one lane never moves another lane or the call sync.
+- **Lanes** per portal, each with its own due time, cursor and failure state, all inside the one portal lease: `dict` (funnels, stages, field maps, hourly), `window` (a 366-day bootstrap of the deals created in it, newest window first, so a report is correct before the full history lands), `backfill` (disjoint id ranges newest first, each walked by the keyset `>id`, ascending, `start:-1`), `sweep` (`>=updatedTime` from the server-clock watermark minus an overlap, keyset inside; the value sent is moved by the filter shift `sync/crm_clock.py` measures per portal, because Bitrix24 reads a datetime filter in the token user's zone, spike S-A.10), `history` (`crm.stagehistory.list` keyset `>ID` plus a trailing `CREATED_TIME` window), `signals` and `dirty` (§5.11), `reconcile` and `patrol` (§5.12). A park, a 429 or a crash on one lane never moves another lane or the call sync.
 - **Built so far** (milestones M4b and M7), run in `jobs/definitions.py` after the statistics phases and before the employee refresh, so assignees get names in the same visit:
   - `dict`;
   - `deal.sweep` / `lead.sweep`;

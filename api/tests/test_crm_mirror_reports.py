@@ -6,11 +6,12 @@ fold the same rows twice: once through the live `_fold` the POST path runs on Bi
 and once into `crm_items` through the worker's own parser and upsert and back out through the
 mirror SQL. Then the two wire bodies are compared whole.
 
-The rows are chosen to exercise what a plausible-but-wrong mirror would get wrong: the three
-legs of the deal period, a closed flag without which the third leg must not match, a tombstone,
-the explicit-P quirk G0 Q3 keeps until cutover, a stage the dictionary does not know, an amount
-that rounds, a record without one, a tag longer than the cut, and a creation time that falls on
-the next local day in the viewer's zone.
+The rows are chosen to exercise what a plausible-but-wrong mirror would get wrong: a deal
+created in the period and closed after it (counted), deals modified or closed in the period but
+created before it (not counted - the deal period is creation time alone), a tombstone, the
+explicit-P quirk G0 Q3 keeps until cutover, a stage the dictionary does not know, an amount that
+rounds, a record without one, a tag longer than the cut, and a creation time that falls on the
+next local day in the viewer's zone.
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ TZ = "Asia/Tashkent"
 JUNE = QueryParams({"period": "custom", "from": "2026-06-01", "to": "2026-06-30"})
 IN = "2026-06-10T12:00:00+05:00"
 BEFORE = "2026-05-10T12:00:00+05:00"
+AFTER = "2026-07-10T12:00:00+05:00"
 
 _FUNNELS: tuple[tuple[int, str, int, bool], ...] = (
     (GROW, "Grow Dermozil", 100, False),
@@ -292,21 +294,27 @@ def deal_rows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         deal(1, category=GROW, stage="C7:NEW", user=VIEWER),
         # The explicit-P quirk: the deal says in progress, its stage says won.
         deal(2, category=GROW, stage="C7:WON", user=VIEWER),
-        # Only modified in June.
-        deal(3, category=GROW, stage="C7:LOSE", user=OTHER, semantic="F", createdTime=BEFORE,
-             movedTime=BEFORE),
-        # Only closed in June, and nobody's.
-        deal(4, category=DEFAULT_FUNNEL, stage="WON", user=0, semantic="S", createdTime=BEFORE,
-             updatedTime=BEFORE, closed="Y"),
         # A stage the dictionary has never heard of.
         deal(5, category=DEFAULT_FUNNEL, stage="MYSTERY", user=OTHER),
         # A stage the dictionary lane stopped seeing, whose stored outcome must not be used.
         deal(6, category=GROW, stage="C7:OLD", user=VIEWER),
+        # Created in June and closed in July: still June's, and nobody's.
+        deal(10, category=DEFAULT_FUNNEL, stage="WON", user=0, semantic="S", updatedTime=AFTER,
+             movedTime=AFTER, closed="Y"),
+        # Created in June, lost and edited in July: still June's.
+        deal(11, category=GROW, stage="C7:LOSE", user=OTHER, semantic="F", updatedTime=AFTER,
+             movedTime=AFTER, closed="Y"),
     ]
     unselected = [
         deal(7, category=GROW, stage="C7:NEW", user=VIEWER, createdTime=BEFORE, updatedTime=BEFORE,
              movedTime=BEFORE),
-        # Moved in June but not closed: the third leg needs both.
+        # Only modified in June: the period is creation time alone.
+        deal(3, category=GROW, stage="C7:LOSE", user=OTHER, semantic="F", createdTime=BEFORE,
+             movedTime=BEFORE),
+        # Only closed in June.
+        deal(4, category=DEFAULT_FUNNEL, stage="WON", user=0, semantic="S", createdTime=BEFORE,
+             updatedTime=BEFORE, closed="Y"),
+        # Moved in June but neither created nor closed in it.
         deal(8, category=GROW, stage="C7:LOSE", user=VIEWER, semantic="F", createdTime=BEFORE,
              updatedTime=BEFORE),
     ]

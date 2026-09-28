@@ -51,8 +51,13 @@ import DealStageTable, {
   type StageColumn,
 } from '@/components/DealStageTable';
 import {
+  appendPeriod,
   defaultFilters,
+  PERIOD_PICKER_CLASS,
+  periodValue,
   rangeForPreset,
+  withPeriod,
+  withPreset,
   type DashboardFilters,
   type EmployeeOption,
   type FilterOptions,
@@ -73,7 +78,15 @@ import { VIZ_CSS } from '@/lib/viz';
  * mirror's `GET` answers the same body plus `MirrorReportMeta`.
  */
 interface DealsResponse extends MirrorReportMeta {
-  range: { from: string; to: string; days: number; timezone: string; preset: string };
+  range: {
+    from: string;
+    to: string;
+    from_time: string | null;
+    to_time: string | null;
+    days: number;
+    timezone: string;
+    preset: string;
+  };
   filters: { employees: number[] };
   stages: StageColumn[];
   groups: DealGroup[];
@@ -274,14 +287,7 @@ export default function DealsPage() {
                 <SegmentedControl<'today' | 'd7' | 'd30' | 'custom'>
                   label={t('app.dashboard.period.label')}
                   value={filters.preset}
-                  onChange={(preset) => {
-                    if (preset === 'custom') {
-                      setFilters({ ...filters, preset });
-                      return;
-                    }
-                    const range = rangeForPreset(preset, timezone);
-                    setFilters({ ...filters, preset, from: range.from, to: range.to });
-                  }}
+                  onChange={(preset) => setFilters(withPreset(filters, preset, timezone))}
                   options={(['today', 'd7', 'd30', 'custom'] as const).map((preset) => ({
                     value: preset,
                     label: t(`app.dashboard.period.${preset}`),
@@ -289,16 +295,15 @@ export default function DealsPage() {
                   className="min-w-0 max-w-full"
                 />
                 {filters.preset === 'custom' ? (
-                  <div className="min-w-0 flex-1 basis-[240px] sm:max-w-[360px]">
+                  <div className={`min-w-0 flex-1 ${PERIOD_PICKER_CLASS}`}>
                     <DateRange
-                      value={{ from: filters.from, to: filters.to }}
-                      onChange={(next) =>
-                        setFilters({ ...filters, preset: 'custom', from: next.from, to: next.to })
-                      }
+                      value={periodValue(filters)}
+                      onChange={(next) => setFilters(withPeriod(filters, next))}
                       timeZone={timezone}
                       // Tighter than the other pages on purpose, unless the report reads the
                       // mirror; see the docblock.
                       maxSpanDays={mirror ? MIRROR_MAX_PERIOD_DAYS : MAX_DEAL_PERIOD_DAYS}
+                      withTime
                     />
                   </div>
                 ) : null}
@@ -443,11 +448,7 @@ function useDeals(
     }
     // `period: 'custom'` always, with explicit dates: without it the server silently
     // answers its own default period and the page would describe a range nobody picked.
-    const params = new URLSearchParams({
-      period: 'custom',
-      from: filters.from,
-      to: filters.to,
-    });
+    const params = appendPeriod(new URLSearchParams(), filters);
     // Repeated, not comma-joined: `parse_filters` reads repeated parameters, and a list
     // encoded into one value would arrive as a single unparsable id.
     for (const id of employees) {

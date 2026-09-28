@@ -28,6 +28,12 @@
  *    click takes the decision away mid-selection, and inside an iframe the refetch also
  *    resizes the slider under the pointer.
  *
+ * With `withTime` the footer also carries a start and an end time, so a period can be cut
+ * to the minute ("28 Sep 10:00 - 29 Sep 19:00"). They are still the viewer's wall clock, not
+ * instants, and the end is exclusive, as `services/stats.py::parse_filters` reads it: the
+ * untouched boxes say `00:00` and `24:00`, and a period left at those is a whole-day period
+ * that sends no time at all.
+ *
  * It is a member of the control kit, not a lookalike: the trigger is `Field` + `.ca-control`
  * and the panel is `.ca-pop`, so it shares the label/hint/error frame, the height, the
  * border, the shadow and the open/close animation with `Select` and `Input` instead of
@@ -59,23 +65,38 @@ import {
   addDays,
   addMonths,
   clampIso,
+  DAY_MINUTES,
   endOfMonth,
   fromIso,
   isIsoDate,
+  isIsoTime,
+  minutesToTime,
   monthGrid,
+  parseTime,
   startOfMonth,
   todayIso,
   type IsoDate,
+  type IsoTime,
 } from '@/lib/dates';
 
 import { Field, type FieldControl } from './Field';
 
 // --- public shape ---------------------------------------------------------------------
 
-/** An inclusive calendar period. Both ends are `YYYY-MM-DD` in the viewer's timezone. */
+/**
+ * An inclusive calendar period. Both ends are `YYYY-MM-DD` in the viewer's timezone.
+ *
+ * `fromTime` / `toTime` (only with `withTime`) cut the two ends to a wall-clock minute,
+ * `HH:MM`. Empty or absent is the edge of the day. The start minute is inclusive and the
+ * end minute is EXCLUSIVE, as the API reads them (`services/stats.py::parse_filters`).
+ * Apply hands back one spelling per period: `00:00` at the start and `24:00` at the end
+ * come back empty, and an end at `00:00` comes back as the whole day before it.
+ */
 export interface DateRangeValue {
   from: IsoDate;
   to: IsoDate;
+  fromTime?: IsoTime | '';
+  toTime?: IsoTime | '';
 }
 
 /**
@@ -99,6 +120,18 @@ export interface DateRangeLabels {
   pickEnd?: string;
   /** Shown when the span cap is what limits the reachable days. Default `period.maxDays`. */
   maxSpan?: string;
+  /** Names the row of time boxes. Default `period.time`. */
+  time?: string;
+  /** The start time box. Default `period.timeFrom`. */
+  timeFrom?: string;
+  /** The end time box. Default `period.timeTo`. */
+  timeTo?: string;
+  /** Clears both times back to whole days. Default `period.allDay`. */
+  allDay?: string;
+  /** A time box holds something that is not a time. Default `period.timeInvalid`. */
+  timeInvalid?: string;
+  /** The end is not after the start. Default `period.timeOrder`. */
+  timeOrder?: string;
 }
 
 export interface DateRangeProps {
@@ -124,6 +157,11 @@ export interface DateRangeProps {
   max?: IsoDate;
   /** Inclusive span cap. Default {@link DEFAULT_MAX_SPAN_DAYS}, the server's `MAX_PERIOD_DAYS`. */
   maxSpanDays?: number;
+  /**
+   * Offer a start and an end time under the calendar, so a period can be cut to the minute.
+   * Off by default: the value then carries dates only, exactly as it always did.
+   */
+  withTime?: boolean;
   disabled?: boolean;
   /** Extra classes on the field wrapper, so the caller's grid can size and place it. */
   className?: string;
@@ -213,6 +251,7 @@ export function DateRange({
   min = CALENDAR_FLOOR,
   max,
   maxSpanDays = DEFAULT_MAX_SPAN_DAYS,
+  withTime = false,
   disabled = false,
   className,
   id,
@@ -234,6 +273,12 @@ export function DateRange({
     nextMonth: labelOverrides?.nextMonth ?? t('nextMonth'),
     pickEnd: labelOverrides?.pickEnd ?? t('pickEnd'),
     maxSpan: labelOverrides?.maxSpan ?? t('maxDays', { days: maxSpanDays }),
+    time: labelOverrides?.time ?? t('time'),
+    timeFrom: labelOverrides?.timeFrom ?? t('timeFrom'),
+    timeTo: labelOverrides?.timeTo ?? t('timeTo'),
+    allDay: labelOverrides?.allDay ?? t('allDay'),
+    timeInvalid: labelOverrides?.timeInvalid ?? t('timeInvalid'),
+    timeOrder: labelOverrides?.timeOrder ?? t('timeOrder'),
   };
 
   const today = useMemo(() => todayIso(timeZone), [timeZone]);
@@ -242,16 +287,28 @@ export function DateRange({
 
   // The applied range, made safe: a stale or hand-edited query string reaches this
   // component too, and a control that renders nothing for a bad value is a blank frame.
-  const applied = useMemo<DateRangeValue>(() => {
+  // A time that is not a strict `HH:MM` is dropped to the day edge for the same reason.
+  const applied = useMemo<Required<DateRangeValue>>(() => {
     const from = isIsoDate(value.from) ? clampIso(value.from, lowerLimit, upperLimit) : today;
     const to = isIsoDate(value.to) ? clampIso(value.to, lowerLimit, upperLimit) : from;
-    return to < from ? { from: to, to: from } : { from, to };
-  }, [value.from, value.to, lowerLimit, upperLimit, today]);
+    const fromTime = withTime && isIsoTime(value.fromTime) ? value.fromTime : '';
+    const toTime = withTime && isIsoTime(value.toTime) ? value.toTime : '';
+    return to < from
+      ? { from: to, to: from, fromTime: '', toTime: '' }
+      : { from, to, fromTime, toTime };
+  }, [value.from, value.to, value.fromTime, value.toTime, withTime, lowerLimit, upperLimit, today]);
 
   const [phase, setPhase] = useState<Phase>('closed');
   const [position, setPosition] = useState<PanelPosition | null>(null);
   /** The range being drawn. `to === null` means "a start is chosen, the end is open". */
   const [draft, setDraft] = useState<{ from: IsoDate; to: IsoDate | null }>(applied);
+  /**
+   * The two time boxes, as typed. Text rather than minutes, so a half-typed `9:` is not
+   * rewritten under the cursor; it is read by `parseTime` and tidied on blur.
+   */
+  const [times, setTimes] = useState<{ from: string; to: string }>(() =>
+    displayTimes(applied.fromTime, applied.toTime),
+  );
   const [hover, setHover] = useState<IsoDate | null>(null);
   const [view, setView] = useState<{ month: IsoDate; dir: -1 | 0 | 1 }>({
     month: startOfMonth(applied.from),
@@ -302,13 +359,14 @@ export function DateRange({
       return;
     }
     setDraft({ from: applied.from, to: applied.to });
+    setTimes(displayTimes(applied.fromTime, applied.toTime));
     setView({ month: startOfMonth(applied.from), dir: 0 });
     setFocusDay(applied.from);
     setHover(null);
     setPosition(null);
     wantsDayFocus.current = true;
     setPhase('open');
-  }, [applied.from, applied.to, disabled]);
+  }, [applied.from, applied.to, applied.fromTime, applied.toTime, disabled]);
 
   // The exit animation has to finish before the node goes, so the panel stays mounted for
   // one more beat. `data-phase` is read off the DOM rather than off a closure, so a panel
@@ -321,14 +379,62 @@ export function DateRange({
     return () => window.clearTimeout(timer);
   }, [phase]);
 
+  // --- times ------------------------------------------------------------------------------
+
+  const fromMinutes = withTime ? parseTime(times.from) : 0;
+  const toMinutes = withTime ? parseTime(times.to, true) : DAY_MINUTES;
+  const draftEndDay = draft.to ?? draft.from;
+  const timeProblem: string | null = !withTime
+    ? null
+    : fromMinutes === null || toMinutes === null
+      ? labels.timeInvalid
+      : draftEndDay === draft.from && toMinutes <= fromMinutes
+        ? labels.timeOrder
+        : null;
+  const timesCustom =
+    withTime && (times.from !== DEFAULT_FROM_TIME || times.to !== DEFAULT_TO_TIME);
+
   const apply = useCallback(() => {
-    const from = draft.from;
-    const to = draft.to ?? draft.from;
-    closePanel(true);
-    if (from !== applied.from || to !== applied.to) {
-      onChange({ from, to });
+    if (timeProblem) {
+      return;
     }
-  }, [applied.from, applied.to, closePanel, draft.from, draft.to, onChange]);
+    const from = draft.from;
+    let to = draft.to ?? draft.from;
+    let fromTime: IsoTime | '' = '';
+    let toTime: IsoTime | '' = '';
+    if (withTime && fromMinutes !== null && toMinutes !== null) {
+      // One spelling per period, the one the server echoes: the day edges travel as nothing
+      // at all, and an end at 00:00 (exclusive) is the whole of the day before it.
+      fromTime = fromMinutes === 0 ? '' : minutesToTime(fromMinutes);
+      if (toMinutes === 0) {
+        to = addDays(to, -1);
+      } else if (toMinutes < DAY_MINUTES) {
+        toTime = minutesToTime(toMinutes);
+      }
+    }
+    closePanel(true);
+    if (
+      from !== applied.from ||
+      to !== applied.to ||
+      fromTime !== applied.fromTime ||
+      toTime !== applied.toTime
+    ) {
+      onChange(withTime ? { from, to, fromTime, toTime } : { from, to });
+    }
+  }, [
+    applied.from,
+    applied.to,
+    applied.fromTime,
+    applied.toTime,
+    closePanel,
+    draft.from,
+    draft.to,
+    fromMinutes,
+    onChange,
+    timeProblem,
+    toMinutes,
+    withTime,
+  ]);
 
   // A pointer outside both the trigger and the panel dismisses without applying, which is
   // the same promise Cancel makes. `pointerdown`, not `click`: the panel must be gone
@@ -553,14 +659,22 @@ export function DateRange({
     [monthTitleFormat],
   );
 
-  const draftEnd = draft.to ?? draft.from;
+  const draftEnd = draftEndDay;
+  // The summary shows the times being typed as soon as they parse, and the day edges as
+  // nothing, so a whole-day draft reads exactly as it did before times existed.
+  const draftFromTime = fromMinutes !== null && fromMinutes > 0 ? minutesToTime(fromMinutes) : '';
+  const draftToTime =
+    toMinutes !== null && toMinutes < DAY_MINUTES && !(toMinutes === 0 && draftEnd === draft.from)
+      ? minutesToTime(toMinutes)
+      : '';
   const draftWords = useMemo(
-    () => formatRangeWords(locale, draft.from, draftEnd),
-    [locale, draft.from, draftEnd],
+    () => formatRangeWords(locale, draft.from, draftEnd, draftFromTime, draftToTime),
+    [locale, draft.from, draftEnd, draftFromTime, draftToTime],
   );
   const appliedWords = useMemo(
-    () => formatRangeWords(locale, applied.from, applied.to),
-    [locale, applied.from, applied.to],
+    () =>
+      formatRangeWords(locale, applied.from, applied.to, applied.fromTime, applied.toTime),
+    [locale, applied.from, applied.to, applied.fromTime, applied.toTime],
   );
 
   // --- the highlighted band -----------------------------------------------------------
@@ -773,27 +887,94 @@ export function DateRange({
                   </div>
 
                   <div ref={footerRef} className="ca-daterange-footer">
-                    <div className="min-w-0">
-                      <div className="ca-daterange-summary" aria-live="polite">
-                        {draftWords}
-                      </div>
-                      {draft.to === null ? (
-                        <div className="ca-daterange-hint">
-                          {capBites ? labels.maxSpan : labels.pickEnd}
+                    {withTime ? (
+                      <div className="ca-daterange-times-wrap">
+                        <div
+                          className="ca-daterange-times"
+                          role="group"
+                          aria-labelledby={`${control.controlId}t`}
+                          aria-describedby={timeProblem ? `${control.controlId}te` : undefined}
+                        >
+                          <span id={`${control.controlId}t`} className="ca-daterange-times-label">
+                            {labels.time}
+                          </span>
+                          <TimeBox
+                            id={`${control.controlId}tf`}
+                            label={labels.timeFrom}
+                            value={times.from}
+                            invalid={fromMinutes === null || timeProblem === labels.timeOrder}
+                            onChange={(next) => setTimes((current) => ({ ...current, from: next }))}
+                            onCommit={apply}
+                          />
+                          <TimeBox
+                            id={`${control.controlId}tt`}
+                            label={labels.timeTo}
+                            value={times.to}
+                            endOfDay
+                            invalid={toMinutes === null || timeProblem === labels.timeOrder}
+                            onChange={(next) => setTimes((current) => ({ ...current, to: next }))}
+                            onCommit={apply}
+                          />
+                          {timesCustom ? (
+                            <button
+                              type="button"
+                              className="ca-button ca-button-quiet ca-daterange-allday"
+                              onClick={() => {
+                                setTimes({ from: DEFAULT_FROM_TIME, to: DEFAULT_TO_TIME });
+                                // This button goes away with the times it cleared. Focus must
+                                // land inside the panel, or it falls to <body> and Escape no
+                                // longer reaches the panel's handler.
+                                document.getElementById(`${control.controlId}tf`)?.focus();
+                              }}
+                            >
+                              {labels.allDay}
+                            </button>
+                          ) : null}
                         </div>
-                      ) : null}
-                    </div>
-                    <div className="ca-daterange-actions">
-                      <button
-                        type="button"
-                        className="ca-button ca-button-quiet"
-                        onClick={() => closePanel(true)}
-                      >
-                        {labels.cancel}
-                      </button>
-                      <button type="button" className="ca-button" onClick={apply}>
-                        {labels.apply}
-                      </button>
+                        {timeProblem ? (
+                          <p id={`${control.controlId}te`} className="ca-field-error" role="alert">
+                            {timeProblem}
+                          </p>
+                        ) : toMinutes !== null && toMinutes < DAY_MINUTES ? (
+                          // The end minute is exclusive, and "until 19:00" is read both ways
+                          // by people: this says which one the numbers below will mean.
+                          <p className="ca-field-hint">
+                            {t('endExclusive', {
+                              time: minutesToTime(toMinutes),
+                              last: minutesToTime((toMinutes + DAY_MINUTES - 1) % DAY_MINUTES),
+                            })}
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    <div className="ca-daterange-footer-row">
+                      <div className="min-w-0">
+                        <div className="ca-daterange-summary" aria-live="polite">
+                          {draftWords}
+                        </div>
+                        {draft.to === null ? (
+                          <div className="ca-daterange-hint">
+                            {capBites ? labels.maxSpan : labels.pickEnd}
+                          </div>
+                        ) : null}
+                      </div>
+                      <div className="ca-daterange-actions">
+                        <button
+                          type="button"
+                          className="ca-button ca-button-quiet"
+                          onClick={() => closePanel(true)}
+                        >
+                          {labels.cancel}
+                        </button>
+                        <button
+                          type="button"
+                          className="ca-button"
+                          onClick={apply}
+                          disabled={timeProblem !== null}
+                        >
+                          {labels.apply}
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </div>,
@@ -824,6 +1005,96 @@ export function DateRange({
 export default DateRange;
 
 // --- helpers --------------------------------------------------------------------------
+
+/** What an untouched time box shows: the two edges of the day. */
+const DEFAULT_FROM_TIME = '00:00';
+const DEFAULT_TO_TIME = '24:00';
+
+/** Arrow keys move a time box by a quarter of an hour, Shift by a whole one. */
+const TIME_STEP_MINUTES = 15;
+const TIME_STEP_LARGE_MINUTES = 60;
+
+function displayTimes(fromTime: IsoTime | '', toTime: IsoTime | ''): { from: string; to: string } {
+  return { from: fromTime || DEFAULT_FROM_TIME, to: toTime || DEFAULT_TO_TIME };
+}
+
+/**
+ * One wall-clock box: a text field, not `<input type="time">`.
+ *
+ * The native control is the one this file already refused for dates, for the same reasons -
+ * a different widget in every browser a portal is opened in, a 12-hour clock in some locales
+ * of the same page, and no `24:00`, which is the only honest way to write the end of a day
+ * when the end is exclusive. Typing is forgiving (`930` is 09:30, see `parseTime`), the value
+ * is tidied to `HH:MM` on blur, the arrow keys step it, and Enter applies the whole panel.
+ */
+function TimeBox({
+  id,
+  label,
+  value,
+  endOfDay = false,
+  invalid,
+  onChange,
+  onCommit,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  endOfDay?: boolean;
+  invalid: boolean;
+  onChange: (next: string) => void;
+  onCommit: () => void;
+}) {
+  const step = (event: ReactKeyboardEvent<HTMLInputElement>, direction: 1 | -1): void => {
+    event.preventDefault();
+    const size = event.shiftKey ? TIME_STEP_LARGE_MINUTES : TIME_STEP_MINUTES;
+    const current = parseTime(value, endOfDay) ?? 0;
+    // Snap to the grid first, so 09:07 steps to 09:15 and 09:00 rather than 09:22 and 08:52.
+    const snapped =
+      direction > 0 ? Math.floor(current / size) * size + size : Math.ceil(current / size) * size - size;
+    const limit = endOfDay ? DAY_MINUTES : DAY_MINUTES - 1;
+    onChange(minutesToTime(Math.min(limit, Math.max(0, snapped))));
+  };
+
+  return (
+    <label className="ca-daterange-timebox" htmlFor={id}>
+      <span className="ca-daterange-timebox-label">{label}</span>
+      <input
+        id={id}
+        type="text"
+        inputMode="numeric"
+        autoComplete="off"
+        spellCheck={false}
+        maxLength={5}
+        placeholder={endOfDay ? DEFAULT_TO_TIME : DEFAULT_FROM_TIME}
+        className="ca-control ca-daterange-time"
+        value={value}
+        aria-invalid={invalid || undefined}
+        onChange={(event) => onChange(event.target.value.replace(/[^\d:.]/g, ''))}
+        onBlur={() => {
+          const minutes = parseTime(value, endOfDay);
+          if (minutes !== null) {
+            onChange(minutesToTime(minutes));
+          }
+        }}
+        onFocus={(event) => event.currentTarget.select()}
+        onKeyDown={(event) => {
+          if (event.key === 'ArrowUp') {
+            step(event, 1);
+          } else if (event.key === 'ArrowDown') {
+            step(event, -1);
+          } else if (event.key === 'Enter') {
+            event.preventDefault();
+            const minutes = parseTime(value, endOfDay);
+            if (minutes !== null) {
+              onChange(minutesToTime(minutes));
+            }
+            onCommit();
+          }
+        }}
+      />
+    </label>
+  );
+}
 
 function minIso(a: IsoDate, b: IsoDate): IsoDate {
   return a < b ? a : b;
@@ -874,21 +1145,33 @@ function weekdayNames(locale: string): { short: string; long: string }[] {
  * "9 September 2026 - 15 September 2026"), and it is not everywhere yet, so the fallback is
  * the plain join.
  */
-function formatRangeWords(locale: string, from: IsoDate, to: IsoDate): string {
+function formatRangeWords(
+  locale: string,
+  from: IsoDate,
+  to: IsoDate,
+  fromTime: IsoTime | '' = '',
+  toTime: IsoTime | '' = '',
+): string {
   const start = fromIso(from);
   const end = fromIso(to);
   if (!start || !end) {
     return from === to ? from : `${from} \u2013 ${to}`;
   }
-  let format: Intl.DateTimeFormat;
-  try {
-    format = new Intl.DateTimeFormat(locale, { day: 'numeric', month: 'short', year: 'numeric' });
-  } catch {
-    format = new Intl.DateTimeFormat(undefined, {
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric',
-    });
+  const format = dateFormat(locale, { day: 'numeric', month: 'short', year: 'numeric' });
+  if (fromTime || toTime) {
+    // With a time on either end both ends carry one, so "10:00 - 19:00" is never read
+    // against an unstated midnight. The times are printed as typed rather than through
+    // `Intl`: they are already the viewer's wall clock, and `24:00` has no `Date` to be.
+    const startClock = fromTime || DEFAULT_FROM_TIME;
+    const endClock = toTime || DEFAULT_TO_TIME;
+    if (from === to) {
+      return `${format.format(start)}, ${startClock}\u2013${endClock}`;
+    }
+    const startFormat =
+      from.slice(0, 4) === to.slice(0, 4)
+        ? dateFormat(locale, { day: 'numeric', month: 'short' })
+        : format;
+    return `${startFormat.format(start)}, ${startClock} \u2013 ${format.format(end)}, ${endClock}`;
   }
   if (from === to) {
     return format.format(start);
@@ -904,6 +1187,15 @@ function formatRangeWords(locale: string, from: IsoDate, to: IsoDate): string {
     }
   }
   return `${format.format(start)} \u2013 ${format.format(end)}`;
+}
+
+/** An `Intl` date format in `locale`, or in the runtime's own if that locale is refused. */
+function dateFormat(locale: string, options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
+  try {
+    return new Intl.DateTimeFormat(locale, options);
+  } catch {
+    return new Intl.DateTimeFormat(undefined, options);
+  }
 }
 
 /** The ids here are `YYYY-MM-DD`, so this is belt and braces rather than a real escape. */
@@ -1075,7 +1367,25 @@ const DATE_RANGE_CSS = `
 .ca-daterange-day:focus-visible{outline:none;}
 .ca-daterange-day:focus-visible .ca-daterange-box{outline:2px solid var(--ca-accent);outline-offset:2px;}
 
-.ca-daterange-footer{flex:none;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 12px;padding:10px 12px;border-top:1px solid var(--ca-border-soft);background:var(--ca-surface);}
+.ca-daterange-footer{flex:none;display:flex;flex-direction:column;gap:10px;padding:10px 12px;border-top:1px solid var(--ca-border-soft);background:var(--ca-surface);}
+.ca-daterange-footer-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 12px;}
+
+/* The time row sits in the footer, not in the scroller: it belongs with Apply and must never
+ * scroll out of reach behind the months. Two boxes and the reset wrap as one unit on a phone. */
+.ca-daterange-times-wrap{padding-bottom:10px;border-bottom:1px solid var(--ca-border-soft);}
+.ca-daterange-times-wrap .ca-field-error,.ca-daterange-times-wrap .ca-field-hint{margin-top:6px;}
+.ca-daterange-times{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;}
+.ca-daterange-times-label{font-size:13px;font-weight:600;color:var(--ca-text);}
+/* On a phone the word costs the row its one line, and a second line is taken straight out of
+ * the months above it. It stays in the accessibility tree: the group is still named by it. */
+@media (max-width:420px){.ca-daterange-times-label{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0;}}
+.ca-daterange-timebox{display:inline-flex;align-items:center;gap:6px;margin:0;}
+.ca-daterange-timebox-label{font-size:13px;color:var(--ca-muted);}
+/* Wide enough for "24:00" in tabular digits at the control's padding, and no wider. */
+.ca-daterange-time{width:76px;height:var(--ca-control-h);text-align:center;font-variant-numeric:tabular-nums;cursor:text;}
+.ca-daterange-time:focus-visible{outline:none;border-color:var(--ca-accent);box-shadow:0 0 0 3px var(--ca-accent-soft);}
+.ca-daterange-allday{min-height:var(--ca-control-h);}
+.ca-daterange-actions .ca-button:disabled{opacity:.5;cursor:not-allowed;}
 .ca-daterange-summary{font-size:13px;font-weight:500;color:var(--ca-text);}
 .ca-daterange-hint{margin-top:1px;font-size:12px;color:var(--ca-muted);}
 .ca-daterange-actions{flex:none;display:flex;align-items:center;gap:8px;}

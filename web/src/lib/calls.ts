@@ -132,6 +132,10 @@ export interface CallsQuery {
   from?: string | null;
   /** Inclusive local day, `YYYY-MM-DD`, in the viewer's timezone. */
   to?: string | null;
+  /** Start minute on `from`, `HH:MM`, inclusive; empty for the start of the day. */
+  fromTime?: string | null;
+  /** End minute on `to`, `HH:MM`, EXCLUSIVE; empty for the end of the day. */
+  toTime?: string | null;
   /** `portal_user_id`. */
   employee?: FilterValue;
   /** Raw `call_type`. */
@@ -245,6 +249,14 @@ export function callsSearchParams(query: CallsQuery, page: number = 1): URLSearc
   if (period === 'custom' && hasDates) {
     params.set('from', query.from as string);
     params.set('to', query.to as string);
+    // The same cut the dashboard's charts were drawn with, or the table beneath them would
+    // list calls the summary above it does not count.
+    if (query.fromTime) {
+      params.set('from_time', query.fromTime);
+    }
+    if (query.toTime) {
+      params.set('to_time', query.toTime);
+    }
   }
   pushAll(params, 'employee', query.employee);
   pushAll(params, 'direction', query.direction);

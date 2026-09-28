@@ -34,8 +34,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ErrorState, LoadingBlock, PageShell, StaleNotice } from '@/components/AppFrame';
 import CrmCoverageNotice from '@/components/CrmCoverageNotice';
 import {
+  appendPeriod,
   defaultFilters,
+  PERIOD_PICKER_CLASS,
+  periodValue,
   rangeForPreset,
+  withPeriod,
+  withPreset,
   type DashboardFilters,
   type EmployeeOption,
   type FilterOptions,
@@ -234,14 +239,7 @@ export default function UtmPage() {
             <SegmentedControl<'today' | 'd7' | 'd30' | 'custom'>
               label={t('app.dashboard.period.label')}
               value={filters.preset}
-              onChange={(preset) => {
-                if (preset === 'custom') {
-                  setFilters({ ...filters, preset });
-                  return;
-                }
-                const range = rangeForPreset(preset, timezone);
-                setFilters({ ...filters, preset, from: range.from, to: range.to });
-              }}
+              onChange={(preset) => setFilters(withPreset(filters, preset, timezone))}
               options={(['today', 'd7', 'd30', 'custom'] as const).map((preset) => ({
                 value: preset,
                 label: t(`app.dashboard.period.${preset}`),
@@ -249,14 +247,13 @@ export default function UtmPage() {
               className="min-w-0 max-w-full"
             />
             {filters.preset === 'custom' ? (
-              <div className="min-w-0 flex-1 basis-[240px] sm:max-w-[360px]">
+              <div className={`min-w-0 flex-1 ${PERIOD_PICKER_CLASS}`}>
                 <DateRange
-                  value={{ from: filters.from, to: filters.to }}
-                  onChange={(next) =>
-                    setFilters({ ...filters, preset: 'custom', from: next.from, to: next.to })
-                  }
+                  value={periodValue(filters)}
+                  onChange={(next) => setFilters(withPeriod(filters, next))}
                   timeZone={timezone}
                   maxSpanDays={mirror ? MIRROR_MAX_PERIOD_DAYS : MAX_UTM_PERIOD_DAYS}
+                  withTime
                 />
               </div>
             ) : null}
@@ -409,11 +406,7 @@ function useUtm(
     }
     // `period: 'custom'` always, with explicit dates: without it the server silently answers
     // its own default period and the page would describe a range nobody picked.
-    const params = new URLSearchParams({
-      period: 'custom',
-      from: filters.from,
-      to: filters.to,
-    });
+    const params = appendPeriod(new URLSearchParams(), filters);
     // Repeated, not comma-joined: `parse_filters` reads repeated parameters.
     for (const id of employees) {
       params.append('employee', id);

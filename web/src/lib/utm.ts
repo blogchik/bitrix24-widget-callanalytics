@@ -81,7 +81,15 @@ export interface UtmEntityScan {
 }
 
 export interface UtmResponse extends MirrorReportMeta {
-  range: { from: string; to: string; days: number; timezone: string; preset: string };
+  range: {
+    from: string;
+    to: string;
+    from_time: string | null;
+    to_time: string | null;
+    days: number;
+    timezone: string;
+    preset: string;
+  };
   filters: { employees: number[] };
   dimensions: Dimension[];
   /** Declared, never hardcoded: a real tag could be spelled like a bucket. */

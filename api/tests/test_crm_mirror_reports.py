@@ -396,6 +396,40 @@ async def test_an_employee_filter_narrows_the_mirror_as_it_narrows_the_scan(
     assert mirror["totals"]["total"] == 2
 
 
+async def test_a_timed_period_cuts_the_mirror_at_the_minute_with_an_exclusive_end(
+    mirrored: tuple[SeededPortal, Fence],
+) -> None:
+    """10 June 10:00 - 19:00 in Tashkent: the start minute is in, the end minute is not."""
+    portal, fence = mirrored
+    await seed_dictionary(portal.portal_id)
+    created = {
+        31: "2026-06-10T09:59:59+05:00",  # a second before the start: out
+        32: "2026-06-10T10:00:00+05:00",  # the start itself: in
+        33: "2026-06-10T18:59:59+05:00",  # the last second before the end: in
+        34: "2026-06-10T19:00:00+05:00",  # the end itself: out
+        35: "2026-06-10T19:00:30+05:00",  # inside the end MINUTE, still out
+    }
+    await store(
+        fence,
+        [deal(item_id, category=GROW, stage="C7:NEW", user=VIEWER, createdTime=moment)
+         for item_id, moment in created.items()],
+        crm_items.DEAL_ITEM,
+    )
+    await loaded(portal.portal_id, now=dt.datetime.now(dt.UTC))
+    principal = viewer(portal)
+    filters = deal_stats.parse_deal_filters(
+        QueryParams({"period": "custom", "from": "2026-06-10", "from_time": "10:00",
+                     "to": "2026-06-10", "to_time": "19:00"}),
+        principal,
+        mirror=True,
+    )
+
+    mirror = await deal_stats.load_deal_report_mirror(principal, await portal_row(portal.portal_id), filters)
+
+    assert mirror["totals"]["total"] == 2
+    assert (mirror["range"]["from_time"], mirror["range"]["to_time"]) == ("10:00", "19:00")
+
+
 # --- /utm --------------------------------------------------------------------------------------
 
 

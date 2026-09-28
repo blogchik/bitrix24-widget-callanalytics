@@ -58,6 +58,7 @@ chart on a customer's portal.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from dataclasses import dataclass
 from typing import Any, Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -151,6 +152,13 @@ _RESULT_KEYS: Final[tuple[str, ...]] = ("result", "results", "result_group")
 _LINE_KEYS: Final[tuple[str, ...]] = ("line", "line_id", "line_ids", "rest_app_id")
 _FROM_KEYS: Final[tuple[str, ...]] = ("from", "date_from", "start")
 _TO_KEYS: Final[tuple[str, ...]] = ("to", "date_to", "end")
+_FROM_TIME_KEYS: Final[tuple[str, ...]] = ("from_time", "time_from")
+_TO_TIME_KEYS: Final[tuple[str, ...]] = ("to_time", "time_to")
+
+#: `HH:MM`, 24-hour, zero-padded - the only spelling the period's clock time travels in.
+#: Seconds are not accepted: the picker offers minutes, and a second-level bound would be a
+#: precision nobody chose.
+_TIME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 
 class FilterError(Exception):
@@ -204,7 +212,16 @@ def _midnight_utc(day: dt.date, zone: ZoneInfo) -> dt.datetime:
     resolves the wall clock with the pre-transition offset rather than raising, which moves
     the boundary by that offset and never drops or duplicates a day.
     """
-    return dt.datetime.combine(day, dt.time.min, tzinfo=zone).astimezone(dt.UTC)
+    return _local_utc(day, dt.time.min, zone)
+
+
+def _local_utc(day: dt.date, clock: dt.time, zone: ZoneInfo) -> dt.datetime:
+    """`day` at wall-clock `clock` in `zone`, as a UTC instant.
+
+    A wall clock inside a DST gap is resolved as `_midnight_utc` resolves a missing
+    midnight: with the pre-transition offset, never by raising.
+    """
+    return dt.datetime.combine(day, clock, tzinfo=zone).astimezone(dt.UTC)
 
 
 @dataclass(frozen=True)
@@ -218,6 +235,14 @@ class CallFilters:
     The dates are *local* to `tz_name` and inclusive at both ends, because that is how a
     person reads a date picker; `start_utc` / `end_utc` are the half-open UTC instants they
     correspond to, which is what a `timestamptz` index range wants.
+
+    `time_from` / `time_to` narrow the two ends to a wall-clock minute. `None` is the edge of
+    the day: local midnight at the start, the following midnight at the end. `time_to` is
+    EXCLUSIVE - "to 19:00" stops at 19:00:00, so a record created at 19:00:30 is not in the
+    period - which keeps the bounds half-open exactly as the whole-day form already is, and
+    lets two periods that share a boundary never count the same record twice. `date_to` is
+    always the last local day the period touches (see `parse_filters`), so every per-day
+    series below still walks `date_from..date_to` without drawing a day that is not in it.
     """
 
     preset: str
@@ -232,10 +257,12 @@ class CallFilters:
     results: tuple[str, ...]
     lines: tuple[int, ...]
     builtin_line: bool
+    time_from: dt.time | None = None
+    time_to: dt.time | None = None
 
     @property
     def days(self) -> int:
-        """Inclusive length of the local period, in days."""
+        """Inclusive length of the local period, in calendar days it touches."""
         return (self.date_to - self.date_from).days + 1
 
     def facet_predicates(self) -> list[ColumnElement[bool]]:
@@ -294,12 +321,16 @@ class CallFilters:
         """The echo the SPA renders above the charts, so the page states its own scope.
 
         `range` is what the server actually aggregated - after preset resolution and after
-        the cap - which is the only period the numbers describe.
+        the cap - which is the only period the numbers describe. `from_time` / `to_time` are
+        `HH:MM` or null for a day edge, so a whole-day period echoes exactly as it always has
+        plus two nulls.
         """
         return {
             "range": {
                 "from": self.date_from.isoformat(),
                 "to": self.date_to.isoformat(),
+                "from_time": _clock(self.time_from),
+                "to_time": _clock(self.time_to),
                 "days": self.days,
                 "timezone": self.tz_name,
                 "preset": self.preset,
@@ -352,6 +383,20 @@ def _date(raw: str) -> dt.date:
         raise FilterError("bad_period") from None
 
 
+def _time(raw: str) -> dt.time | None:
+    """`HH:MM` -> a wall-clock minute; `""` -> None (the edge of the day)."""
+    if not raw:
+        return None
+    match = _TIME_PATTERN.match(raw)
+    if match is None:
+        raise FilterError("bad_period")
+    return dt.time(int(match.group(1)), int(match.group(2)))
+
+
+def _clock(value: dt.time | None) -> str | None:
+    return value.strftime("%H:%M") if value is not None else None
+
+
 def parse_filters(params: QueryParams, principal: Principal) -> CallFilters:
     """Query string -> `CallFilters`, in the viewer's timezone (§10 step 5).
 
@@ -359,6 +404,10 @@ def parse_filters(params: QueryParams, principal: Principal) -> CallFilters:
 
     * `from` / `to` (also `date_from` / `date_to`) - inclusive **local** dates,
       `YYYY-MM-DD`. Given either one, both are required and the period is that range;
+    * `from_time` / `to_time` - optional **local** wall-clock minutes, `HH:MM`, that cut
+      the two ends of an explicit range. The start is inclusive and the end is EXCLUSIVE
+      (`to_time=19:00` stops at 19:00:00). Either may be sent alone; absent means the edge
+      of the day, and an end of `00:00` is read as the whole day before it;
     * `period` - `today` | `7d` | `30d` | `custom` when no dates are sent (default `7d`).
       The SPA resolves its own presets into dates in the viewer's zone, so this is the
       convenience path, not the main one;
@@ -383,6 +432,8 @@ def parse_filters(params: QueryParams, principal: Principal) -> CallFilters:
     raw_from = _first(params, _FROM_KEYS)
     raw_to = _first(params, _TO_KEYS)
     preset = (params.get("period") or "").strip().lower()
+    time_from = _time(_first(params, _FROM_TIME_KEYS))
+    time_to = _time(_first(params, _TO_TIME_KEYS))
 
     if raw_from or raw_to:
         # An explicit range wins over any preset: it is what the user picked in the date
@@ -397,8 +448,25 @@ def parse_filters(params: QueryParams, principal: Principal) -> CallFilters:
         if preset not in _PRESETS:
             # `period=custom` without dates included: there is nothing to aggregate over.
             raise FilterError("bad_period")
+        if time_from is not None or time_to is not None:
+            # A clock time belongs to a date the caller named. Pinned to a preset it would
+            # narrow days the caller never saw, so it is refused rather than guessed at.
+            raise FilterError("bad_period")
         date_to = today
         date_from = today - dt.timedelta(days=_PRESETS[preset] - 1)
+
+    # One spelling per period, so the echo, the per-day series and the day cap agree. A start
+    # at 00:00 IS the whole-day start. An end at 00:00 is exclusive, so it stops where the
+    # day before ended: "to 29 Sep 00:00" and "to 28 Sep, whole day" are the same period, and
+    # only the second keeps `date_to` the last day the period actually touches.
+    if time_from == dt.time.min:
+        time_from = None
+    if time_to == dt.time.min:
+        time_to = None
+        try:
+            date_to -= dt.timedelta(days=1)
+        except OverflowError:
+            raise FilterError("bad_period") from None
 
     if date_from > date_to:
         raise FilterError("bad_period")
@@ -431,12 +499,21 @@ def parse_filters(params: QueryParams, principal: Principal) -> CallFilters:
             raise FilterError("bad_line") from None
 
     try:
-        start_utc = _midnight_utc(date_from, zone)
-        end_utc = _midnight_utc(date_to + dt.timedelta(days=1), zone)
-        # The equally long window immediately before this one, for the summary tiles'
-        # "vs previous period" line. Computed from local dates, so a period that contains a
-        # DST change is still compared against the same number of *days*, not of hours.
-        previous_start_utc = _midnight_utc(date_from - dt.timedelta(days=span), zone)
+        start_utc = _local_utc(date_from, time_from or dt.time.min, zone)
+        if time_to is None:
+            end_utc = _midnight_utc(date_to + dt.timedelta(days=1), zone)
+        else:
+            end_utc = _local_utc(date_to, time_to, zone)
+        if time_from is None and time_to is None:
+            # The equally long window immediately before this one, for the summary tiles'
+            # "vs previous period" line. Computed from local dates, so a period that contains
+            # a DST change is still compared against the same number of *days*, not of hours.
+            previous_start_utc = _midnight_utc(date_from - dt.timedelta(days=span), zone)
+        else:
+            # A period cut to the minute has no whole number of days to repeat, so the
+            # window before it is the same length in time: 10:00-19:00 compares against
+            # 01:00-10:00, not against the whole of yesterday.
+            previous_start_utc = start_utc - (end_utc - start_utc)
     except (OverflowError, ValueError):
         # The three bounds are DERIVED, and a well-formed date does not guarantee they
         # exist: `_date` accepts the whole proleptic calendar, so `9999-12-31` has no next
@@ -449,6 +526,10 @@ def parse_filters(params: QueryParams, principal: Principal) -> CallFilters:
         # is the honest answer, because a range at the bottom of the calendar has no
         # previous period to compare against and the tiles would be about nothing.
         raise FilterError("bad_period") from None
+    if start_utc >= end_utc:
+        # Same day, and the end is not after the start: an empty period, which is a mistake
+        # in the question rather than an answer of zero.
+        raise FilterError("bad_period")
 
     return CallFilters(
         preset=preset,
@@ -458,6 +539,8 @@ def parse_filters(params: QueryParams, principal: Principal) -> CallFilters:
         end_utc=end_utc,
         previous_start_utc=previous_start_utc,
         tz_name=tz_name,
+        time_from=time_from,
+        time_to=time_to,
         employees=_ints(params, _EMPLOYEE_KEYS, "bad_employee"),
         directions=directions,
         results=results,

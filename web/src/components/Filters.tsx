@@ -29,6 +29,7 @@ import {
   Field,
   Select,
   SegmentedControl,
+  type DateRangeValue,
   type SegmentedOption,
   type SelectOption,
 } from '@/components/ui';
@@ -51,6 +52,10 @@ export interface DashboardFilters {
   from: string;
   /** Inclusive last calendar day, `YYYY-MM-DD` in the viewer's timezone. */
   to: string;
+  /** Start minute on `from`, `HH:MM` (inclusive), or `''` for the start of the day. */
+  fromTime: string;
+  /** End minute on `to`, `HH:MM` (EXCLUSIVE), or `''` for the end of the day. */
+  toTime: string;
   /** `employees.portal_user_id` as a string, or `''` for all. */
   employee: string;
   /** `incoming` | `outgoing`, or `''` for all. */
@@ -153,7 +158,91 @@ export function rangeForPreset(
 /** The filter set the dashboard opens with: the last 30 days, nothing else applied. */
 export function defaultFilters(timeZone: string | null | undefined): DashboardFilters {
   const { from, to } = rangeForPreset('d30', timeZone);
-  return { preset: 'd30', from, to, employee: '', direction: '', result: '', line: '' };
+  return {
+    preset: 'd30',
+    from,
+    to,
+    fromTime: '',
+    toTime: '',
+    employee: '',
+    direction: '',
+    result: '',
+    line: '',
+  };
+}
+
+/**
+ * `filters` with the period set to `preset`.
+ *
+ * A preset is whole days, so it clears any clock time a custom period carried; `custom`
+ * keeps the current period as the picker's starting point. Every page's period control goes
+ * through this, so no page can leave a stale 19:00 cut on a "7 days" it did not ask for.
+ */
+export function withPreset<F extends Pick<DashboardFilters, 'preset' | 'from' | 'to' | 'fromTime' | 'toTime'>>(
+  filters: F,
+  preset: PeriodPreset,
+  timeZone: string | null | undefined,
+): F {
+  if (preset === 'custom') {
+    return { ...filters, preset };
+  }
+  const range = rangeForPreset(preset, timeZone);
+  return { ...filters, preset, from: range.from, to: range.to, fromTime: '', toTime: '' };
+}
+
+/** The period of a filter set as the picker's value. */
+export function periodValue(
+  filters: Pick<DashboardFilters, 'from' | 'to' | 'fromTime' | 'toTime'>,
+): DateRangeValue {
+  return { from: filters.from, to: filters.to, fromTime: filters.fromTime, toTime: filters.toTime };
+}
+
+/** `filters` with the period the picker applied. */
+export function withPeriod<F extends Pick<DashboardFilters, 'preset' | 'from' | 'to' | 'fromTime' | 'toTime'>>(
+  filters: F,
+  next: DateRangeValue,
+): F {
+  return {
+    ...filters,
+    preset: 'custom',
+    from: next.from,
+    to: next.to,
+    fromTime: next.fromTime ?? '',
+    toTime: next.toTime ?? '',
+  };
+}
+
+/**
+ * How wide the custom-period trigger may grow on each page.
+ *
+ * Wider than a date-only range needed: "28 Sep, 10:00 - 29 Sep 2026, 19:00" is about half as
+ * long again, and at the old 360px cap it ellipsised the one part the reader just typed.
+ */
+export const PERIOD_PICKER_CLASS = 'basis-[260px] sm:max-w-[440px]';
+
+/**
+ * The period of a filter set onto a query string: `period=custom`, the dates, and the two
+ * times only when they cut the day (`services/stats.py::parse_filters` reads them as
+ * `from_time` / `to_time`). A whole-day period therefore sends exactly what it always sent.
+ */
+export function appendPeriod(
+  params: URLSearchParams,
+  filters: Pick<DashboardFilters, 'from' | 'to' | 'fromTime' | 'toTime'>,
+): URLSearchParams {
+  // `period=custom` is required, not decorative: the API reads `from`/`to` only under
+  // that preset and otherwise answers its 7-day default. Omitting it makes every
+  // period control silently do nothing while the page still renders a plausible chart,
+  // which is the worst kind of bug to ship.
+  params.set('period', 'custom');
+  params.set('from', filters.from);
+  params.set('to', filters.to);
+  if (filters.fromTime) {
+    params.set('from_time', filters.fromTime);
+  }
+  if (filters.toTime) {
+    params.set('to_time', filters.toTime);
+  }
+  return params;
 }
 
 /** True when anything beyond the period is narrowing the data. */
@@ -163,15 +252,7 @@ export function hasNarrowingFilter(filters: DashboardFilters): boolean {
 
 /** The `GET /api/v1/dashboard` query string for a filter set. */
 export function toQuery(filters: DashboardFilters): string {
-  // `period=custom` is required, not decorative: the API reads `from`/`to` only under
-  // that preset and otherwise answers its 7-day default. Omitting it makes every
-  // period control silently do nothing while the page still renders a plausible chart,
-  // which is the worst kind of bug to ship.
-  const params = new URLSearchParams({
-    period: 'custom',
-    from: filters.from,
-    to: filters.to,
-  });
+  const params = appendPeriod(new URLSearchParams(), filters);
   if (filters.employee) {
     params.set('employee', filters.employee);
   }
@@ -224,12 +305,7 @@ export function Filters({
   const t = useTranslations();
 
   const selectPreset = (preset: PeriodPreset): void => {
-    if (preset === 'custom') {
-      onChange({ ...value, preset });
-      return;
-    }
-    const range = rangeForPreset(preset, timeZone);
-    onChange({ ...value, preset, from: range.from, to: range.to });
+    onChange(withPreset(value, preset, timeZone));
   };
 
   const allLabel = t('app.dashboard.filter.all');
@@ -340,19 +416,18 @@ export function Filters({
             <Field
               group
               label={t('app.dashboard.period.custom')}
-              className="min-w-0 flex-1 basis-[240px] sm:max-w-[360px]"
+              className={`min-w-0 flex-1 ${PERIOD_PICKER_CLASS}`}
             >
               {(control) => (
                 <DateRange
                   id={control.controlId}
                   aria-labelledby={control.labelId}
                   aria-describedby={control.describedBy}
-                  value={{ from: value.from, to: value.to }}
-                  onChange={(next) =>
-                    onChange({ ...value, preset: 'custom', from: next.from, to: next.to })
-                  }
+                  value={periodValue(value)}
+                  onChange={(next) => onChange(withPeriod(value, next))}
                   timeZone={timeZone}
                   maxSpanDays={MAX_PERIOD_DAYS}
+                  withTime
                 />
               )}
             </Field>

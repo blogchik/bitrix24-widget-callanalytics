@@ -675,6 +675,51 @@ async def test_a_backwards_or_unparsable_period_is_a_machine_code_too(
     )
 
 
+# --- a period cut to the minute ------------------------------------------------------------
+
+
+async def test_a_timed_period_includes_its_start_minute_and_excludes_its_end_minute(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """`from_time` / `to_time` narrow the period to the viewer's wall clock (`parse_filters`).
+
+    In Tashkent the known set falls at 11:10, 11:40, 12:15, 13:20, 14:05, 15:30, 16:45 and
+    17:50. The window 12:15 - 15:30 starts ON a call and ends ON a call, so it separates the
+    two rules in one request: the 12:15 call is in (the start is inclusive) and the 15:30 call
+    is out (the end is exclusive). Three calls, and every page that reads `calls` must agree.
+    """
+    await seed_the_known_set(portal.portal_id)
+    token = session_for(portal)
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {
+        "period": "custom",
+        "from": DAY.isoformat(),
+        "from_time": "12:15",
+        "to": DAY.isoformat(),
+        "to_time": "15:30",
+    }
+
+    dashboard = await client.get(DASHBOARD, params=params, headers=headers)
+    assert dashboard.status_code == 200, dashboard.text
+    body = dashboard.json()
+    assert summary_of(body)["total"] == 3
+    assert day_series(body) == {DAY.isoformat(): 3}
+    assert heatmap_cells(body) == {(DAY_ISODOW, 12): 1, (DAY_ISODOW, 13): 1, (DAY_ISODOW, 14): 1}
+    echo = range_of(body)
+    assert (echo["from_time"], echo["to_time"]) == ("12:15", "15:30")
+    # The window before a 3 h 15 min period is the 3 h 15 min before it: 09:00 - 12:15, which
+    # holds the two calls at 11:10 and 11:40.
+    assert summary_of(body)["previous"]["total"] == 2
+
+    calls = await client.get("/api/v1/calls", params=params, headers=headers)
+    assert calls.status_code == 200, calls.text
+    assert calls.json()["total"] == 3
+
+    hours = await client.get("/api/v1/hours", params=params, headers=headers)
+    assert hours.status_code == 200, hours.text
+    assert hours.json()["totals"]["calls"] == 3
+
+
 # --- the ends of the calendar ----------------------------------------------------------
 
 

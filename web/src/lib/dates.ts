@@ -1,5 +1,5 @@
 /**
- * Calendar-date arithmetic for the filter controls (§4.11, §10 step 5).
+ * Calendar-date and wall-clock arithmetic for the filter controls (§4.11, §10 step 5).
  *
  * **Everything here is a calendar date, never an instant.** A `YYYY-MM-DD` in this app
  * means "that day in the *viewer's* timezone" (§4.6 `tz`), which is what the server
@@ -163,6 +163,61 @@ export function daysInMonth(year: number, month: number): number {
   const probe = new Date(2000, 0, 1, 12, 0, 0, 0);
   probe.setFullYear(year, month + 1, 0);
   return probe.getDate();
+}
+
+// --- wall-clock times -------------------------------------------------------------------
+
+/**
+ * A wall-clock minute as `HH:MM`, 24-hour, zero-padded - the viewer's clock, like the dates.
+ *
+ * It narrows the two ends of a period (`from_time` / `to_time`, `services/stats.py`). The
+ * start is inclusive and the end is EXCLUSIVE, so the end of a day is written `24:00`: it
+ * is the only spelling that means "through 23:59:59", and it never crosses the wire - a
+ * period that ends at `24:00` is simply a whole-day end and sends no `to_time` at all.
+ */
+export type IsoTime = string;
+
+/** Minutes in a day, and the value `24:00` stands for. */
+export const DAY_MINUTES = 1440;
+
+const TIME_PATTERN = /^(\d{1,2})(?:[:.\s]?(\d{2}))?$/;
+
+/** `HH:MM` for `0..1440` minutes; `1440` is `24:00`. */
+export function minutesToTime(minutes: number): IsoTime {
+  const clamped = Math.min(DAY_MINUTES, Math.max(0, Math.round(minutes)));
+  const pad = (value: number): string => String(value).padStart(2, '0');
+  return `${pad(Math.floor(clamped / 60))}:${pad(clamped % 60)}`;
+}
+
+/**
+ * What a person typed into a time box -> minutes since midnight, or `null`.
+ *
+ * Forgiving about the shape and strict about the value: `9`, `09`, `930`, `0930`, `9:30`
+ * and `9.30` are all half past nine, while `25:00` and `9:75` are nothing. `24:00` is only
+ * accepted where `endOfDay` says an end is being typed.
+ */
+export function parseTime(raw: string, endOfDay = false): number | null {
+  const text = raw.trim();
+  const match = TIME_PATTERN.exec(text);
+  if (!match) {
+    return null;
+  }
+  // Without a separator the pattern still splits right: `930` backtracks to `9` + `30`.
+  const hours = Number(match[1]);
+  const minutes = match[2] === undefined ? 0 : Number(match[2]);
+  if (minutes > 59) {
+    return null;
+  }
+  const total = hours * 60 + minutes;
+  if (total < DAY_MINUTES || (endOfDay && total === DAY_MINUTES)) {
+    return total;
+  }
+  return null;
+}
+
+/** `true` for a strict `HH:MM` between `00:00` and `23:59` - what the API accepts. */
+export function isIsoTime(value: string | null | undefined): value is IsoTime {
+  return typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
 }
 
 /**

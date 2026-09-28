@@ -59,6 +59,10 @@ import { VIZ_CSS } from '@/lib/viz';
 export interface DashboardRange {
   from: string;
   to: string;
+  /** `HH:MM` the period starts at on `from`, or null for the start of the day. */
+  from_time?: string | null;
+  /** `HH:MM` the period ends at on `to` (exclusive), or null for the end of the day. */
+  to_time?: string | null;
   /** Inclusive length in days; the previous-period comparison uses the same length. */
   days: number;
 }
@@ -362,8 +366,13 @@ function EmptyPeriod({ importing }: { importing: boolean }) {
   );
 }
 
-/** A failed refetch while usable numbers are still on screen: explain, offer, keep. */
-/** "1 Aug - 7 Sep 2026": the period the server actually aggregated, under the title. */
+/**
+ * "1 Aug - 7 Sep 2026": the period the server actually aggregated, under the title.
+ *
+ * With a clock time on either end both ends show one ("28 Sep 2026, 10:00 - 29 Sep 2026,
+ * 19:00"), so a cut period is never read as whole days. The times are printed as the server
+ * echoed them: they are already the viewer's wall clock, and `24:00` has no `Date` to be.
+ */
 function rangeLabel(range: DashboardRange, locale: string): string {
   const options: Intl.DateTimeFormatOptions = {
     day: 'numeric',
@@ -382,6 +391,13 @@ function rangeLabel(range: DashboardRange, locale: string): string {
       return iso;
     }
   };
+  if (range.from_time || range.to_time) {
+    const start = range.from_time || '00:00';
+    const end = range.to_time || '24:00';
+    return range.from === range.to
+      ? `${format(range.from)}, ${start}–${end}`
+      : `${format(range.from)}, ${start} — ${format(range.to)}, ${end}`;
+  }
   return range.from === range.to
     ? format(range.from)
     : `${format(range.from)} — ${format(range.to)}`;

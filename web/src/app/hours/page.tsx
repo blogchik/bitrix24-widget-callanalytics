@@ -30,8 +30,13 @@ import {
   StaleNotice,
 } from '@/components/AppFrame';
 import {
+  appendPeriod,
   defaultFilters,
+  PERIOD_PICKER_CLASS,
+  periodValue,
   rangeForPreset,
+  withPeriod,
+  withPreset,
   type DashboardFilters,
   type EmployeeOption,
   type FilterOptions,
@@ -208,14 +213,7 @@ export default function HoursPage() {
                 <SegmentedControl<'today' | 'd7' | 'd30' | 'custom'>
                   label={t('app.dashboard.period.label')}
                   value={filters.preset}
-                  onChange={(preset) => {
-                    if (preset === 'custom') {
-                      setFilters({ ...filters, preset });
-                      return;
-                    }
-                    const range = rangeForPreset(preset, timezone);
-                    setFilters({ ...filters, preset, from: range.from, to: range.to });
-                  }}
+                  onChange={(preset) => setFilters(withPreset(filters, preset, timezone))}
                   options={(['today', 'd7', 'd30', 'custom'] as const).map((preset) => ({
                     value: preset,
                     label: t(`app.dashboard.period.${preset}`),
@@ -223,14 +221,13 @@ export default function HoursPage() {
                   className="min-w-0 max-w-full"
                 />
                 {filters.preset === 'custom' ? (
-                  <div className="min-w-0 flex-1 basis-[240px] sm:max-w-[360px]">
+                  <div className={`min-w-0 flex-1 ${PERIOD_PICKER_CLASS}`}>
                     <DateRange
-                      value={{ from: filters.from, to: filters.to }}
-                      onChange={(next) =>
-                        setFilters({ ...filters, preset: 'custom', from: next.from, to: next.to })
-                      }
+                      value={periodValue(filters)}
+                      onChange={(next) => setFilters(withPeriod(filters, next))}
                       timeZone={timezone}
                       maxSpanDays={MAX_PERIOD_DAYS}
+                      withTime
                     />
                   </div>
                 ) : null}
@@ -317,11 +314,7 @@ function useHours(
     if (!filters) {
       return null;
     }
-    const params = new URLSearchParams({
-      period: 'custom',
-      from: filters.from,
-      to: filters.to,
-    });
+    const params = appendPeriod(new URLSearchParams(), filters);
     // Repeated, not comma-joined: `parse_filters` reads repeated parameters, and a list
     // encoded into one value would arrive as a single unparsable id.
     for (const id of employees) {

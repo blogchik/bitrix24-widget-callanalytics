@@ -80,6 +80,9 @@ class Portal(Base):
         CheckConstraint(
             "crm_opt_out_at IS NULL OR crm_mode = 'off'", name="portals_crm_opt_out_chk"
         ),
+        CheckConstraint(
+            "jsonb_typeof(deal_period_rule) = 'object'", name="portals_deal_period_rule_chk"
+        ),
         Index("portals_status_idx", "status", postgresql_where=text("status = 'active'")),
         Index("portals_purge_idx", "id", postgresql_where=text("purge_pending")),
         Index("portals_crm_purge_idx", "id", postgresql_where=text("crm_purge_pending")),
@@ -143,6 +146,12 @@ class Portal(Base):
     )
     crm_purge_pending: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
+    )
+    # Owner decision 3 (0007, §4.12): the stages whose deals also count in the period they moved
+    # into the stage or were modified in. `{}` is creation time alone. One writer:
+    # `services/portals.set_deal_period_rule`; one reader of its shape: `services/deal_period.py`.
+    deal_period_rule: Mapped[dict[str, Any]] = mapped_column(
+        postgresql.JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
     created_at: Mapped[dt.datetime] = mapped_column(_TS, nullable=False, server_default=func.now())
     # Maintained by the portals_updated_at trigger, not by the ORM.

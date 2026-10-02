@@ -92,6 +92,25 @@ export interface DealStageTableProps {
   nameOf: (row: DealRow) => string;
   /** Render each stage cell's share of the row total under its count. */
   showPercent: boolean;
+  /**
+   * Columns that also count deals moved onto them or modified in the period, not only the
+   * ones created in it (owner decision 3, `period_rule.stage_keys`). Marked with ↻, and so
+   * is every rollup their deals land in, because «Успешные» growing past the deals created
+   * in a month is the first thing a reader would otherwise take for a bug.
+   */
+  legKeys?: ReadonlySet<string>;
+}
+
+const NO_LEGS: ReadonlySet<string> = new Set();
+
+function LegMark({ title }: { title: string }) {
+  // `aria-hidden`: the page's note says in words what the mark means, and a symbol read out
+  // in every header would say nothing a screen-reader user can act on.
+  return (
+    <span className="ca-deals-leg" aria-hidden="true" title={title}>
+      ↻
+    </span>
+  );
 }
 
 export interface DealSummaryStripProps {
@@ -193,6 +212,7 @@ export default function DealStageTable({
   t,
   nameOf,
   showPercent,
+  legKeys = NO_LEGS,
 }: DealStageTableProps) {
   // The columns this block draws, in the order the server put them: the funnel's own
   // stages by SORT, then whatever the deals turned up that the dictionary could not name.
@@ -202,6 +222,14 @@ export default function DealStageTable({
       .map((key) => byKey.get(key))
       .filter((stage): stage is StageColumn => stage !== undefined);
   }, [group.stage_keys, stages]);
+
+  // The outcomes the marked columns roll up into: a named «Заклад» feeds «В работе», a named
+  // won stage feeds «Успешные».
+  const legOutcomes = useMemo(
+    () => new Set(columns.filter((stage) => legKeys.has(stage.key)).map((stage) => stage.semantic)),
+    [columns, legKeys],
+  );
+  const legTitle = t('app.deals.legTitle');
 
   // "Прочее" exists only when it has something in it. A permanently empty column that
   // nobody can explain is worse than an absent one; a non-empty one that is hidden makes
@@ -232,19 +260,34 @@ export default function DealStageTable({
                 {t('app.deals.operator')}
               </th>
               <th scope="col" className="ca-deals-roll">
+                {legOutcomes.has('P') ? <LegMark title={legTitle} /> : null}
                 {t('app.deals.inProgress')}
               </th>
               <th scope="col" className="ca-deals-roll">
+                {legOutcomes.has('S') ? <LegMark title={legTitle} /> : null}
                 {t('app.deals.won')}
               </th>
               <th scope="col" className="ca-deals-roll">
+                {legOutcomes.has('F') ? <LegMark title={legTitle} /> : null}
                 {t('app.deals.lost')}
               </th>
-              {columns.map((stage) => (
-                <th scope="col" key={stage.key} className="ca-deals-cell-h" title={stageLabel(stage, t)}>
-                  {stageLabel(stage, t)}
-                </th>
-              ))}
+              {columns.map((stage) => {
+                const leg = legKeys.has(stage.key);
+                const label = stageLabel(stage, t);
+                return (
+                  <th
+                    scope="col"
+                    key={stage.key}
+                    className="ca-deals-cell-h"
+                    title={leg ? `${label} — ${legTitle}` : label}
+                  >
+                    {/* The mark goes first: a long stage name is cut with an ellipsis at the
+                        column's right edge, and the mark must not be what gets cut. */}
+                    {leg ? <LegMark title={legTitle} /> : null}
+                    {label}
+                  </th>
+                );
+              })}
               {hasUnknown ? (
                 <th scope="col" className="ca-deals-cell-h">
                   {t('app.deals.other')}
@@ -436,6 +479,12 @@ export const DEAL_CSS = `
   font-size: 10px;
   color: var(--ca-muted);
   font-variant-numeric: tabular-nums;
+}
+.ca-deals-leg {
+  margin-right: 3px;
+  color: var(--ca-accent);
+  font-weight: 700;
+  cursor: help;
 }
 .ca-deals-grid tfoot th,
 .ca-deals-grid tfoot td {

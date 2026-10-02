@@ -14,9 +14,11 @@ downstream can catch:
   `createdTime` key, the selection becomes every deal the viewer can see and the report is
   simply too big, with every number internally consistent. `honour_verdict` is the guard,
   and its *inconclusive* case matters as much as its negative one.
-* **A deal counted for a period it was not created in.** Owner decision 3 counts creation
-  alone; a filter that also matched modification or closing would quietly pull old deals
-  into every report.
+* **A deal counted for a period it was not created in.** Owner decision 3 counts creation,
+  and since 2026-10-02 movement into or modification on a stage the administrator NAMED -
+  and nothing else. A filter that matched modification on every stage would quietly pull
+  old deals into every report; one that lost the stage would pull every won deal ever into
+  this month's «Успешные».
 * **A deal whose stage the dictionary does not name.** Dropping it would make a row's
   `total` disagree with the sum of its own cells, which is the one discrepancy a reader can
   see and cannot explain.
@@ -32,6 +34,7 @@ from app.bitrix.deals import (
     DEAL_DIALECT,
     ITEM_DIALECT,
     Dialect,
+    Stage,
     as_int,
     honour_probe_commands,
     honour_verdict,
@@ -43,13 +46,16 @@ from app.bitrix.deals import (
     period_filter,
     stage_entity_id,
     stage_key,
+    stage_leg_filters,
     status_commands,
     status_key,
 )
+from app.services import deal_period
 from app.services.deal_stats import _fold, _Group, _Measures
 
 START = "2026-06-01T00:00:00+00:00"
 END = "2026-07-01T00:00:00+00:00"
+NEVER = "2999-01-01T00:00:00+00:00"
 
 
 # --- entity ids and keys ----------------------------------------------------------------
@@ -310,3 +316,143 @@ def test_measures_merge_is_additive_across_funnels() -> None:
     assert left.cells == {"0:WON": 2, "7:C7:LOSE": 1}
     # The grand total drops `cells` on purpose: two funnels' stages are not comparable.
     assert "cells" not in left.wire(with_cells=False)
+
+
+# --- named stages (owner decision 3, 2026-10-02) ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("dialect", "stage", "moved", "updated"),
+    [
+        (ITEM_DIALECT, "stageId", "movedTime", "updatedTime"),
+        (DEAL_DIALECT, "STAGE_ID", "MOVED_TIME", "DATE_MODIFY"),
+    ],
+)
+def test_a_named_stage_adds_two_flat_legs_on_movement_and_modification(
+    dialect: Dialect, stage: str, moved: str, updated: str
+) -> None:
+    """Flat keys on both dialects: one shape, and a probe that tests exactly what is sent."""
+    names = ["C16:UC_0U9IW2", "C16:WON"]
+    moved_leg, updated_leg = stage_leg_filters(
+        dialect, stage_ids=names, start_iso=START, end_iso=END
+    )
+    assert moved_leg == {f"@{stage}": names, f">={moved}": START, f"<{moved}": END}
+    assert updated_leg == {f"@{stage}": names, f">={updated}": START, f"<{updated}": END}
+
+
+def test_the_stage_legs_page_keys_never_collide_with_the_creation_stream() -> None:
+    """Stream 0 keeps the keys it always had; the legs get their own."""
+    keys = [page_key(start, stream) for stream in (0, 1, 2) for start in (0, 50, 100)]
+    assert len(set(keys)) == len(keys)
+    assert (page_key(0, 0), page_key(50, 0)) == ("pre", "p50")
+    assert (page_key(0, 1), page_key(50, 2)) == ("s1p0", "s2p50")
+    with pytest.raises(ValueError):
+        page_key(0, -1)
+
+
+def test_the_leg_probes_are_sent_only_for_a_portal_with_named_stages() -> None:
+    """A portal without a rule asks exactly the two questions it always asked."""
+    assert [key for key, _, _ in honour_probe_commands(ITEM_DIALECT)] == ["hp0", "hp1"]
+    commands = honour_probe_commands(ITEM_DIALECT, legs=True)
+    assert [key for key, _, _ in commands] == ["hp0", "hp1", "hp2", "hp3"]
+    assert commands[2][2]["filter"] == {">=movedTime": NEVER}
+    assert commands[3][2]["filter"] == {">=updatedTime": NEVER}
+
+
+def test_honour_verdict_needs_every_leg_probe_at_zero() -> None:
+    """An ignored `>=movedTime` would put every won deal ever into this month's column."""
+    assert honour_verdict(baseline=5, future=0, legs=[0, 0]) is True
+    assert honour_verdict(baseline=5, future=0, legs=[3, 0]) is False
+    assert honour_verdict(baseline=5, future=0, legs=[0, 3]) is False
+    assert honour_verdict(baseline=5, future=0, legs=[0, None]) is None
+    assert honour_verdict(baseline=0, future=0, legs=[0, 0]) is None
+
+
+def test_a_leg_row_outside_the_named_stages_is_skipped_and_not_marked_seen() -> None:
+    """The legs ask by bare status id; the pair is what decides, and the deal may come back."""
+    groups: dict[int | None, _Group] = {}
+    seen: set[int] = set()
+    named = frozenset({"16:C16:WON"})
+    _fold(
+        [
+            # A build that ignored `@stageId` hands back a stage nobody named.
+            _deal(1, 16, "C16:NEW", 11, "P"),
+            _deal(2, 16, "C16:WON", 11, "S"),
+            # The same status id in another funnel is a different column.
+            _deal(3, 18, "C16:WON", 11, "S"),
+        ],
+        dialect=ITEM_DIALECT,
+        known={},
+        groups=groups,
+        seen=seen,
+        only=named,
+    )
+    assert seen == {2}
+    # Deal 1 was also created in the period: the creation stream still counts it.
+    _fold([_deal(1, 16, "C16:NEW", 11, "P")], dialect=ITEM_DIALECT, known={}, groups=groups, seen=seen)
+    assert groups[16].subtotal.total == 2
+    assert 18 not in groups
+
+
+def _dictionary() -> dict[int, tuple[Stage, ...]]:
+    """Portal 1's two working funnels, as they stood on 2026-10-02."""
+    return {
+        16: tuple(
+            parse_stages(
+                [
+                    {"STATUS_ID": "C16:NEW", "NAME": "Новый", "SORT": "10", "SEMANTICS": None},
+                    {"STATUS_ID": "C16:UC_0U9IW2", "NAME": "Заклад", "SORT": "80", "SEMANTICS": None},
+                    {"STATUS_ID": "C16:WON", "NAME": "Успешний", "SORT": "90", "SEMANTICS": "S"},
+                    {"STATUS_ID": "C16:LOSE", "NAME": "Цена дорогая", "SORT": "100", "SEMANTICS": "F"},
+                ],
+                category_id=16,
+            )
+        ),
+        18: tuple(
+            parse_stages(
+                [
+                    {"STATUS_ID": "C18:NEW", "NAME": "Новая", "SORT": "10", "SEMANTICS": None},
+                    {"STATUS_ID": "C18:WON", "NAME": "Успешний", "SORT": "60", "SEMANTICS": "S"},
+                ],
+                category_id=18,
+            )
+        ),
+    }
+
+
+def test_the_rule_resolves_to_the_named_stages_the_dictionary_still_has() -> None:
+    """In the dictionary's order; a stage that is gone simply drops out."""
+    rule = {"stage_keys": ["16:C16:WON", "16:C16:UC_0U9IW2", "16:C16:GONE"]}
+    resolved = deal_period.resolve(rule, _dictionary())
+    assert [stage.key for stage in resolved] == ["16:C16:UC_0U9IW2", "16:C16:WON"]
+    # Per stage, never per outcome: «База»'s won stage is not named, so it is not a leg.
+    assert "18:C18:WON" not in {stage.key for stage in resolved}
+    assert deal_period.resolve({}, _dictionary()) == ()
+    assert deal_period.resolve(None, _dictionary()) == ()
+
+
+def test_a_stored_rule_that_is_malformed_reads_as_creation_time_alone() -> None:
+    """A hand-edited row degrades to today's report, never to a 500."""
+    assert deal_period.stage_keys({"stage_keys": "16:C16:WON"}) == ()
+    assert deal_period.stage_keys({"stage_keys": [16]}) == ()
+    assert deal_period.stage_keys({"stage_keys": ["C16:WON"]}) == ()
+    assert deal_period.stage_keys({"other": []}) == ()
+    assert deal_period.stage_keys({"stage_keys": ["16:C16:WON", "16:C16:WON"]}) == ("16:C16:WON",)
+
+
+def test_the_settings_body_is_shape_checked_and_validated_against_the_dictionary() -> None:
+    assert deal_period.parse_body({"stage_keys": ["16:C16:WON"]}) == ("16:C16:WON",)
+    assert deal_period.parse_body({"stage_keys": []}) == ()
+    assert deal_period.parse_body({"stage_keys": ["16:C16:WON"], "won": True}) is None
+    assert deal_period.parse_body({"stage_keys": ["16: spaced"]}) is None
+    assert deal_period.parse_body(["16:C16:WON"]) is None
+    too_many = [f"16:S{index}" for index in range(deal_period.MAX_STAGE_KEYS + 1)]
+    assert deal_period.parse_body({"stage_keys": too_many}) is None
+
+    stages = _dictionary()
+    assert deal_period.validate(("16:C16:WON", "16:C16:UC_0U9IW2"), stages) == (
+        "16:C16:UC_0U9IW2",
+        "16:C16:WON",
+    )
+    assert deal_period.validate(("16:C16:GONE",), stages) is None
+    assert deal_period.validate((), stages) == ()

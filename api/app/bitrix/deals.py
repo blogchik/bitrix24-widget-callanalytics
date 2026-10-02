@@ -30,21 +30,27 @@ favour of `crm.item.*` with `entityTypeId = 2`, so the universal method is the p
 The fallback exists only for builds that answer `ERROR_METHOD_NOT_FOUND`, and it is entered by
 the typed `errors.MethodNotFound` - never by a version number, which no response carries.
 
-**Why creation time alone.** Owner decision 3 (changed 2026-09-26) puts a deal in the period
-it was CREATED in, whatever happened to it afterwards. The earlier rule also counted deals
-modified or closed in the period. That took a `logic: "OR"` group, documented only for
-`crm.item.list`, and cost the fallback three paged scans deduped by id. `>=createdTime` AND
-`<createdTime` is two flat keys that every list method has always honoured, so both dialects
-now cost one selection.
+**Why creation time, plus two legs for named stages.** Owner decision 3 puts a deal in the
+period it was CREATED in (since 2026-09-26). Since 2026-10-02 a deal on a stage the
+administrator named (`services/deal_period.py`) ALSO belongs to the period in which it moved
+into that stage or was modified. The selection is therefore up to three flat filters - created
+in the period; on a named stage and moved in it; on a named stage and modified in it - read as
+separate paged streams and folded together by id. Flat keys rather than one `logic: "OR"`
+group, because every list method honours flat keys and only `crm.item.list` documents the
+group: one shape on both dialects, and a probe that tests exactly what is sent. A portal with
+no named stages sends one stream, exactly as before.
 
 **Why the honour probe.** `createdTime` is confirmed by a retrieved doc, but Bitrix24 may
 **ignore** a filter key it does not apply rather than refuse it. An ignored `>=createdTime`
 deletes the period outright: the selection becomes every deal the viewer can see. On a large
 portal that surfaces as `deal_scan_too_large`; on a small one it is a 200 - a lifetime report
-with a one-month range printed above it, internally consistent in every cell, and wrong.
-`honour_probe_commands` therefore asks the server a question whose answer is known in advance,
-in the EXACT shape production sends, so that a build which drops the key is demoted to the
-`deal` dialect instead of being believed.
+with a one-month range printed above it, internally consistent in every cell, and wrong. An
+ignored `>=movedTime` or `>=updatedTime` does the same to a named stage: every deal ever won
+would land in this month's «Успешные». `honour_probe_commands` therefore asks the server
+questions whose answers are known in advance, in the EXACT shape production sends, so that a
+build which drops a key is demoted to the `deal` dialect instead of being believed. An ignored
+`@stageId` needs no probe: the fold re-checks every stage-leg row's stage, so it can only cost
+pages, never a count.
 """
 
 from __future__ import annotations
@@ -68,6 +74,7 @@ __all__ = [
     "FIELDS_KEY",
     "HONOUR_KEYS",
     "ITEM_DIALECT",
+    "LEG_HONOUR_KEYS",
     "ME_KEY",
     "PREFLIGHT_KEY",
     "SEMANTIC_FAILURE",
@@ -93,6 +100,7 @@ __all__ = [
     "period_filter",
     "stage_entity_id",
     "stage_key",
+    "stage_leg_filters",
     "status_commands",
     "status_key",
 ]
@@ -132,6 +140,8 @@ CATEGORIES_KEY: Final[str] = "cats"
 FIELDS_KEY: Final[str] = "flds"
 PREFLIGHT_KEY: Final[str] = "pre"
 HONOUR_KEYS: Final[tuple[str, str]] = ("hp0", "hp1")
+#: The two probes a portal with named stages adds: `movedTime`, then `updatedTime`.
+LEG_HONOUR_KEYS: Final[tuple[str, str]] = ("hp2", "hp3")
 
 #: A date far enough ahead that no real deal can be at or past it, used by the honour
 #: probe. Deliberately not derived from the clock: `Date.now()` in a builder would make the
@@ -156,6 +166,10 @@ class Dialect:
     assigned_by_id: str
     semantic: str
     created: str
+    #: When the deal moved into its current stage - read-only, set by Bitrix24 itself.
+    moved: str
+    #: When the deal was last modified, by anyone or anything.
+    updated: str
     #: True when the method takes `entityTypeId` and wraps its rows in `result.items`.
     universal: bool
 
@@ -169,6 +183,8 @@ ITEM_DIALECT: Final[Dialect] = Dialect(
     assigned_by_id="assignedById",
     semantic="stageSemanticId",
     created="createdTime",
+    moved="movedTime",
+    updated="updatedTime",
     universal=True,
 )
 
@@ -181,6 +197,8 @@ DEAL_DIALECT: Final[Dialect] = Dialect(
     assigned_by_id="ASSIGNED_BY_ID",
     semantic="STAGE_SEMANTIC_ID",
     created="DATE_CREATE",
+    moved="MOVED_TIME",
+    updated="DATE_MODIFY",
     universal=False,
 )
 
@@ -301,14 +319,21 @@ def status_key(category_id: int) -> str:
     return f"st{category_id}"
 
 
-def page_key(start: int) -> str:
-    """Batch key for one deal page: `pre`, `p50`, `p100`...
+def page_key(start: int, stream: int = 0) -> str:
+    """Batch key for one deal page: `pre`, `p50`, `p100`... and `s1p0`, `s2p50`...
 
-    The first page keeps the bare `pre` key it was requested under in the preflight batch,
-    so a report reads in `rest_log` exactly as §4.12 spells it.
+    Stream 0 is the creation filter and keeps the keys it always had, so a report with no
+    named stages reads in `rest_log` exactly as §4.12 spells it. The stage legs are streams 1
+    and 2; their pages also start at 0, and two pages under one key would be rejected by
+    `BitrixClient.batch` outright - but only after the report was already wrong in the
+    caller's head.
     """
     if start < 0 or start % DEAL_PAGE_SIZE:
         raise ValueError(f"deal page start must be a non-negative multiple of {DEAL_PAGE_SIZE}")
+    if stream < 0:
+        raise ValueError("deal page stream must be non-negative")
+    if stream:
+        return f"s{stream}p{start}"
     if start == 0:
         return PREFLIGHT_KEY
     return f"p{start}"
@@ -389,14 +414,36 @@ def status_commands(
 
 
 def period_filter(dialect: Dialect, *, start_iso: str, end_iso: str) -> dict[str, Any]:
-    """Owner decision 3 as ONE flat filter: deals CREATED inside the window, and no others.
+    """Owner decision 3's first leg as ONE flat filter: deals CREATED inside the window.
 
-    A deal modified or closed in the period but created before it does not count, and one
-    created in the period counts whatever happened to it afterwards. Bounds are half-open
-    (`>=start`, `<end`), so a deal created at midnight on the last day belongs to exactly one
-    period and the second-versus-millisecond boundary argument never arises.
+    One created in the period counts whatever happened to it afterwards. Without named stages
+    this is the whole selection: a deal modified or closed in the period but created before it
+    does not count. Bounds are half-open (`>=start`, `<end`), so a deal created at midnight on
+    the last day belongs to exactly one period and the second-versus-millisecond boundary
+    argument never arises.
     """
     return {f">={dialect.created}": start_iso, f"<{dialect.created}": end_iso}
+
+
+def stage_leg_filters(
+    dialect: Dialect, *, stage_ids: Sequence[str], start_iso: str, end_iso: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The two legs a named stage adds: on it and moved inside the window, or modified in it.
+
+    Two flat filters rather than one `logic: "OR"` group, for the reason the module docblock
+    gives; the fold de-duplicates the deals both legs return. `stage_ids` are bare status ids
+    (`C16:WON`): the filter cannot express the `(funnel, stage)` pair the report keys on, so
+    `_fold` re-checks the pair on every row these legs return.
+    """
+    stages = list(stage_ids)
+    return (
+        {f"@{dialect.stage_id}": stages, f">={dialect.moved}": start_iso, f"<{dialect.moved}": end_iso},
+        {
+            f"@{dialect.stage_id}": stages,
+            f">={dialect.updated}": start_iso,
+            f"<{dialect.updated}": end_iso,
+        },
+    )
 
 
 def _select(dialect: Dialect) -> list[str]:
@@ -426,10 +473,11 @@ def _list_params(
     """One page request, in this dialect's spelling.
 
     `order` by id ascending is what makes offset paging as stable as it can be here. The
-    selection filters on creation time, which no edit changes, so an ordinary edit cannot
-    move a deal between pages. A deletion mid-scan still can, and so can a reassignment when
-    `@assignedById` narrows the selection; the stable key and the fold's dedup by id turn
-    either into a possible one-row undercount, never a double count.
+    creation stream filters on creation time, which no edit changes, so an ordinary edit
+    cannot move a deal between its pages. A deletion mid-scan still can, and so can a
+    reassignment when `@assignedById` narrows the selection - and on the stage legs, which
+    filter on modification and stage, so can any edit. The stable key and the fold's dedup by
+    id turn each of these into a possible one-row undercount, never a double count.
     """
     params: dict[str, Any] = dict(filter_)
     if assigned_to:
@@ -451,8 +499,9 @@ def list_page_commands(
     filter_: dict[str, Any],
     starts: Sequence[int],
     assigned_to: Sequence[int] = (),
+    stream: int = 0,
 ) -> list[tuple[str, str, dict[str, Any]]]:
-    """Page requests for the given offsets, ready to pack into one batch.
+    """Page requests for the given offsets of one stream, ready to pack into one batch.
 
     Speculative packing is the same idiom `crm.py::activity_page_commands` uses: a page past
     the end of the selection answers an empty list rather than an error, so a batch may ask
@@ -460,7 +509,7 @@ def list_page_commands(
     """
     return [
         (
-            page_key(start),
+            page_key(start, stream),
             dialect.method,
             _list_params(dialect, filter_=filter_, start=start, assigned_to=assigned_to),
         )
@@ -468,19 +517,25 @@ def list_page_commands(
     ]
 
 
-def honour_probe_commands(dialect: Dialect) -> list[tuple[str, str, dict[str, Any]]]:
-    """Two questions whose answers are known, in the EXACT shape production sends.
+def honour_probe_commands(
+    dialect: Dialect, *, legs: bool = False
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """Questions whose answers are known, in the EXACT shape production sends.
 
     `hp0` is unfiltered and establishes that this viewer can see anything at all - without
-    it a zero from `hp1` proves nothing, because a viewer with no readable deals returns
-    zero for every filter.
+    it a zero from any other probe proves nothing, because a viewer with no readable deals
+    returns zero for every filter.
 
     `hp1` asks for deals created at or past the year 2999, as the same flat key
     `period_filter` sends. No deal can be: an honoured filter answers zero, and any non-zero
     total means the key was dropped - which on this page deletes the period rather than
     narrowing it.
+
+    `legs=True` adds `hp2` and `hp3`, the same question of `movedTime` and `updatedTime`, for
+    a portal whose administrator named stages (`stage_leg_filters`). Without them a portal
+    with no named stages sends exactly the two probes it always did.
     """
-    return [
+    commands = [
         (HONOUR_KEYS[0], dialect.method, _list_params(dialect, filter_={}, start=0)),
         (
             HONOUR_KEYS[1],
@@ -488,10 +543,25 @@ def honour_probe_commands(dialect: Dialect) -> list[tuple[str, str, dict[str, An
             _list_params(dialect, filter_={f">={dialect.created}": _NEVER_ISO}, start=0),
         ),
     ]
+    if legs:
+        for key, field_name in zip(LEG_HONOUR_KEYS, (dialect.moved, dialect.updated), strict=True):
+            commands.append(
+                (
+                    key,
+                    dialect.method,
+                    _list_params(dialect, filter_={f">={field_name}": _NEVER_ISO}, start=0),
+                )
+            )
+    return commands
 
 
-def honour_verdict(*, baseline: int | None, future: int | None) -> bool | None:
+def honour_verdict(
+    *, baseline: int | None, future: int | None, legs: Sequence[int | None] = ()
+) -> bool | None:
     """`True` honoured, `False` demote to the fallback dialect, `None` inconclusive.
+
+    `legs` are the totals of the `movedTime` / `updatedTime` probes when they were sent; every
+    future-dated probe must answer zero.
 
     `None` is returned when the baseline is zero or unknown, and the caller MUST NOT cache
     it. A viewer whose CRM rights are "own deals only" and who owns nothing gets a zero
@@ -501,9 +571,10 @@ def honour_verdict(*, baseline: int | None, future: int | None) -> bool | None:
     """
     if baseline is None or baseline <= 0:
         return None
-    if future is None:
+    futures = [future, *legs]
+    if any(value is None for value in futures):
         return None
-    return future == 0
+    return all(value == 0 for value in futures)
 
 
 # --- parsers ----------------------------------------------------------------------------

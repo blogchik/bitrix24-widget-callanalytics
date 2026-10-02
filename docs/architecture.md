@@ -640,6 +640,13 @@ CREATE INDEX crm_dirty_due_idx ON crm_dirty (portal_id, not_before);
 -- RLS: crm_items, crm_funnels, crm_stages, crm_dirty get the same ENABLE + FORCE and the same
 -- <table>_tenant policy as calls below.
 
+-- ===================== 0007_deal_period_rule (§4.12 constraint 3; COMMENT in the revision) =====================
+ALTER TABLE portals
+    ADD COLUMN deal_period_rule jsonb NOT NULL DEFAULT '{}'::jsonb,  -- {"stage_keys": ["16:C16:WON", ...]}
+    ADD CONSTRAINT portals_deal_period_rule_chk CHECK (jsonb_typeof(deal_period_rule) = 'object');
+-- {} = creation time alone. One writer (services/portals.set_deal_period_rule), audited to
+-- portal_events as deal_period_rule_set; one reader of its shape (services/deal_period.py).
+
 -- ---------- Row-Level Security: structural tenant isolation ----------
 ALTER TABLE calls        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE calls        FORCE  ROW LEVEL SECURITY;
@@ -810,6 +817,13 @@ rows of its own.
 3. A deal counts if it was **created** inside the period; the operator is `ASSIGNED_BY_ID`.
    *Changed by the owner 2026-09-26: a deal modified or closed in the period but created
    before it no longer counts. It was "created, modified or closed" until then.*
+   *Extended by the owner 2026-10-02: a deal on a stage an administrator names on the
+   Settings page (`portals.deal_period_rule`, 0007) also counts in the period in which it
+   **moved into that stage** (`movedTime`) **or was modified** (`updatedTime`). The owner asked
+   for «Успешные» and «Заклад»; every other stage keeps creation alone, and `{}` - the default -
+   is creation alone everywhere. Stages are named per stage, not per outcome: on 2026-09-14
+   portal 1 bulk-moved 112 old won deals into its «База» funnel, and an "every won stage" rule
+   would have counted all of them as September's sales.*
 4. ~~**Nothing is stored** — no table, no migration, no sync phase.~~ *Superseded
    2026-09-14 by the CRM mirror (decision 26, §4.14). Until a portal is switched to the
    mirror, this section describes the live read it still serves.*
@@ -851,14 +865,31 @@ an administrator, a team lead and a salesperson alike.
 | Dictionary | `crm.category.list` + `crm.status.list` | `crm.dealcategory.list` + `crm.dealcategory.stage.list` |
 
 `crm.deal.*` is officially discontinued for new development, so the universal method is the
-primary path. Constraint 3 is two flat keys that every list method honours, so both paths cost
-one paged selection. Never gate on a version number; the only detector is the typed error.
+primary path. Constraint 3 is flat keys that every list method honours, so both paths send the
+same selections. Never gate on a version number; the only detector is the typed error.
 
-**The period filter** is creation time alone (`DATE_CREATE` on the fallback):
+**The period filter** is creation time (`DATE_CREATE` on the fallback):
 
 ```json
 {">=createdTime": "<startISO>", "<createdTime": "<endISO>"}
 ```
+
+A portal with named stages adds **two more streams**, flat as well (`STAGE_ID`, `MOVED_TIME`,
+`DATE_MODIFY` on the fallback), paged separately and folded together by id, so a deal created
+and won in the period counts once:
+
+```json
+{"@stageId": ["C16:WON", "C16:UC_0U9IW2"], ">=movedTime": "<startISO>", "<movedTime": "<endISO>"}
+{"@stageId": ["C16:WON", "C16:UC_0U9IW2"], ">=updatedTime": "<startISO>", "<updatedTime": "<endISO>"}
+```
+
+Flat streams rather than one `logic: "OR"` group because only `crm.item.list` documents the
+group: one shape on both dialects, and a probe that tests what is sent. The stage legs ask by
+bare status id, and the fold re-checks every leg row's `(funnel, stage)` column against the
+named ones - skipping a row it rejects without marking it seen, so the same deal still counts
+from the creation stream. The cap gates the SUM of the three totals. Without named stages the
+request is exactly the one-stream request of 2026-09-26. The mirror applies the same rule as
+one `OR` in SQL, resolved from the same named stages (`services/deal_period.py`).
 
 Bounds carry an **explicit offset**: a bare date is read in the *portal's* zone while this app
 computes its period in the viewer's, which is the normal case.
@@ -867,8 +898,13 @@ computes its period in the viewer's, which is the normal case.
 ignored `>=createdTime` deletes the period outright: the selection becomes every deal the
 viewer can see — a report that is plausible, larger than the truth, and wrong with no symptom.
 `crm.item.fields` proves the name exists; a year-2999 probe in the **exact flat shape the
-period sends** proves the filter is applied. A verdict is cached only when the unfiltered
-baseline is non-zero: a viewer who can see no deals proves nothing about the build.
+period sends** proves the filter is applied. A portal with named stages also proves
+`movedTime` and `updatedTime` the same way (`hp2`, `hp3`): an ignored one would put every deal
+ever won into this month's «Успешные». A verdict reached without those two does not vouch for
+a report that sends them; the next such report probes again. An ignored `@stageId` needs no
+probe, because the fold's re-check turns it into extra pages, never into a count. A verdict is
+cached only when the unfiltered baseline is non-zero: a viewer who can see no deals proves
+nothing about the build.
 
 `ENTITY_ID` is `DEAL_STAGE` for funnel 0 and `DEAL_STAGE_<id>` otherwise. **`DEAL_STAGE_0`
 returns an empty list with no error** — a silent zero-column funnel, caught only by the unit
@@ -920,7 +956,11 @@ comparable, and adding them would invent a number.
 * The unassigned row is kept and sorts last, as `load_hours` keeps its NULL row.
 * `subtotal` is server-computed over every operator, including any past the 200-row cap.
 * The page states that every count is a **current-stage snapshot** of deals that touched the
-  period — the most likely misreading of the whole report.
+  period — the most likely misreading of the whole report. `period_rule.stage_keys` names the
+  columns that also count deals moved onto them or modified in the period; the page marks
+  them, and the rollups they feed, with ↻ and names them in that sentence. Because those deals
+  count in the period they moved in as well as the one they were created in, monthly reports
+  no longer add up to a quarter's - the quarter counts each deal once.
 
 #### Caveat
 

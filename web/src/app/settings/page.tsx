@@ -40,6 +40,7 @@ import {
   Section,
 } from '@/components/AppFrame';
 import CrmScopeSection from '@/components/CrmScopeSection';
+import DealPeriodSection from '@/components/DealPeriodSection';
 import PageNav, { NAV_CSS } from '@/components/PageNav';
 import StateCard from '@/components/StateCard';
 import { apiFetch, setCrmAnalytics, useMe, type Me } from '@/lib/api';
@@ -562,6 +563,10 @@ export default function SettingsPage() {
       {/* Only while CRM analytics is on: with the mirror turned off there is nothing to
           scope, and a picker over a deleted copy would be a promise the app cannot keep. */}
       {crmOn ? <CrmScopeSection /> : null}
+
+      {/* -------------------------------------------------- deal period --------- */}
+      {/* The same condition, for the same reason: the stages to choose from are the mirror's. */}
+      {crmOn ? <DealPeriodSection /> : null}
 
       {/* ----------------------------------------------------------- token ------- */}
       <Section title={t('app.settings.tokenSection')}>

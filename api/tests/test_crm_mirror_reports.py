@@ -8,16 +8,17 @@ mirror SQL. Then the two wire bodies are compared whole.
 
 The rows are chosen to exercise what a plausible-but-wrong mirror would get wrong: a deal
 created in the period and closed after it (counted), deals modified or closed in the period but
-created before it (not counted - the deal period is creation time alone), a tombstone, the
-explicit-P quirk G0 Q3 keeps until cutover, a stage the dictionary does not know, an amount that
-rounds, a record without one, a tag longer than the cut, and a creation time that falls on the
-next local day in the viewer's zone.
+created before it (not counted - unless their stage is one the administrator named, owner
+decision 3 as of 2026-10-02), a tombstone, the explicit-P quirk G0 Q3 keeps until cutover, a
+stage the dictionary does not know, an amount that rounds, a record without one, a tag longer
+than the cut, and a creation time that falls on the next local day in the viewer's zone.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import AsyncIterator, Mapping
+import json
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -36,7 +37,7 @@ from app.config import settings
 from app.db.models import Portal
 from app.db.session import control_txn, tenant_txn
 from app.security.principal import Principal, PrincipalError
-from app.services import crm_repo, crm_shadow, deal_stats, utm_stats
+from app.services import crm_repo, crm_shadow, deal_period, deal_stats, utm_stats
 from app.services.stats import parse_filters
 from app.sync import crm_lanes
 from app.sync.crm_upsert import upsert_items
@@ -162,6 +163,8 @@ def _stage_rows(category_id: int) -> list[dict[str, Any]]:
     prefix = f"C{category_id}:" if category_id else ""
     return [
         {"STATUS_ID": f"{prefix}NEW", "NAME": "Новая", "SORT": "10", "SEMANTICS": None},
+        # A working stage an administrator may name, as portal 1 named «Заклад».
+        {"STATUS_ID": f"{prefix}PLEDGE", "NAME": "Заклад", "SORT": "30", "SEMANTICS": None},
         {"STATUS_ID": f"{prefix}WON", "NAME": "Успех", "SORT": "40", "SEMANTICS": "S"},
         {"STATUS_ID": f"{prefix}LOSE", "NAME": "Отказ", "SORT": "50", "SEMANTICS": "F"},
     ]
@@ -321,17 +324,30 @@ def deal_rows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     return selected, unselected
 
 
-async def live_deal_report(portal: SeededPortal, rows: list[dict[str, Any]], filters: Any) -> dict[str, Any]:
+async def live_deal_report(
+    portal: SeededPortal,
+    rows: list[dict[str, Any]],
+    filters: Any,
+    *,
+    legs: Sequence[dict[str, Any]] = (),
+    rule: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The live read's fold: `rows` from the creation stream, `legs` from the stage legs."""
     dictionary = live_dictionary()
+    stage_legs = deal_period.resolve(rule, dictionary.stages)
+    known = deal_stats._stage_index(dictionary)
     groups: dict[int | None, Any] = {}
     seen: set[int] = set()
-    deal_stats._fold(
-        rows,
-        dialect=ITEM_DIALECT,
-        known=deal_stats._stage_index(dictionary),
-        groups=groups,
-        seen=seen,
-    )
+    deal_stats._fold(rows, dialect=ITEM_DIALECT, known=known, groups=groups, seen=seen)
+    if stage_legs:
+        deal_stats._fold(
+            list(legs),
+            dialect=ITEM_DIALECT,
+            known=known,
+            groups=groups,
+            seen=seen,
+            only=frozenset(stage.key for stage in stage_legs),
+        )
     operators = {uid for group in groups.values() for uid in group.rows if uid is not None}
     return deal_stats._build_response(
         filters=filters,
@@ -344,7 +360,19 @@ async def live_deal_report(portal: SeededPortal, rows: list[dict[str, Any]], fil
         rest_requests=0,
         from_cache=False,
         assigned_to=filters.employees,
+        stage_legs=stage_legs,
     )
+
+
+async def name_stages(portal_id: int, keys: list[str]) -> dict[str, Any]:
+    """What the Settings page stores, written directly; returns the rule for the live fold."""
+    rule = {"stage_keys": keys}
+    async with control_txn() as session:
+        await session.execute(
+            text("UPDATE portals SET deal_period_rule = CAST(:rule AS jsonb) WHERE id = :pid"),
+            {"rule": json.dumps(rule), "pid": portal_id},
+        )
+    return rule
 
 
 async def test_the_deal_report_from_the_mirror_is_the_live_report(
@@ -428,6 +456,137 @@ async def test_a_timed_period_cuts_the_mirror_at_the_minute_with_an_exclusive_en
 
     assert mirror["totals"]["total"] == 2
     assert (mirror["range"]["from_time"], mirror["range"]["to_time"]) == ("10:00", "19:00")
+
+
+# --- named stages (owner decision 3, 2026-10-02) ------------------------------------------------
+
+
+def named_stage_rows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(rows only a named stage's legs select in June, rows on a named stage they must not)."""
+    legs = [
+        # Created in May, moved into the won stage in June.
+        deal(40, category=GROW, stage="C7:WON", user=VIEWER, semantic="S", createdTime=BEFORE, closed="Y"),
+        # On «Заклад» since May and edited in June: the owner asked for modification as well.
+        deal(41, category=GROW, stage="C7:PLEDGE", user=OTHER, createdTime=BEFORE, movedTime=BEFORE),
+        # Moved onto «Заклад» in June and edited again in July: the move keeps it in June.
+        deal(42, category=GROW, stage="C7:PLEDGE", user=OTHER, createdTime=BEFORE, updatedTime=AFTER),
+    ]
+    outside = [
+        # On «Заклад» since May and untouched since.
+        deal(43, category=GROW, stage="C7:PLEDGE", user=OTHER, createdTime=BEFORE, movedTime=BEFORE,
+             updatedTime=BEFORE),
+        # Won in July.
+        deal(44, category=GROW, stage="C7:WON", user=VIEWER, semantic="S", createdTime=BEFORE,
+             movedTime=AFTER, updatedTime=AFTER, closed="Y"),
+        # A won stage nobody named - portal 1's «База» funnel, where 112 old won deals were
+        # moved in on 2026-09-14 - stays on creation time alone.
+        deal(45, category=DEFAULT_FUNNEL, stage="WON", user=OTHER, semantic="S", createdTime=BEFORE,
+             closed="Y"),
+        # A lost stage nobody named, moved and edited in June.
+        deal(46, category=GROW, stage="C7:LOSE", user=OTHER, semantic="F", createdTime=BEFORE),
+    ]
+    return legs, outside
+
+
+def in_june(row: Mapping[str, Any]) -> bool:
+    """What the live read's two legs select: moved or modified inside June."""
+    return IN in (row["movedTime"], row["updatedTime"])
+
+
+async def test_named_stages_count_deals_moved_or_modified_in_the_period_on_both_paths(
+    mirrored: tuple[SeededPortal, Fence],
+) -> None:
+    portal, fence = mirrored
+    selected, unselected = deal_rows()
+    legs, outside = named_stage_rows()
+    everything = [*selected, *unselected, *legs, *outside]
+    await seed_dictionary(portal.portal_id)
+    await store(fence, everything, crm_items.DEAL_ITEM)
+    await loaded(portal.portal_id, now=dt.datetime.now(dt.UTC))
+    rule = await name_stages(portal.portal_id, ["7:C7:WON", "7:C7:PLEDGE"])
+    principal = viewer(portal)
+    filters = parse_filters(JUNE, principal)
+
+    # The live legs return every deal on a named stage moved or modified in June - deal 2 too,
+    # which the creation stream already has - and the fold counts it once.
+    named = [row for row in everything if row["stageId"] in ("C7:WON", "C7:PLEDGE") and in_june(row)]
+    assert {row["id"] for row in named} == {2, 40, 41, 42}
+    live = await live_deal_report(portal, selected, filters, legs=named, rule=rule)
+    mirror = await deal_stats.load_deal_report_mirror(principal, await portal_row(portal.portal_id), filters)
+
+    assert without_source(mirror) == without_source(live)
+    assert mirror["totals"]["total"] == len(selected) + 3
+    grow = next(group for group in mirror["groups"] if group["category_id"] == GROW)
+    assert grow["subtotal"]["won"] == 2, "deal 2 by the quirk, deal 40 by its move"
+    assert grow["subtotal"]["cells"]["7:C7:PLEDGE"] == 2
+    # Dictionary order, which is the order the columns are drawn in.
+    assert mirror["period_rule"] == {"stage_keys": ["7:C7:PLEDGE", "7:C7:WON"]}
+
+    # An employee filter narrows the legs exactly as it narrows the creation stream.
+    narrowed = parse_filters(QueryParams([*JUNE.multi_items(), ("employee", str(OTHER))]), principal)
+    live = await live_deal_report(
+        portal,
+        [row for row in selected if row["assignedById"] == OTHER],
+        narrowed,
+        legs=[row for row in named if row["assignedById"] == OTHER],
+        rule=rule,
+    )
+    mirror = await deal_stats.load_deal_report_mirror(principal, await portal_row(portal.portal_id), narrowed)
+    assert without_source(mirror) == without_source(live)
+    assert mirror["totals"]["total"] == 4
+
+
+async def test_without_a_rule_a_deal_moved_in_the_period_is_not_counted(
+    mirrored: tuple[SeededPortal, Fence],
+) -> None:
+    """`{}` is creation time alone: the report every portal drew before 2026-10-02."""
+    portal, fence = mirrored
+    legs, outside = named_stage_rows()
+    await seed_dictionary(portal.portal_id)
+    await store(fence, [*legs, *outside], crm_items.DEAL_ITEM)
+    await loaded(portal.portal_id, now=dt.datetime.now(dt.UTC))
+    principal = viewer(portal)
+
+    mirror = await deal_stats.load_deal_report_mirror(
+        principal, await portal_row(portal.portal_id), parse_filters(JUNE, principal)
+    )
+    assert mirror["groups"] == []
+    assert mirror["period_rule"] == {"stage_keys": []}
+
+
+async def test_a_timed_period_cuts_a_named_stage_at_the_minute_too(
+    mirrored: tuple[SeededPortal, Fence],
+) -> None:
+    """The legs share the period's bounds: the start minute is in, the end minute is not."""
+    portal, fence = mirrored
+    await seed_dictionary(portal.portal_id)
+    moved = {
+        61: "2026-06-10T09:59:59+05:00",  # a second before the start: out
+        62: "2026-06-10T10:00:00+05:00",  # the start itself: in
+        63: "2026-06-10T18:59:59+05:00",  # the last second before the end: in
+        64: "2026-06-10T19:00:00+05:00",  # the end itself: out
+        65: "2026-06-10T19:00:30+05:00",  # inside the end MINUTE, still out
+    }
+    await store(
+        fence,
+        [deal(item_id, category=GROW, stage="C7:WON", user=VIEWER, semantic="S", createdTime=BEFORE,
+              movedTime=moment, updatedTime=moment, closed="Y")
+         for item_id, moment in moved.items()],
+        crm_items.DEAL_ITEM,
+    )
+    await loaded(portal.portal_id, now=dt.datetime.now(dt.UTC))
+    await name_stages(portal.portal_id, ["7:C7:WON"])
+    principal = viewer(portal)
+    filters = deal_stats.parse_deal_filters(
+        QueryParams({"period": "custom", "from": "2026-06-10", "from_time": "10:00",
+                     "to": "2026-06-10", "to_time": "19:00"}),
+        principal,
+        mirror=True,
+    )
+
+    mirror = await deal_stats.load_deal_report_mirror(principal, await portal_row(portal.portal_id), filters)
+
+    assert mirror["totals"]["total"] == 2
 
 
 # --- /utm --------------------------------------------------------------------------------------

@@ -20,6 +20,7 @@ feature could be wrong while looking right:
 from __future__ import annotations
 
 import datetime as dt
+import json
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, Final
 from urllib.parse import parse_qsl
@@ -30,7 +31,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.config import settings
-from app.db.session import tenant_txn
+from app.db.session import control_txn, tenant_txn
 from app.main import create_app
 from app.security.session_token import issue_session
 from app.services import deal_stats
@@ -346,6 +347,160 @@ async def test_the_period_selects_on_creation_time_alone(
         "filter[>=createdTime]": "2026-05-31T19:00:00+00:00",
         "filter[<createdTime]": "2026-06-30T19:00:00+00:00",
     }
+    # No named stages: no legs, nothing marked on the page.
+    assert response.json()["period_rule"] == {"stage_keys": []}
+
+
+# --- named stages (owner decision 3, 2026-10-02) ------------------------------------------
+
+JUNE_START: Final[str] = "2026-05-31T19:00:00+00:00"
+JUNE_END: Final[str] = "2026-06-30T19:00:00+00:00"
+NEVER: Final[str] = "2999-01-01T00:00:00+00:00"
+
+
+async def name_stages(portal_id: int, keys: list[str]) -> None:
+    """What the Settings page stores, written directly: this file tests the report."""
+    async with control_txn() as session:
+        await session.execute(
+            text("UPDATE portals SET deal_period_rule = CAST(:rule AS jsonb) WHERE id = :pid"),
+            {"rule": json.dumps({"stage_keys": keys}), "pid": portal_id},
+        )
+
+
+def legs_fake(
+    created: list[dict[str, Any]],
+    moved: list[dict[str, Any]],
+    updated: list[dict[str, Any]],
+    *,
+    probes: tuple[int, int, int] = (0, 0, 0),
+) -> FakeBitrix:
+    """The cold path of a portal with named stages: four probes, then one page per stream."""
+    future = [Page(items=[deal(98, GROW, "C7:NEW", VIEWER, "P")] if n else [], total=n) for n in probes]
+    return (
+        FakeBitrix()
+        .on("user.current", me())
+        .on("crm.item.fields", item_fields())
+        .on("crm.category.list", categories())
+        .on("crm.status.list", stages("C7:"), stages(""))
+        .on(
+            "crm.item.list",
+            Page(items=[deal(99, GROW, "C7:NEW", VIEWER, "P")], total=1),
+            *future,
+            Page(items=created, total=len(created)),
+            Page(items=moved, total=len(moved)),
+            Page(items=updated, total=len(updated)),
+        )
+    )
+
+
+async def test_a_named_stage_adds_two_legs_and_counts_every_deal_once(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """A deal won in June counts in June even if it was created before it - once."""
+    await name_stages(portal.portal_id, ["7:C7:WON"])
+    fake = legs_fake(
+        sample_deals(),
+        # Deal 3 was created AND won in June: the creation stream has it already.
+        moved=[deal(3, GROW, "C7:WON", VIEWER, "S"), deal(50, GROW, "C7:WON", OTHER, "S")],
+        updated=[
+            deal(50, GROW, "C7:WON", OTHER, "S"),
+            deal(51, GROW, "C7:WON", VIEWER, "S"),
+            # A build that ignored `@stageId`: a stage nobody named must not be counted.
+            deal(52, GROW, "C7:NEW", VIEWER, "P"),
+        ],
+    )
+    with patch_httpx(fake):
+        response = await post_deals(client, session_for(portal))
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Identity + dictionary, stages + four probes, then page 0 of all three streams.
+    assert fake.rest_count == 3
+    grow = group_of(body, GROW)
+    assert grow["subtotal"]["won"] == 3
+    assert grow["subtotal"]["total"] == 7
+    assert grow["subtotal"]["cells"]["7:C7:NEW"] == 1
+    assert body["totals"]["total"] == 9
+    assert body["scan"]["deals"] == 9
+    assert body["period_rule"] == {"stage_keys": ["7:C7:WON"]}
+
+    *probes, created, moved, updated = list_filters(fake)
+    assert probes == [
+        {},
+        {"filter[>=createdTime]": NEVER},
+        {"filter[>=movedTime]": NEVER},
+        {"filter[>=updatedTime]": NEVER},
+    ]
+    assert created == {"filter[>=createdTime]": JUNE_START, "filter[<createdTime]": JUNE_END}
+    assert moved == {
+        "filter[@stageId][0]": "C7:WON",
+        "filter[>=movedTime]": JUNE_START,
+        "filter[<movedTime]": JUNE_END,
+    }
+    assert updated == {
+        "filter[@stageId][0]": "C7:WON",
+        "filter[>=updatedTime]": JUNE_START,
+        "filter[<updatedTime]": JUNE_END,
+    }
+
+
+async def test_the_cap_counts_every_stream(
+    client: httpx.AsyncClient, portal: SeededPortal, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sum of the three totals is gated, not the creation stream's alone."""
+    monkeypatch.setattr(deal_stats, "settings", settings.model_copy(update={"deal_scan_cap": 8}))
+    await name_stages(portal.portal_id, ["7:C7:WON"])
+    fake = legs_fake(
+        sample_deals(),
+        moved=[deal(50, GROW, "C7:WON", OTHER, "S")],
+        updated=[deal(51, GROW, "C7:WON", OTHER, "S")],
+    )
+    with patch_httpx(fake):
+        response = await post_deals(client, session_for(portal))
+    assert response.status_code == 400
+    assert response.json()["code"] == "deal_scan_too_large"
+    assert response.json()["deals"] == 9
+
+
+async def test_a_portal_that_ignores_moved_time_is_demoted(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """Believed, the leg would put every deal ever won into this month's column."""
+    await name_stages(portal.portal_id, ["7:C7:WON"])
+    fake = legs_fake([], [], [], probes=(0, 1, 0))
+    fake.on("crm.deal.list", Page(items=[], total=0))
+    with patch_httpx(fake):
+        response = await post_deals(client, session_for(portal))
+    assert response.status_code == 200, response.text
+    assert response.json()["scan"]["list_dialect"] == "deal"
+    sent = [
+        dict(parse_qsl(command.partition("?")[2]))
+        for record in fake.requests
+        if record.kind == "batch"
+        for command in record.commands.values()
+        if command.startswith("crm.deal.list")
+    ]
+    # The fallback spells the same legs in its own dialect.
+    assert {"filter[@STAGE_ID][0]": "C7:WON"}.items() <= sent[1].items()
+    assert "filter[>=MOVED_TIME]" in sent[1]
+    assert "filter[>=DATE_MODIFY]" in sent[2]
+
+
+async def test_a_verdict_reached_without_the_leg_probes_does_not_vouch_for_them(
+    client: httpx.AsyncClient, portal: SeededPortal
+) -> None:
+    """A rule saved after the portal's verdict was cached makes the next report probe again."""
+    token = session_for(portal)
+    with patch_httpx(cold_fake()):
+        assert (await post_deals(client, token)).status_code == 200
+
+    await name_stages(portal.portal_id, ["7:C7:WON"])
+    fake = legs_fake(sample_deals(), [], [])
+    with patch_httpx(fake):
+        response = await post_deals(client, token)
+    assert response.status_code == 200, response.text
+    assert {"filter[>=movedTime]": NEVER} in list_filters(fake)
+    assert response.json()["scan"]["from_cache"] is False
 
 
 # --- the viewer's own token ------------------------------------------------------------------

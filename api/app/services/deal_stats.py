@@ -20,11 +20,12 @@ number.
 **3. Offset paging, not cursor paging.** `start: -1` is faster (it disables the count) and is
 immune to drift, and it forfeits `total` - which is the preflight gate, the one thing that
 lets this endpoint refuse an impossible report in two seconds instead of discovering it after
-twenty-eight. The trade is deliberate and its cost is small: the selection filters on creation
-time, which no edit changes, but a deal deleted mid-scan - or reassigned, when an employee
-filter narrows the selection - can shift later pages and produce a one-row undercount.
-Ordering by id ascending and de-duplicating by id means drift can only ever lose a row, never
-double one.
+twenty-eight. The trade is deliberate and its cost is small: the creation stream filters on
+creation time, which no edit changes, but a deal deleted mid-scan - or reassigned, when an
+employee filter narrows the selection - can shift later pages and produce a one-row
+undercount. The stage legs a named stage adds (`services/deal_period.py`) filter on movement
+and modification, so any edit can shift theirs. Ordering by id ascending and de-duplicating by
+id means drift can only ever lose a row, never double one.
 
 **4. The viewer's own Bitrix24 token, never the installer's.** `principal.access` is decided
 from `user.admin` plus a `voximplant.statistic.get` probe - it is a TELEPHONY verdict, and
@@ -75,6 +76,7 @@ from app.bitrix.deals import (
     FIELDS_KEY,
     HONOUR_KEYS,
     ITEM_DIALECT,
+    LEG_HONOUR_KEYS,
     ME_KEY,
     Dialect,
     Funnel,
@@ -94,6 +96,7 @@ from app.bitrix.deals import (
     parse_stages,
     period_filter,
     stage_key,
+    stage_leg_filters,
     status_commands,
     status_key,
 )
@@ -116,7 +119,7 @@ from app.db.models import Employee, Portal
 from app.db.session import tenant_txn
 from app.logging import get_logger
 from app.security.principal import Principal
-from app.services import crm_repo
+from app.services import crm_repo, deal_period
 from app.services.stats import CallFilters, FilterError, parse_filters
 from app.sync.throttle import read_time_block
 
@@ -170,6 +173,13 @@ _ADMIT_WAIT_S: Final[float] = 0.5
 
 _FIELD_NAMES: Final[tuple[str, ...]] = (ITEM_DIALECT.created,)
 
+#: What the stage legs send besides: a portal with named stages must declare these too.
+_LEG_FIELD_NAMES: Final[tuple[str, ...]] = (
+    ITEM_DIALECT.moved,
+    ITEM_DIALECT.updated,
+    ITEM_DIALECT.stage_id,
+)
+
 
 class DealReportError(Exception):
     """A deal report that cannot be served, as a machine code (§8).
@@ -216,9 +226,11 @@ class _Dictionary:
 #: `resolved_by_user_id` rule refuses for CRM contexts.
 _dictionary_cache: dict[tuple[int, int], tuple[float, _Dictionary]] = {}
 
-#: `portal_id` -> `(expires_at, honoured)`. Keyed by portal alone: whether a method exists
-#: and whether it applies a filter are properties of the build, not of a permission.
-_dialect_cache: dict[int, tuple[float, bool]] = {}
+#: `portal_id` -> `(expires_at, honoured, legs_probed)`. Keyed by portal alone: whether a
+#: method exists and whether it applies a filter are properties of the build, not of a
+#: permission. `legs_probed` says the verdict also covers `movedTime` / `updatedTime`; a
+#: verdict reached without them does not vouch for a report that sends them.
+_dialect_cache: dict[int, tuple[float, bool, bool]] = {}
 
 #: `(portal_id, user_id)` -> recent report timestamps.
 _report_window: dict[tuple[int, int], deque[float]] = {}
@@ -494,8 +506,21 @@ def _dialect_for(portal_id: int) -> Dialect:
     return ITEM_DIALECT
 
 
-def _remember_dialect(portal_id: int, honoured: bool) -> None:
-    _dialect_cache[portal_id] = (time.monotonic() + _DIALECT_TTL_S, honoured)
+def _dialect_known(portal_id: int, *, legs: bool) -> bool:
+    """A live verdict that covers every key this report will send.
+
+    A verdict for the fallback dialect covers the legs too: `crm.deal.list` is never probed,
+    so there is nothing a second look could add.
+    """
+    entry = _dialect_cache.get(portal_id)
+    if entry is None or entry[0] <= time.monotonic():
+        return False
+    _, honoured, legs_probed = entry
+    return legs_probed or not legs or not honoured
+
+
+def _remember_dialect(portal_id: int, honoured: bool, *, legs: bool = False) -> None:
+    _dialect_cache[portal_id] = (time.monotonic() + _DIALECT_TTL_S, honoured, legs)
 
 
 def _build_dictionary(
@@ -595,6 +620,7 @@ async def _load_dictionary(
     *,
     list_dialect: Dialect,
     probe_honour: bool,
+    legs: bool = False,
 ) -> tuple[_Dictionary, Dialect]:
     """The cold path: identity, funnels, field names, stages and the honour probe.
 
@@ -604,8 +630,9 @@ async def _load_dictionary(
 
     * "Does this build have `crm.category.list`?" is answered by `MethodNotFound` on the
       dictionary, and its fallback is `crm.dealcategory.*`.
-    * "Does this build honour the `createdTime` filter on `crm.item.list`?" is answered by
-      the probe, and its fallback is `crm.deal.list`.
+    * "Does this build honour the period's filters on `crm.item.list`?" is answered by the
+      probe, and its fallback is `crm.deal.list`. `legs` - the portal has named stages -
+      extends both the field-name check and the probe to `movedTime` and `updatedTime`.
 
     A portal can fail either without failing the other, and an earlier revision of this
     module re-read the whole dictionary whenever the probe failed - which cost a round trip,
@@ -650,25 +677,29 @@ async def _load_dictionary(
         raise DealReportError("crm_no_access", 403)
 
     if list_dialect.universal:
-        missing = set(_FIELD_NAMES) - field_names_present(batch.get(FIELDS_KEY), _FIELD_NAMES)
+        names = _FIELD_NAMES + (_LEG_FIELD_NAMES if legs else ())
+        missing = set(names) - field_names_present(batch.get(FIELDS_KEY), names)
         if missing:
-            # The name the period filter depends on does not exist here. Sending it anyway
+            # A name the period filters depend on does not exist here. Sending it anyway
             # risks it being IGNORED rather than refused, which silently deletes the period.
             _log.info(
                 "deals: universal field names missing, using the deal dialect",
                 extra={"portal_id": portal.id, "missing": sorted(missing)},
             )
             list_dialect = DEAL_DIALECT
-            _remember_dialect(portal.id, honoured=False)
+            _remember_dialect(portal.id, honoured=False, legs=legs)
 
     ids = [funnel.id for funnel in funnels]
-    probe = probe_honour and list_dialect.universal
-    room = 50 - (len(HONOUR_KEYS) if probe else 0)
+    probes = (
+        honour_probe_commands(list_dialect, legs=legs)
+        if probe_honour and list_dialect.universal
+        else []
+    )
+    room = 50 - len(probes)
     second: list[tuple[str, str, dict[str, Any]]] = list(
         status_commands(ids[:room], universal=dictionary_universal)
     )
-    if probe:
-        second.extend(honour_probe_commands(list_dialect))
+    second.extend(probes)
     stage_batch = await _run_batch(client, second, budget)
 
     # A portal with more funnels than one batch holds pays one more round trip for the rest
@@ -683,22 +714,23 @@ async def _load_dictionary(
             commands=stage_batch.commands + extra.commands, time=stage_batch.time
         )
 
-    if probe:
+    if probes:
         verdict = honour_verdict(
             baseline=stage_batch.total_of(HONOUR_KEYS[0]),
             future=stage_batch.total_of(HONOUR_KEYS[1]),
+            legs=[stage_batch.total_of(key) for key in LEG_HONOUR_KEYS] if legs else (),
         )
         if verdict is False:
-            # The filter was sent and not applied. Believing this portal would produce a
+            # A filter was sent and not applied. Believing this portal would produce a
             # report that is plausible, larger than the truth, and wrong with no symptom.
             _log.warning(
-                "deals: the portal does not honour the created-time filter, using the deal dialect",
+                "deals: the portal does not honour the period filters, using the deal dialect",
                 extra={"portal_id": portal.id},
             )
             list_dialect = DEAL_DIALECT
-            _remember_dialect(portal.id, honoured=False)
+            _remember_dialect(portal.id, honoured=False, legs=legs)
         elif verdict is True:
-            _remember_dialect(portal.id, honoured=True)
+            _remember_dialect(portal.id, honoured=True, legs=legs)
         # `None` is deliberately NOT cached: a viewer who can see no deals proves nothing
         # about the build, and recording their measurement would pin an untested verdict
         # on the whole portal for an hour.
@@ -727,11 +759,19 @@ def _fold(
     known: Mapping[str, Stage],
     groups: dict[int | None, _Group],
     seen: set[int],
+    only: frozenset[str] | None = None,
 ) -> None:
     """Fold one page of deals into the per-funnel aggregates.
 
-    Deduped by id: cheap insurance against offset drift, which can show the same row on two
-    pages when a deal is reassigned into an employee-filtered selection mid-scan.
+    Deduped by id: the stage legs return deals the creation stream also returns, and offset
+    drift can show the same row on two pages when a deal is reassigned into an
+    employee-filtered selection mid-scan.
+
+    `only` is set for a page of a stage leg: the row's `(funnel, stage)` column must be one
+    the administrator named, or the row is skipped WITHOUT being marked seen. The filter asked
+    for those stages by bare status id - Bitrix24 might ignore `@stageId`, or match a code
+    another funnel also uses - and the same deal may still arrive on the creation stream,
+    where it counts.
 
     A deal whose stage is absent from the dictionary is NOT dropped. It gets a synthesised
     column instead, because a dropped deal makes the row's `total` disagree with the sum of
@@ -744,17 +784,20 @@ def _fold(
         identifier = as_int(row.get(dialect.id))
         if identifier is None or identifier in seen:
             continue
-        seen.add(identifier)
 
         category_id = as_int(row.get(dialect.category_id))
+        raw_stage = row.get(dialect.stage_id)
+        status_text = raw_stage.strip() if isinstance(raw_stage, str) else ""
+        column = stage_key(category_id, status_text) if category_id is not None else None
+        if only is not None and column not in only:
+            continue
+        seen.add(identifier)
+
         group = groups.get(category_id)
         if group is None:
             group = _Group(category_id=category_id)
             groups[category_id] = group
 
-        raw_stage = row.get(dialect.stage_id)
-        status_text = raw_stage.strip() if isinstance(raw_stage, str) else ""
-        column = stage_key(category_id, status_text) if category_id is not None else None
         if column is not None and column not in known and column not in group.extra_columns:
             group.extra_columns[column] = status_text
 
@@ -816,6 +859,52 @@ def _deadline(deals_total: int | None, days: int | None) -> DealReportError:
     return DealReportError("deal_scan_deadline", 400, **extra)
 
 
+@dataclass(frozen=True)
+class _Stream:
+    """One paged selection of the report: its filter, and the columns its rows may fold into."""
+
+    filter_: dict[str, Any]
+    #: None for the creation stream; the named stages' columns for a stage leg.
+    only: frozenset[str] | None = None
+
+
+def _streams(
+    dialect: Dialect, filters: CallFilters, stage_legs: Sequence[Stage]
+) -> tuple[_Stream, ...]:
+    """Owner decision 3 as selections: created in the period, plus two legs for named stages.
+
+    No named stages is one stream - the request every portal sent before 2026-10-02.
+    """
+    start_iso, end_iso = _iso(filters.start_utc), _iso(filters.end_utc)
+    created = _Stream(period_filter(dialect, start_iso=start_iso, end_iso=end_iso))
+    if not stage_legs:
+        return (created,)
+    columns = frozenset(stage.key for stage in stage_legs)
+    stage_ids = sorted({stage.status_id for stage in stage_legs})
+    return (
+        created,
+        *(
+            _Stream(leg, columns)
+            for leg in stage_leg_filters(
+                dialect, stage_ids=stage_ids, start_iso=start_iso, end_iso=end_iso
+            )
+        ),
+    )
+
+
+def _first_pages(
+    dialect: Dialect, streams: Sequence[_Stream], assigned_to: Sequence[int]
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """Page 0 of every stream: the preflight, whose totals gate the scan."""
+    return [
+        command
+        for index, stream in enumerate(streams)
+        for command in list_page_commands(
+            dialect, filter_=stream.filter_, starts=[0], assigned_to=assigned_to, stream=index
+        )
+    ]
+
+
 async def _scan(
     client: BitrixClient,
     budget: _Budget,
@@ -825,44 +914,56 @@ async def _scan(
     filters: CallFilters,
     assigned_to: Sequence[int],
     first_batch: BatchResult | None,
+    stage_legs: Sequence[Stage] = (),
 ) -> tuple[dict[int | None, _Group], int, int]:
     """Page the selection, refusing rather than truncating.
 
     Returns `(groups, folded, deals_total)`. `first_batch` is the preflight the warm path
     already sent alongside `user.current`; the cold path passes None and pays one request
     for it here.
+
+    With named stages the selection is three streams, and `deals_total` is the SUM of their
+    totals - at least the size of their union, since a deal created and won in the period is
+    in two of them. The cap is applied to that conservative number on purpose: the honest
+    count is unknowable before the scan, and over-refusing costs a narrower period while
+    under-refusing costs a report that dies at the browser's timeout with no explanation.
     """
-    period = period_filter(
-        dialect, start_iso=_iso(filters.start_utc), end_iso=_iso(filters.end_utc)
-    )
+    streams = _streams(dialect, filters, stage_legs)
 
     if first_batch is None:
         first_batch = await _run_batch(
-            client,
-            list_page_commands(dialect, filter_=period, starts=[0], assigned_to=assigned_to),
-            budget,
+            client, _first_pages(dialect, streams, assigned_to), budget
         )
 
-    preflight = page_key(0)
-    error = first_batch.error(preflight)
-    if error is not None:
-        raise _classify(error)
-    deals_total = first_batch.total_of(preflight) or 0
+    totals: list[int] = []
+    for index in range(len(streams)):
+        preflight = page_key(0, index)
+        error = first_batch.error(preflight)
+        if error is not None:
+            raise _classify(error)
+        totals.append(first_batch.total_of(preflight) or 0)
+    deals_total = sum(totals)
     if deals_total > settings.deal_scan_cap:
         raise _too_large(deals_total, filters.days)
 
     known = _stage_index(dictionary)
     groups: dict[int | None, _Group] = {}
     seen: set[int] = set()
-    _fold(
-        parse_deal_rows(first_batch.get(preflight), universal=dialect.universal),
-        dialect=dialect,
-        known=known,
-        groups=groups,
-        seen=seen,
-    )
+    for index, stream in enumerate(streams):
+        _fold(
+            parse_deal_rows(first_batch.get(page_key(0, index)), universal=dialect.universal),
+            dialect=dialect,
+            known=known,
+            groups=groups,
+            seen=seen,
+            only=stream.only,
+        )
 
-    pending = list(range(DEAL_PAGE_SIZE, deals_total, DEAL_PAGE_SIZE))
+    pending: list[tuple[int, int]] = [
+        (index, start)
+        for index, total in enumerate(totals)
+        for start in range(DEAL_PAGE_SIZE, total, DEAL_PAGE_SIZE)
+    ]
     page_cost = 0.0
     while pending:
         remaining = budget.remaining()
@@ -881,16 +982,23 @@ async def _scan(
             size = max(1, min(_PAGE_BATCH, int(remaining / page_cost)))
         chunk, pending = pending[:size], pending[size:]
 
+        commands: list[tuple[str, str, dict[str, Any]]] = []
+        for index, start in chunk:
+            commands.extend(
+                list_page_commands(
+                    dialect,
+                    filter_=streams[index].filter_,
+                    starts=[start],
+                    assigned_to=assigned_to,
+                    stream=index,
+                )
+            )
         began = time.monotonic()
-        batch = await _run_batch(
-            client,
-            list_page_commands(dialect, filter_=period, starts=chunk, assigned_to=assigned_to),
-            budget,
-        )
+        batch = await _run_batch(client, commands, budget)
         page_cost = max(page_cost, (time.monotonic() - began) / max(1, len(chunk)))
 
-        for start in chunk:
-            key = page_key(start)
+        for index, start in chunk:
+            key = page_key(start, index)
             error = batch.error(key)
             if error is not None:
                 # A silently dropped page under-counts one stage column and reads to the
@@ -903,6 +1011,7 @@ async def _scan(
                 known=known,
                 groups=groups,
                 seen=seen,
+                only=streams[index].only,
             )
 
     return groups, len(seen), deals_total
@@ -991,6 +1100,7 @@ def _build_response(
     rest_requests: int,
     from_cache: bool,
     assigned_to: Sequence[int],
+    stage_legs: Sequence[Stage] = (),
 ) -> dict[str, Any]:
     """The wire form (§4.12).
 
@@ -999,6 +1109,10 @@ def _build_response(
     caller's rights and cached for a few minutes while the deals are always live, so a
     funnel created five minutes ago is routine rather than exceptional. Dropping its deals
     would make the grand total disagree with the blocks above it.
+
+    `period_rule.stage_keys` names the columns that also count deals moved into them or
+    modified in the period, so the page can mark them: without the mark a reader takes a
+    month's «Успешные» for the deals created that month.
     """
     order = {funnel.id: index for index, funnel in enumerate(dictionary.funnels)}
     names = {funnel.id: funnel for funnel in dictionary.funnels}
@@ -1043,6 +1157,7 @@ def _build_response(
         "stages": stages,
         "groups": blocks,
         "totals": totals.wire(with_cells=False),
+        "period_rule": {"stage_keys": [stage.key for stage in stage_legs]},
         "scan": {
             "deals": folded,
             "deals_total": deals_total,
@@ -1078,11 +1193,15 @@ async def _report(
         filters.employees if principal.access == "all" else (principal.user_id,)
     )
 
+    # Owner decision 3: the stages whose deals also count when moved or modified in the
+    # period. Resolved against THIS viewer's dictionary below, as the mirror resolves it
+    # against the stored one; a portal without a rule probes and sends exactly what it did.
+    legs = bool(deal_period.stage_keys(portal.deal_period_rule))
+
     cache_key = (portal.id, principal.user_id)
     cached = _dictionary_cache.get(cache_key)
     dictionary = cached[1] if cached is not None and cached[0] > time.monotonic() else None
-    dialect_entry = _dialect_cache.get(portal.id)
-    dialect_known = dialect_entry is not None and dialect_entry[0] > time.monotonic()
+    dialect_known = _dialect_known(portal.id, legs=legs)
     dialect = _dialect_for(portal.id)
 
     async with BitrixClient(
@@ -1097,14 +1216,13 @@ async def _report(
         correlation_id=correlation_id,
     ) as client:
         if dictionary is not None and dialect_known:
-            # The warm path: identity proof and the first page of deals in ONE request, so
-            # a portal with fifty matching deals answers the whole report in one round trip.
-            period = period_filter(
-                dialect, start_iso=_iso(filters.start_utc), end_iso=_iso(filters.end_utc)
-            )
+            # The warm path: identity proof and the first page of every stream in ONE
+            # request, so a portal with fifty matching deals answers the whole report in one
+            # round trip.
+            stage_legs = deal_period.resolve(portal.deal_period_rule, dictionary.stages)
             commands = [
                 me_command(),
-                *list_page_commands(dialect, filter_=period, starts=[0], assigned_to=assigned_to),
+                *_first_pages(dialect, _streams(dialect, filters, stage_legs), assigned_to),
             ]
             first = await _run_batch(client, commands, budget)
             if not _identity_ok(first, principal):
@@ -1118,7 +1236,9 @@ async def _report(
                 budget,
                 list_dialect=dialect,
                 probe_honour=not dialect_known,
+                legs=legs,
             )
+            stage_legs = deal_period.resolve(portal.deal_period_rule, dictionary.stages)
             first = None
             from_cache = False
 
@@ -1130,6 +1250,7 @@ async def _report(
             filters=filters,
             assigned_to=assigned_to,
             first_batch=first,
+            stage_legs=stage_legs,
         )
 
     operators = {uid for group in groups.values() for uid in group.rows if uid is not None}
@@ -1146,6 +1267,7 @@ async def _report(
         rest_requests=budget.requests,
         from_cache=from_cache,
         assigned_to=assigned_to,
+        stage_legs=stage_legs,
     )
 
 
@@ -1260,10 +1382,16 @@ async def load_deal_report_mirror(
         if not coverage.deals_available:
             raise DealReportError(crm_repo.MIRROR_UNAVAILABLE, 409, reason=coverage.deal_reason)
         funnels, stages = await crm_repo.deal_dictionary(portal.id)
+        # Owner decision 3's named stages, resolved exactly as the live read resolves them.
+        stage_legs = deal_period.resolve(portal.deal_period_rule, stages)
         # An administrator's own employee filter. Everyone else is pinned by `crm_scope`.
         assigned_to = filters.employees
         counts = await crm_repo.deal_stage_counts(
-            portal.id, filters, scope=scope, employees=assigned_to
+            portal.id,
+            filters,
+            scope=scope,
+            employees=assigned_to,
+            stage_legs=[(stage.category_id, stage.status_id) for stage in stage_legs],
         )
     finally:
         gate.release()
@@ -1287,6 +1415,7 @@ async def load_deal_report_mirror(
         rest_requests=0,
         from_cache=False,
         assigned_to=assigned_to,
+        stage_legs=stage_legs,
     )
     body.update(coverage.wire(now=dt.datetime.now(dt.UTC)))
     return body

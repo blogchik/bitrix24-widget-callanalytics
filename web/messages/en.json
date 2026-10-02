@@ -248,6 +248,23 @@
         "laneDone": "Loaded",
         "laneBlocked": "Waiting: {reason}",
         "laneProgress": "{done} / {total}"
+      },
+      "dealPeriod": {
+        "section": "Period in the Deals report",
+        "hint": "A deal belongs to the period it was created in. On the stages chosen here it also belongs to the period in which it moved to that stage or was changed, even if it was created earlier. Every other stage counts by creation date only.",
+        "none": "Creation date only",
+        "selected": "{count} selected",
+        "won": "won",
+        "lost": "lost",
+        "noStages": "This funnel has no stages",
+        "save": "Save",
+        "saving": "Saving…",
+        "saved": "Saved. The Deals report already counts this way.",
+        "failed": "Could not save. Please try again.",
+        "loading": "Loading…",
+        "loadFailed": "Could not load this setting.",
+        "retry": "Retry",
+        "unavailable": "Funnel stages have not been loaded from CRM yet. This setting becomes available once CRM analytics has read them."
       }
     },
     "signedInAs": "Bitrix24 user #{id}",
@@ -293,6 +310,8 @@
       "scopeGranted": "The scope of this report was set by the application administrator — it can differ from what Bitrix24 CRM shows you.",
       "scopeNote": "Showing the deals and funnels you can see in Bitrix24 CRM.",
       "currentStageNote": "Only deals created in the selected period are counted. Every count is their CURRENT stage: a snapshot of today, not a picture of the period.",
+      "currentStageNoteLegs": "Deals created in the selected period are counted, and on the stages marked ↻ ({stages}) also deals that moved to them or changed during it, even if they were created earlier. Every count is the deal's CURRENT stage: a snapshot of today, not a picture of the period.",
+      "legTitle": "Also deals that moved to this stage or changed in the selected period",
       "rowsTruncated": "Showing {shown} of {total} operators; the Total row covers all of them.",
       "funnelsHidden": "{count, plural, one {# funnel is hidden} other {# funnels are hidden}}: they have no deals in this period.",
       "stageDictionaryFailed": "Stage names could not be read for {count, plural, one {# funnel} other {# funnels}} — those columns are labelled by code. The counts are still correct.",

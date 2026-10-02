@@ -91,6 +91,11 @@ interface DealsResponse extends MirrorReportMeta {
   stages: StageColumn[];
   groups: DealGroup[];
   totals: DealMeasures;
+  /**
+   * Owner decision 3: the columns that also count deals moved onto them or modified in the
+   * period. Optional only so a page served during a rollout reads an older API as "none".
+   */
+  period_rule?: { stage_keys: string[] };
   scan: {
     deals: number;
     deals_total: number;
@@ -224,6 +229,20 @@ export default function DealsPage() {
     },
     [t],
   );
+
+  // The named stages that are on screen, and their names for the note. A named stage whose
+  // funnel had no deals is not drawn, so there is nothing about it to explain.
+  const reportData = report.data;
+  const legKeys = useMemo(
+    () => new Set(reportData?.period_rule?.stage_keys ?? []),
+    [reportData],
+  );
+  const legNames = useMemo(() => {
+    const names = (reportData?.stages ?? [])
+      .filter((stage) => legKeys.has(stage.key))
+      .map((stage) => stage.name || stage.status_id);
+    return [...new Set(names)];
+  }, [legKeys, reportData]);
 
   if (me.loading) {
     return <LoadingBlock label={t('app.loading')} />;
@@ -369,6 +388,7 @@ export default function DealsPage() {
                     t={t}
                     nameOf={nameOf}
                     showPercent={showPercent}
+                    legKeys={legKeys}
                   />
                 ))}
                 <DealSummaryStrip totals={data.totals} locale={locale} t={t} />
@@ -376,11 +396,14 @@ export default function DealsPage() {
             </div>
 
             {/* The most likely misreading of the whole report, answered where it happens.
-                Every count is where deals CREATED in the period sit TODAY, not where they
-                sat during it. Without this sentence a lead reads a month's "in progress" as
-                a month's backlog and does not find out for months. */}
+                Every count is where deals CREATED in the period - and, on the stages marked
+                ↻, deals moved onto them or modified in it - sit TODAY, not where they sat
+                during it. Without this sentence a lead reads a month's "in progress" as a
+                month's backlog and does not find out for months. */}
             <p className="ca-deals-note" role="note">
-              {t('app.deals.currentStageNote')}
+              {legNames.length > 0
+                ? t('app.deals.currentStageNoteLegs', { stages: legNames.join(', ') })
+                : t('app.deals.currentStageNote')}
             </p>
 
             {scan && scan.funnels_hidden > 0 ? (

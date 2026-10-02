@@ -545,6 +545,43 @@ export function clearCrmGrant(userId: number): Promise<{ removed: boolean }> {
   return apiFetch<{ removed: boolean }>(`/portal/crm-grants/${userId}`, { method: 'DELETE' });
 }
 
+/** One stage an administrator can name for the Deals report's period rule. */
+export interface DealPeriodStage {
+  /** The report's column key, `"<category_id>:<status_id>"`. */
+  key: string;
+  name: string;
+  semantic: 'P' | 'S' | 'F';
+}
+
+export interface DealPeriodFunnel {
+  category_id: number;
+  name: string;
+  stages: DealPeriodStage[];
+}
+
+/**
+ * Which stages of the Deals report also count deals moved into them or modified in a period
+ * (owner decision 3). Every other stage counts a deal in the period it was created in.
+ */
+export interface DealPeriodRule {
+  stage_keys: string[];
+  /** False while the CRM mirror holds no stage dictionary to choose from. */
+  available: boolean;
+  funnels: DealPeriodFunnel[];
+}
+
+export function fetchDealPeriodRule(signal?: AbortSignal): Promise<DealPeriodRule> {
+  return apiFetch<DealPeriodRule>('/portal/deal-period-rule', { signal });
+}
+
+/** Replace the rule; an empty list is creation time alone. Administrators only. */
+export function setDealPeriodRule(stageKeys: readonly string[]): Promise<DealPeriodRule> {
+  return apiFetch<DealPeriodRule>('/portal/deal-period-rule', {
+    method: 'POST',
+    body: { stage_keys: [...stageKeys] },
+  });
+}
+
 export interface CrmScopeResult {
   /** Which path this viewer's reports take now that the census has been taken. */
   read: 'mirror' | 'live';

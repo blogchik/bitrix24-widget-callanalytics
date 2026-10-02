@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Final
 
-from sqlalchemy import Date, and_, case, cast, func, literal, select
+from sqlalchemy import Date, and_, case, cast, func, literal, or_, select, tuple_
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.bitrix.deals import Funnel, Stage, normalise_semantic, stage_key
@@ -375,11 +375,15 @@ async def deal_stage_counts(
     *,
     scope: ColumnElement[bool] | None,
     employees: Sequence[int],
+    stage_legs: Sequence[tuple[int, str]] = (),
 ) -> list[StageCount]:
-    """Owner decision 3 in SQL: deals CREATED in the period, counted - and no others.
+    """Owner decision 3 in SQL: deals CREATED in the period, plus the named stages' legs.
 
-    A deal modified or closed in the period but created before it does not count, exactly as
-    the live read's `period_filter` does not select it.
+    `stage_legs` are the `(category_id, status_id)` pairs `services/deal_period.resolve`
+    produced. A deal on one of them also counts when it moved into it (`moved_time`) or was
+    modified (`updated_time`) inside the period - the live read's two stage legs, as one `OR`.
+    Without them a deal modified or closed in the period but created before it does not count,
+    exactly as the live read's `period_filter` does not select it.
 
     The outcome repeats the live read's rule, including the quirk G0 Q3 keeps until cutover:
     a deal that says won or lost is believed; one that says anything else takes its stage's
@@ -394,7 +398,16 @@ async def deal_stage_counts(
         (CrmStage.semantic.in_(_WON_OR_LOST), CrmStage.semantic),
         else_=literal(_IN_PROGRESS),
     )
-    terms = [*_live(portal_id, (DEAL,)), _period(CrmItem.created_time, filters)]
+    period = _period(CrmItem.created_time, filters)
+    if stage_legs:
+        period = or_(
+            period,
+            and_(
+                tuple_(CrmItem.category_id, CrmItem.stage_id).in_(sorted(set(stage_legs))),
+                or_(_period(CrmItem.moved_time, filters), _period(CrmItem.updated_time, filters)),
+            ),
+        )
+    terms = [*_live(portal_id, (DEAL,)), period]
     if scope is not None:
         terms.append(scope)
     if employees:

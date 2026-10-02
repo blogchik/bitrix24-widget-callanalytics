@@ -37,6 +37,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from app.bitrix.client import BitrixClient
+from app.bitrix.deals import Funnel, Stage
 from app.bitrix.errors import BitrixError, InvalidGrant, TransportError
 from app.bitrix.identity import NotAnAdministrator, verify_admin_token
 from app.bitrix.oauth import (
@@ -57,13 +58,14 @@ from app.security.principal import (
     PrincipalErrorRoute,
     get_principal,
 )
-from app.services import crm_grants
+from app.services import crm_grants, crm_repo, deal_period
 from app.services.portals import (
     decrypt_portal_token,
     dismiss_crm_notice,
     record_event,
     record_placements,
     set_crm_analytics,
+    set_deal_period_rule,
     store_portal_credential,
 )
 
@@ -365,6 +367,92 @@ async def dismiss_notice(principal: Principal = Depends(get_principal)) -> JSONR
     async with control_txn() as session:
         await dismiss_crm_notice(session, principal.portal_id, user_id=principal.user_id)
     return JSONResponse({"notice_visible": False})
+
+
+# --- GET/POST /portal/deal-period-rule (0007, owner decision 3) ------------------------
+
+
+async def _deal_period_body(portal: Portal) -> dict[str, Any]:
+    """The rule, and every funnel's stages to choose from, from the mirror's dictionary.
+
+    `available` is false while the mirror holds no live dictionary - CRM analytics off, or
+    a portal whose lanes have not read one yet - because a stage picker over nothing, or over
+    a copy being purged, is a promise the page cannot keep.
+    """
+    funnels: list[Funnel] = []
+    stages: dict[int, tuple[Stage, ...]] = {}
+    if crm_repo.mirror_readable(portal):
+        funnels, stages = await crm_repo.deal_dictionary(portal.id)
+    return {
+        "stage_keys": list(deal_period.stage_keys(portal.deal_period_rule)),
+        "available": bool(funnels),
+        "funnels": [
+            {
+                "category_id": funnel.id,
+                "name": funnel.name,
+                "stages": [
+                    {"key": stage.key, "name": stage.name, "semantic": stage.semantic}
+                    for stage in stages.get(funnel.id, ())
+                ],
+            }
+            for funnel in funnels
+        ],
+    }
+
+
+@router.get("/portal/deal-period-rule")
+async def deal_period_rule(principal: Principal = Depends(get_principal)) -> JSONResponse:
+    """Which stages of the Deals report also count deals moved into them or modified in a period."""
+    await _require_admin(principal)
+    portal, _ = await _load(principal.portal_id)
+    if portal.status != _ACTIVE:
+        return _error("portal_inactive", 401)
+    return JSONResponse(await _deal_period_body(portal))
+
+
+@router.post("/portal/deal-period-rule")
+async def deal_period_rule_set(
+    request: Request, principal: Principal = Depends(get_principal)
+) -> JSONResponse:
+    """Replace the rule with `{"stage_keys": [...]}`; an empty list is creation time alone.
+
+    Every key must name a stage the mirror's dictionary has now. A key it does not know is
+    refused rather than stored, because a rule that silently does nothing is one the
+    administrator who saved it would believe works.
+    """
+    await _require_admin(principal)
+    raw = await request.body()
+    if not raw or len(raw) > _MAX_BODY_BYTES:
+        return _error("bad_request", 400)
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return _error("bad_request", 400)
+    keys = deal_period.parse_body(payload)
+    if keys is None:
+        return _error("bad_request", 400)
+
+    portal, _ = await _load(principal.portal_id)
+    if portal.status != _ACTIVE:
+        return _error("portal_inactive", 401)
+    if not crm_repo.mirror_readable(portal):
+        return _error("deal_dictionary_unavailable", 409)
+    _, stages = await crm_repo.deal_dictionary(portal.id)
+    ordered = deal_period.validate(keys, stages)
+    if ordered is None:
+        return _error("deal_period_rule_invalid", 400)
+
+    async with control_txn() as session:
+        changed = await set_deal_period_rule(
+            session, portal.id, stage_keys=ordered, user_id=principal.user_id
+        )
+    _log.info(
+        "portal: deal period rule saved",
+        # Counts, not keys: the keys are in the `portal_events` row this wrote.
+        extra={"portal_id": portal.id, "stages": len(ordered), "changed": changed},
+    )
+    portal, _ = await _load(principal.portal_id)
+    return JSONResponse(await _deal_period_body(portal))
 
 
 # --- POST /portal/reauthorize --------------------------------------------------------

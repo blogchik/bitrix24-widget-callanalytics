@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
@@ -37,6 +38,7 @@ from sqlalchemy.sql import func, text
 from app.db.models import CrmLane, Portal, PortalEvent, PortalSync, SyncMethodBudget
 from app.logging import get_logger
 from app.security.crypto import DecryptionError, decrypt, encrypt
+from app.services import deal_period
 
 if TYPE_CHECKING:
     # Import-time cycle guard: `bitrix/oauth.py` reads and re-seeds credentials through
@@ -58,6 +60,7 @@ __all__ = [
     "record_placements",
     "set_crm_analytics",
     "set_crm_mode",
+    "set_deal_period_rule",
     "set_token_status",
     "store_portal_credential",
 ]
@@ -621,6 +624,46 @@ async def set_crm_analytics(
     )
     await session.execute(delete(CrmLane).where(CrmLane.portal_id == portal_id))
     await record_event(session, portal_id, "crm_analytics_off", user_id=user_id)
+    return True
+
+
+async def set_deal_period_rule(
+    session: AsyncSession, portal_id: int, *, stage_keys: Sequence[str], user_id: int
+) -> bool:
+    """An administrator's choice of stages that also count by movement and modification.
+
+    Owner decision 3 (§4.12, 0007). `stage_keys` arrive validated against the portal's stage
+    dictionary (`services/deal_period.validate`); this function stores them and audits the
+    change. Returns whether anything changed: saving the rule a portal already has writes
+    no event, so a double click is one line in `portal_events`, not two.
+
+    The event carries both sets of keys. They are portal stage ids, never customer content,
+    and "since when has «Заклад» counted this way, and who decided?" is exactly the question
+    support will be asked.
+    """
+    row = (
+        await session.execute(
+            select(Portal.deal_period_rule).where(Portal.id == portal_id).with_for_update()
+        )
+    ).one_or_none()
+    if row is None:
+        return False
+    before = list(deal_period.stage_keys(row[0]))
+    after = list(stage_keys)
+    if before == after:
+        return False
+    await session.execute(
+        update(Portal)
+        .where(Portal.id == portal_id)
+        .values(deal_period_rule=deal_period.rule_of(after))
+    )
+    await record_event(
+        session,
+        portal_id,
+        "deal_period_rule_set",
+        user_id=user_id,
+        details={"from": before, "to": after},
+    )
     return True
 
 

@@ -181,6 +181,17 @@
     transform: scale(0.98);
   }
 
+  /* A disabled button has to look it. Without this a Save with nothing to save, or a switch
+   * that is already busy, looks exactly as clickable as one that works. The date picker
+   * carried its own copy of this rule; this is the shared one. After :hover and :active, so
+   * a pointer over a disabled button neither brightens nor presses it. */
+  .ca-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    filter: none;
+    transform: none;
+  }
+
   .ca-button-quiet {
     background: transparent;
     color: var(--ca-accent);
